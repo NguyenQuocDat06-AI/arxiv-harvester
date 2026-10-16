@@ -1,0 +1,27 @@
+# Tài liệu đầu vào chỉ dùng tại máy cá nhân.
+prompt_khoi_tao_project.md
+YEU_CAU.md
+.local/
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.DS_Store
+.env
+.env.*
+_build/
+build/
+dist/
+
+# Giữ cấu trúc thư mục, không đưa dữ liệu thô lên Git.
+data/raw/*
+!data/raw/sources/
+!data/raw/unzipped/
+data/raw/sources/*
+!data/raw/sources/.gitkeep
+data/raw/unzipped/*
+!data/raw/unzipped/.gitkeep
+data/shards/*/*.parquet
