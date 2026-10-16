@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arxiv-harvester"
+version = "0.1.0"
+description = "arXiv Data Crawling Pipeline - Intro to Data Science Milestone 1"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "arxiv",
+    "sickle",
+    "requests",
+    "pandas",
+    "pyarrow",
+    "psutil",
+    "tqdm",
+    "matplotlib",
+    "seaborn",
+    "jupyter-book",
+]
+
+[project.scripts]
+arxiv-harvester = "crawler.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

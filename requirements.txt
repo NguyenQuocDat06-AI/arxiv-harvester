@@ -1,0 +1,12 @@
+# Keep this list aligned with project.dependencies in pyproject.toml.
+# GitHub Dependency graph uses this pip manifest to discover direct dependencies.
+arxiv
+sickle
+requests
+pandas
+pyarrow
+psutil
+tqdm
+matplotlib
+seaborn
+jupyter-book
