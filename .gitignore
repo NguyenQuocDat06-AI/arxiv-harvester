@@ -25,3 +25,6 @@ data/raw/sources/*
 data/raw/unzipped/*
 !data/raw/unzipped/.gitkeep
 data/shards/*/*.parquet
+
+# Checkpoint --resume (Parquet tạm theo lô) chỉ dùng tại máy chạy.
+data/shards/*/_checkpoint/
