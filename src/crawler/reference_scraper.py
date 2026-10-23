@@ -98,6 +98,34 @@ _session: requests.Session | None = None
 _last_request_at: float | None = None  # mốc time.monotonic() của request gần nhất
 
 
+def _new_request_stats() -> dict:
+    """Bộ đếm rỗng: tổng request, request theo mã trả về, số lần thử lại, số giây chờ backoff và chờ giới hạn tốc độ."""
+    return {"requests": 0, "by_status": {}, "retries": 0, "backoff_sec": 0.0, "rate_limit_wait_sec": 0.0}
+
+
+# Bộ đếm để chương 03 báo cáo (số request, số 429, thời gian chờ). Chỉ ghi số, không đổi cách gọi S2.
+_request_stats: dict = _new_request_stats()
+
+
+def _count_request(key: str) -> None:
+    """Ghi nhận một request đã gửi. key là mã HTTP dạng chuỗi (ví dụ "429"), hoặc "network" khi lỗi mạng."""
+    _request_stats["requests"] += 1
+    _request_stats["by_status"][key] = _request_stats["by_status"].get(key, 0) + 1
+
+
+def reset_request_stats() -> None:
+    """Đặt bộ đếm về 0. Dùng khi bắt đầu một đoạn đo mới, hoặc trong test."""
+    global _request_stats
+    _request_stats = _new_request_stats()
+
+
+def get_request_stats() -> dict:
+    """Bản sao của bộ đếm hiện tại. Sửa bản sao không làm đổi bộ đếm thật."""
+    stats = dict(_request_stats)
+    stats["by_status"] = dict(_request_stats["by_status"])
+    return stats
+
+
 def scrape_references_for_paper(
     arxiv_id: str,
     unzipped_paper_dir: str | None = None,
@@ -253,6 +281,7 @@ def _wait_for_rate_limit(rate_limit_sec: float) -> None:
         remaining = _last_request_at + rate_limit_sec - now
         if remaining > 0:
             time.sleep(remaining)
+            _request_stats["rate_limit_wait_sec"] += remaining
             now = time.monotonic()
     _last_request_at = now
 
@@ -301,14 +330,17 @@ def _get_json(url: str, params: dict, source_id: str, rate_limit_sec: float) -> 
         try:
             response = session.get(url, params=params, headers=headers, timeout=_TIMEOUT)
         except _TRANSIENT_ERRORS as exc:
+            _count_request("network")
             problem, cause = f"lỗi mạng {type(exc).__name__}", exc
         except requests.exceptions.RequestException as exc:
+            _count_request("network")
             # Lỗi kiểu URL sai, chuyển hướng vô tận...: thử lại không giúp gì. Chỉ ghi tên lỗi, không ghi nội dung.
             raise ReferenceScrapeError(
                 f"Request tới S2 cho bài {source_id} thất bại, không thử lại được: {type(exc).__name__}"
             ) from exc
         else:
             status = response.status_code
+            _count_request(str(status))
             if status == 200:
                 return _decode_json(response, source_id)
             if status == 404:
@@ -323,6 +355,8 @@ def _get_json(url: str, params: dict, source_id: str, rate_limit_sec: float) -> 
                 f"S2 vẫn lỗi sau {_MAX_ATTEMPTS} lần thử cho bài {source_id} (lần cuối: {problem})"
             ) from cause
         wait = _backoff_seconds(attempt, retry_after)
+        _request_stats["retries"] += 1
+        _request_stats["backoff_sec"] += wait
         logger.warning(
             "S2 lỗi (%s) cho bài %s, thử lại lần %d/%d sau %.1f giây",
             problem, source_id, attempt, _MAX_ATTEMPTS - 1, wait,
