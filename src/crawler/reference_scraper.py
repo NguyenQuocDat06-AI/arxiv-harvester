@@ -4,7 +4,8 @@ Các bước của `scrape_references_for_paper` (mỗi bước là một nhóm 
   1. Kiểm tra và chuẩn hóa ID bài nguồn; sai hình dạng thì lỗi ngay, chưa gửi request nào.
   2. Hỏi Semantic Scholar (S2). Request đầu lấy luôn danh sách trích dẫn; nếu S2 cắt bớt thì lấy lại
      bằng endpoint phân trang. Lỗi tạm thời (429, 5xx, mạng) được thử lại, chờ tăng dần.
-  3. S2 trả 404 (không biết bài này) thì đọc .bib/.bbl trong thư mục nguồn đã giải nén.
+  3. S2 trả 404 (không biết bài này) thì đọc .bib/.bbl trong thư mục nguồn đã giải nén. Từ .bib chỉ lấy mục
+     mà file .tex trong thư mục trích (\\cite, \\nocite...).
   4. Đổi mọi thứ thành bản ghi chung (đúng các khóa của REFERENCE_KEYS) và bỏ cạnh trích dẫn trùng.
 
 Tài liệu API: https://api.semanticscholar.org/api-docs/graph
@@ -64,6 +65,13 @@ class PaperNotFoundError(ReferenceScrapeError):
     """Semantic Scholar trả 404 và không có file .bib/.bbl nào đọc được để dự phòng."""
 
 
+class ReferencesUnavailableError(ReferenceScrapeError):
+    """S2 có bài và báo có trích dẫn (referenceCount > 0) nhưng không đưa mục nào.
+
+    Không phải lỗi tạm thời nên không thử lại, và không được che bằng fallback .bib/.bbl (fallback chỉ cho 404).
+    """
+
+
 # --- Cấu hình gọi Semantic Scholar -----------------------------------------------------------------
 _API_BASE = "https://api.semanticscholar.org/graph/v1/paper"
 # Trường của một trích dẫn. Phải là trường PHẲNG: đề không cho dùng dạng lồng như `authors.name`.
@@ -109,6 +117,7 @@ def scrape_references_for_paper(
     Ngoại lệ:
       TypeError, ValueError: arxiv_id hoặc rate_limit_sec sai (chưa gửi request nào).
       PaperNotFoundError: S2 trả 404 và không có .bib/.bbl dùng được.
+      ReferencesUnavailableError: S2 báo có trích dẫn nhưng không đưa mục nào.
       ReferenceScrapeError: mọi lỗi còn lại (mạng, 429/5xx hết lượt thử lại, mã 4xx khác, dữ liệu hỏng).
     """
     source_id = _validate_source_id(arxiv_id)
@@ -339,8 +348,10 @@ def _fetch_s2_references(source_id: str, rate_limit_sec: float) -> list[dict]:
     """Toàn bộ trích dẫn thô (dict kiểu S2) của bài. PaperNotFoundError nếu S2 không có bài này.
 
     Request đầu (`/paper/arXiv:{id}`) lấy cả danh sách trích dẫn trong một lần, nhanh nhất. Nhưng S2 có thể cắt
-    bớt, nên so với referenceCount (tổng thật): đủ thì dùng luôn, thiếu (hoặc không biết tổng) thì bỏ danh sách đó
-    và lấy lại từ đầu bằng endpoint phân trang. Bỏ hẳn thay vì nối tiếp vì chưa chắc hai endpoint cùng thứ tự.
+    bớt, nên so với referenceCount (tổng thật): đủ thì dùng luôn. Thiếu (hoặc không biết tổng) thì lấy lại bằng
+    endpoint phân trang rồi giữ bản DÀI HƠN trong hai bản; không nối hai bản vì chưa chắc hai endpoint cùng thứ tự.
+    Nếu vẫn thiếu: không có mục nào thì ném ReferencesUnavailableError; thiếu một phần thì ghi cảnh báo và giữ
+    phần lấy được.
     """
     paper_url = f"{_API_BASE}/arXiv:{quote(source_id, safe='')}"
     body = _get_json(paper_url, {"fields": _PAPER_FIELDS}, source_id, rate_limit_sec)
@@ -348,9 +359,19 @@ def _fetch_s2_references(source_id: str, rate_limit_sec: float) -> list[dict]:
     if not isinstance(refs, list):
         raise ReferenceScrapeError(f"S2 trả dữ liệu sai hình dạng cho bài {source_id}: thiếu danh sách references")
     total = body.get("referenceCount")
-    if isinstance(total, int) and not isinstance(total, bool) and len(refs) >= total:
+    known_total = isinstance(total, int) and not isinstance(total, bool)
+    if known_total and len(refs) >= total:
         return refs
-    return _fetch_s2_pages(f"{paper_url}/references", source_id, rate_limit_sec)
+    paged = _fetch_s2_pages(f"{paper_url}/references", source_id, rate_limit_sec)
+    if len(paged) < len(refs):  # trang lỗi mà lần đầu có nhiều hơn: giữ lần đầu, không bỏ mất dữ liệu thật
+        paged = refs
+    if known_total and len(paged) < total:
+        if not paged:
+            raise ReferencesUnavailableError(f"S2 báo bài {source_id} có {total} trích dẫn nhưng không trả mục nào")
+        logger.warning(
+            "S2 báo bài %s có %d trích dẫn nhưng chỉ trả %d; giữ phần lấy được", source_id, total, len(paged)
+        )
+    return paged
 
 
 def _fetch_s2_pages(url: str, source_id: str, rate_limit_sec: float) -> list[dict]:
@@ -521,12 +542,34 @@ _BIBITEM_RE = re.compile(r"\\bibitem\b")
 _BIBITEM_HEAD_RE = re.compile(r"\s*(?:\[[^\]]*\])?\s*\{[^}]*\}")  # phần "[nhãn]{khóa}" ngay sau \bibitem
 _END_BIBLIOGRAPHY = "\\end{thebibliography}"
 
+# --- .tex: lệnh trích dẫn (chỉ dùng để chọn mục .bib) -----------------------------------------------
+_TEX_COMMENT_RE = re.compile(r"(?<!\\)%[^\n]*")  # từ % tới hết dòng; \% là dấu phần trăm thật, không phải chú thích
+# Tên lệnh bất kỳ, tối đa hai tham số tùy chọn [..] (natbib: \citet[xem][ch.~2]), rồi nhóm {khóa1,khóa2}.
+# Lọc lệnh có chữ "cite" bằng Python chứ không đưa vào regex: regex kiểu \\[A-Za-z]*cite[A-Za-z]* đo được
+# 5,8 giây trên chuỗi \cite lặp 8.000 lần, còn regex này chạy dưới 0,1 giây trên đầu vào cỡ 1 triệu ký tự.
+_TEX_CITE_RE = re.compile(r"\\([A-Za-z]+)\*?\s*(?:\[[^\[\]{}]{0,500}\]\s*){0,2}\{([^{}]*)\}")
+
+
+def _cited_keys(tex_texts: list[str]) -> set[str]:
+    """Khóa BibTeX mà các file .tex trích (cite, citep, parencite, nocite...); "*" nghĩa là \\nocite{*}.
+
+    Phần chú thích bị bỏ trước khi tìm, nên lệnh nằm sau % không được tính.
+    """
+    keys: set[str] = set()
+    for text in tex_texts:
+        for match in _TEX_CITE_RE.finditer(_TEX_COMMENT_RE.sub("", text)):
+            if "cite" in match.group(1).lower():
+                keys.update(key.strip() for key in match.group(2).split(",") if key.strip())
+    return keys
+
 
 def _read_local_references(source_id: str, unzipped_paper_dir: str | None) -> list[dict]:
     """Bản ghi dự phòng đọc từ .bib/.bbl trong thư mục (kể cả thư mục con); không có gì dùng được thì [].
 
-    Quy tắc chọn (giả định của Tân, CHƯA chốt với nhóm): ưu tiên .bib vì có trường có cấu trúc; chỉ khi không
-    có mục .bib nào mới dùng .bbl. Không trộn cả hai vì cùng một tài liệu sẽ bị tính hai lần.
+    Quy tắc chọn:
+      - .bib chỉ giữ mục mà file .tex trong thư mục trích. File .bib thường là kho chung của tác giả, lớn hơn
+        số trích dẫn thật của bài, nên đưa cả kho vào là bịa dữ liệu. Không .tex nào trích thì không giữ mục nào.
+      - .bbl chỉ dùng khi không còn mục .bib nào được trích. Không trộn hai nguồn: cùng tài liệu sẽ bị tính hai lần.
     """
     if unzipped_paper_dir is None:
         return []
@@ -535,14 +578,21 @@ def _read_local_references(source_id: str, unzipped_paper_dir: str | None) -> li
         return []
     # Bỏ symlink để một file trong gói giải nén không thể trỏ ra ngoài thư mục. Sắp xếp để kết quả ổn định.
     files = sorted(p for p in root.rglob("*") if p.is_file() and not p.is_symlink())
-    for suffix, parse in ((".bib", _bib_records), (".bbl", _bbl_records)):
-        records: list[dict] = []
-        for path in files:
-            if path.suffix.lower() == suffix:
-                records.extend(parse(source_id, _read_text(path)))
-        if records:
-            logger.info("Dùng %s dự phòng cho bài %s: %d mục", suffix, source_id, len(records))
-            return _dedupe(records)
+    bib_files = [p for p in files if p.suffix.lower() == ".bib"]
+    if bib_files:
+        cited = _cited_keys([_read_text(p) for p in files if p.suffix.lower() == ".tex"])
+        entries = [entry for path in bib_files for entry in _bib_entries(source_id, _read_text(path))]
+        kept = [record for key, record in entries if "*" in cited or key in cited]
+        if kept:
+            logger.info("Dùng .bib dự phòng cho bài %s: giữ %d/%d mục được trích", source_id, len(kept), len(entries))
+            return _dedupe(kept)
+    bbl_records: list[dict] = []
+    for path in files:
+        if path.suffix.lower() == ".bbl":
+            bbl_records.extend(_bbl_records(source_id, _read_text(path)))
+    if bbl_records:
+        logger.info("Dùng .bbl dự phòng cho bài %s: %d mục", source_id, len(bbl_records))
+        return _dedupe(bbl_records)
     return []
 
 
@@ -703,9 +753,17 @@ def _record_from_bib_entry(source_id: str, raw: str) -> dict:
     )
 
 
-def _bib_records(source_id: str, text: str) -> list[dict]:
+def _bib_entry_key(raw: str) -> str:
+    """Khóa trích dẫn của mục .bib: chữ giữa "@loại{" và dấu phẩy đầu tiên, ví dụ doe2020."""
+    head = _BIB_HEAD_RE.match(raw)
+    body = raw[head.end() : -1]  # bỏ "@loại{" đầu và "}" cuối, giống _record_from_bib_entry
+    return body.partition(",")[0].strip()
+
+
+def _bib_entries(source_id: str, text: str) -> list[tuple[str, dict]]:
+    """Mỗi mục .bib thành cặp (khóa trích dẫn, bản ghi). Bỏ @string, @preamble, @comment vì không phải trích dẫn."""
     return [
-        _record_from_bib_entry(source_id, raw)
+        (_bib_entry_key(raw), _record_from_bib_entry(source_id, raw))
         for kind, raw in _split_bib_entries(text)
         if kind not in _BIB_SKIPPED_KINDS
     ]
