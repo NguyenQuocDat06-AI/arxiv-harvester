@@ -25,3 +25,5 @@ data/raw/sources/*
 data/raw/unzipped/*
 !data/raw/unzipped/.gitkeep
 data/shards/*/*.parquet
+data/mock/
+data/**/stats.json
