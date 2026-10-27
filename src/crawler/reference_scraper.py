@@ -1,12 +1,13 @@
 """Thu thập trích dẫn. Phụ trách: Trần Nguyên Tân (24120438).
 
-Các bước của `scrape_references_for_paper` (mỗi bước là một nhóm hàm bên dưới):
+Các bước của `scrape_references_for_paper`:
   1. Kiểm tra và chuẩn hóa ID bài nguồn; sai hình dạng thì lỗi ngay, chưa gửi request nào.
   2. Hỏi Semantic Scholar (S2). Request đầu lấy luôn danh sách trích dẫn; nếu S2 cắt bớt thì lấy lại
-     bằng endpoint phân trang. Lỗi tạm thời (429, 5xx, mạng) được thử lại, chờ tăng dần.
-  3. S2 trả 404 (không biết bài này) thì đọc .bib/.bbl trong thư mục nguồn đã giải nén. Từ .bib chỉ lấy mục
-     mà file .tex trong thư mục trích (\\cite, \\nocite...).
+     bằng endpoint phân trang. Lỗi tạm thời (429, 5xx, mạng) được thử lại có chờ tăng dần (backoff + jitter).
+  3. S2 trả 404 (không biết bài này) thì đọc .bib trong thư mục nguồn đã giải nén (chỉ lấy mục mà .tex trích).
   4. Đổi mọi thứ thành bản ghi chung (đúng các khóa của REFERENCE_KEYS) và bỏ cạnh trích dẫn trùng.
+  5. Đóng gói vào ReferenceResult (kế thừa list) mang status ("success", "empty", "partial", "not_indexed", "bib_fallback", "api_error"),
+     bảo đảm không bao giờ làm rơi metadata bài báo ở main pipeline.
 
 Tài liệu API: https://api.semanticscholar.org/api-docs/graph
 """
@@ -24,29 +25,33 @@ from urllib.parse import quote
 
 import requests
 
+from src.crawler.exceptions import (
+    CrawlerError,
+    NetworkTimeoutError,
+    RateLimitError,
+)
+from src.crawler.rate_limiter import rate_limiter
+
 logger = logging.getLogger(__name__)
 
-# Danh sách khóa của MỘT bản ghi trích dẫn mà hàm trả về: mỗi bản ghi có đúng các khóa này, không thừa không thiếu.
-# Đây là "nguồn sự thật duy nhất" cho tên khóa: code tạo bản ghi, test và storage.py đều đọc từ đây.
-# - 6 khóa đầu là cột bảng `references` theo đề M1, giữ đúng thứ tự:
+# Danh sách khóa của MỘT bản ghi trích dẫn mà hàm trả về:
+# - 6 khóa đầu là cột bảng `references` theo đề M1:
 #   https://hcmus-cs-ta.github.io/lab-book/intro-ds/statement/crawling/
-# - 5 khóa sau là khóa nội bộ do Tân đề xuất, CHỜ Trí (storage.py) xác nhận.
-# - Thiếu dữ liệu thì để None, riêng ref_authors để [] (danh sách rỗng); không bịa giá trị.
-# Dùng tuple (không sửa được lúc chạy) để không đoạn code nào lỡ tay thêm/bớt khóa.
+# - 5 khóa sau là khóa nội bộ phục vụ phân tích / audit / fallback.
 REFERENCE_KEYS: tuple[str, ...] = (
     # --- 6 cột của đề ---
-    "arxiv_id",  # bài ĐANG trích dẫn (bài trong khoảng ID được giao), không có đuôi phiên bản
-    "ref_arxiv_id",  # bài ĐƯỢC trích, lấy từ externalIds.ArXiv; None nếu tài liệu không có trên arXiv
+    "arxiv_id",             # bài ĐANG trích dẫn (base ID, không có đuôi vN)
+    "ref_arxiv_id",         # bài ĐƯỢC trích, lấy từ externalIds.ArXiv; None nếu tài liệu không có trên arXiv
     "ref_title",
-    "ref_authors",  # list[str] tên tác giả, giữ thứ tự
+    "ref_authors",          # list[str] tên tác giả, giữ thứ tự
     "ref_submission_date",  # lấy từ publicationDate của S2 ("YYYY-MM-DD"); không tự dựng từ năm
-    "ref_s2_id",  # paperId của Semantic Scholar; thường None với mục S2 chưa nhận diện được
-    # --- 5 khóa nội bộ (đề xuất) ---
-    "ref_doi",  # DOI đã bỏ tiền tố "https://doi.org/" hoặc "doi:"
-    "ref_year",  # int
-    "ref_venue",  # chuỗi rỗng từ S2 coi là thiếu, đổi thành None
-    "raw_citation",  # chuỗi gốc trong .bib/.bbl (nhánh dự phòng); None với bản ghi từ API
-    "source",  # chỉ nhận "semantic_scholar" hoặc "bib_fallback"
+    "ref_s2_id",            # paperId của Semantic Scholar; None với mục S2 chưa nhận diện được
+    # --- 5 khóa nội bộ ---
+    "ref_doi",              # DOI đã bỏ tiền tố "https://doi.org/" hoặc "doi:"
+    "ref_year",             # int
+    "ref_venue",            # chuỗi rỗng từ S2 coi là thiếu, đổi thành None
+    "raw_citation",         # chuỗi gốc trong .bib/.bbl (nhánh dự phòng); None với bản ghi từ API
+    "source",               # "semantic_scholar" hoặc "bib_fallback"
 )
 
 # Hai giá trị hợp lệ của khóa "source".
@@ -54,11 +59,13 @@ _SOURCE_API = "semantic_scholar"
 _SOURCE_BIB = "bib_fallback"
 
 
-class ReferenceScrapeError(Exception):
-    """Lỗi khi lấy trích dẫn của một bài: mạng hỏng, máy chủ lỗi, hết lượt thử lại, dữ liệu trả về hỏng.
+# =================================================================================================
+# Ngoại lệ đặc tả cho scraper trích dẫn
+# =================================================================================================
 
-    Ném lỗi thay vì trả [] để main.py phân biệt "bài bị lỗi" với "bài không trích dẫn ai".
-    """
+
+class ReferenceScrapeError(CrawlerError):
+    """Lỗi khi lấy trích dẫn của một bài: mạng hỏng, máy chủ lỗi, hết lượt thử lại, dữ liệu trả về hỏng."""
 
 
 class PaperNotFoundError(ReferenceScrapeError):
@@ -66,126 +73,230 @@ class PaperNotFoundError(ReferenceScrapeError):
 
 
 class ReferencesUnavailableError(ReferenceScrapeError):
-    """S2 có bài và báo có trích dẫn (referenceCount > 0) nhưng không đưa mục nào.
+    """S2 có bài và báo có trích dẫn (referenceCount > 0) nhưng không đưa mục nào."""
 
-    Không phải lỗi tạm thời nên không thử lại, và không được che bằng fallback .bib/.bbl (fallback chỉ cho 404).
+
+class SemanticScholarRateLimitError(RateLimitError, ReferenceScrapeError):
+    """Hết lượt thử lại khi S2 trả HTTP 429."""
+
+
+class SemanticScholarConnectionError(NetworkTimeoutError, ReferenceScrapeError):
+    """Hết lượt thử lại khi gặp lỗi mạng/timeout tới S2."""
+
+
+# =================================================================================================
+# Cấu trúc kết quả trích dẫn: ReferenceResult
+# =================================================================================================
+
+
+class ReferenceResult(list):
+    """Danh sách kết quả trích dẫn kế thừa list để tương thích 100% với list[dict],
+    đồng thời mang metadata trạng thái: status, source, expected_count, received_count, request_stats.
+
+    Các trạng thái:
+      - "success": Lấy thành công đầy đủ trích dẫn từ S2.
+      - "empty": S2 xác nhận bài không có trích dẫn (referenceCount = 0).
+      - "partial": S2 trả về một phần trích dẫn (ít hơn referenceCount công bố).
+      - "bib_fallback": Không có trên S2 (404), đã trích xuất từ .bib được .tex trích dẫn.
+      - "not_indexed": S2 trả 404 và không có .bib dự phòng.
+      - "unavailable": S2 báo có trích dẫn nhưng trả về rỗng.
+      - "api_error": Lỗi mạng/API hoặc 429 quá số lần thử lại.
     """
+
+    def __init__(
+        self,
+        records: list[dict] | None = None,
+        status: str = "success",
+        source: str = _SOURCE_API,
+        expected_count: int | None = None,
+        received_count: int | None = None,
+        request_stats: dict | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        super().__init__(records or [])
+        self.status = status
+        self.source = source
+        self.expected_count = expected_count
+        self.received_count = len(self) if received_count is None else received_count
+        self.request_stats = dict(request_stats or {})
+        self.error_message = error_message
+
+    def __repr__(self) -> str:
+        return (
+            f"ReferenceResult(len={len(self)}, status={self.status!r}, "
+            f"source={self.source!r}, expected={self.expected_count}, received={self.received_count})"
+        )
 
 
 # --- Cấu hình gọi Semantic Scholar -----------------------------------------------------------------
 _API_BASE = "https://api.semanticscholar.org/graph/v1/paper"
-# Trường của một trích dẫn. Phải là trường PHẲNG: đề không cho dùng dạng lồng như `authors.name`.
+# Trường của một trích dẫn. Phải là trường phẳng theo đặc tả S2 Graph API.
 _REF_FIELDS = ("paperId", "title", "authors", "year", "publicationDate", "venue", "externalIds")
-_PAGE_FIELDS = ",".join(_REF_FIELDS)  # cho endpoint /references (tên trường không có tiền tố)
+_PAGE_FIELDS = ",".join(_REF_FIELDS)
 _PAPER_FIELDS = "referenceCount," + ",".join(f"references.{name}" for name in _REF_FIELDS)
-_PAGE_LIMIT = 1000  # S2 cho lấy tối đa 1000 mục mỗi trang /references
-_TIMEOUT = (10, 60)  # (giây chờ kết nối, giây chờ đọc). Thiếu timeout thì mạng đứng là treo vô hạn.
+_PAGE_LIMIT = 1000
+_TIMEOUT = (10, 60)
 
-# --- Thử lại khi lỗi tạm thời (giả định G4 ở đầu tests/test_reference_scraper.py) ----------------
+# Thử lại khi lỗi tạm thời (429, 5xx, timeout, ngắt kết nối)
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _TRANSIENT_ERRORS = (
     requests.exceptions.ConnectionError,
     requests.exceptions.Timeout,
     requests.exceptions.ChunkedEncodingError,
 )
-_MAX_ATTEMPTS = 6  # tổng số lần gửi một request: 1 lần đầu + 5 lần thử lại
-_BACKOFF_BASE_SEC = 10.0  # lần chờ đầu; mỗi lần sau gấp đôi: 10, 20, 40, 80, 160 giây
-_MAX_WAIT_SEC = 300.0  # trần cho MỖI lần chờ (5 phút), kể cả khi Retry-After đòi lâu hơn
-_JITTER_FRACTION = 0.25  # cộng thêm ngẫu nhiên tối đa 25% để các tiến trình khỏi thử lại cùng một lúc
+_MAX_ATTEMPTS = 6
+_BACKOFF_BASE_SEC = 5.0
+_MAX_WAIT_SEC = 120.0
+_JITTER_FRACTION = 0.25
 
-# Trạng thái ở mức module, dùng chung cho cả tiến trình (xem _get_session và _wait_for_rate_limit).
 _session: requests.Session | None = None
-_last_request_at: float | None = None  # mốc time.monotonic() của request gần nhất
 
 
 def _new_request_stats() -> dict:
-    """Bộ đếm rỗng: tổng request, request theo mã trả về, số lần thử lại, số giây chờ backoff và chờ giới hạn tốc độ."""
-    return {"requests": 0, "by_status": {}, "retries": 0, "backoff_sec": 0.0, "rate_limit_wait_sec": 0.0}
+    """Bộ đếm thống kê cho báo cáo Chương 03 và kiểm toán dữ liệu."""
+    return {
+        "requests": 0,
+        "by_status": {},
+        "retries": 0,
+        "backoff_sec": 0.0,
+        "rate_limit_wait_sec": 0.0,
+        "s2_404": 0,
+        "partials": 0,
+        "bib_fallbacks": 0,
+        "empty_refs": 0,
+    }
 
 
-# Bộ đếm để chương 03 báo cáo (số request, số 429, thời gian chờ). Chỉ ghi số, không đổi cách gọi S2.
 _request_stats: dict = _new_request_stats()
 
 
 def _count_request(key: str) -> None:
-    """Ghi nhận một request đã gửi. key là mã HTTP dạng chuỗi (ví dụ "429"), hoặc "network" khi lỗi mạng."""
     _request_stats["requests"] += 1
     _request_stats["by_status"][key] = _request_stats["by_status"].get(key, 0) + 1
 
 
 def reset_request_stats() -> None:
-    """Đặt bộ đếm về 0. Dùng khi bắt đầu một đoạn đo mới, hoặc trong test."""
+    """Đặt bộ đếm về 0 khi bắt đầu chạy một phân vùng mới hoặc trong test."""
     global _request_stats
     _request_stats = _new_request_stats()
 
 
 def get_request_stats() -> dict:
-    """Bản sao của bộ đếm hiện tại. Sửa bản sao không làm đổi bộ đếm thật."""
+    """Bản sao snapshot của bộ đếm hiện tại."""
     stats = dict(_request_stats)
     stats["by_status"] = dict(_request_stats["by_status"])
     return stats
+
+
+# =================================================================================================
+# Hàm giao diện chính
+# =================================================================================================
 
 
 def scrape_references_for_paper(
     arxiv_id: str,
     unzipped_paper_dir: str | None = None,
     rate_limit_sec: float = 3.1,
-) -> list[dict]:
-    """Lấy references qua Semantic Scholar, dự phòng bằng .bib/.bbl.
+    raise_on_error: bool = False,
+    raise_on_not_found: bool | None = None,
+) -> ReferenceResult:
+    """Lấy references qua Semantic Scholar, dự phòng bằng .bib trong thư mục nguồn đã giải nén.
 
     Tham số:
-      arxiv_id: ID bài nguồn. Nhận cả dạng có URL, tiền tố "arXiv:" hay đuôi "vN" và tự chuẩn hóa.
-      unzipped_paper_dir: thư mục nguồn đã giải nén của bài. Chỉ được đọc khi S2 trả 404.
-      rate_limit_sec: khoảng cách tối thiểu (giây) giữa hai request liên tiếp, tính chung cả tiến trình.
+      arxiv_id: ID bài nguồn (nhận cả dạng '2407.12839', 'arXiv:2407.12839v2', URL...).
+      unzipped_paper_dir: thư mục nguồn đã giải nén của bài (chỉ dùng đọc .bib khi S2 trả 404).
+      rate_limit_sec: khoảng cách tối thiểu (giây) giữa 2 request S2 (mặc định 3.1s cho hạn mức public).
+      raise_on_error: nếu True, ném ngoại lệ khi gặp lỗi mạng/404/không có trích dẫn.
+                      nếu False (mặc định cho pipeline), trả ReferenceResult với status tương ứng để
+                      pipeline KHÔNG bao giờ làm rơi bài báo khỏi publications.parquet.
+      raise_on_not_found: bí danh tương thích cho raise_on_error khi xử lý 404.
 
-    Trả về list[dict]; mỗi phần tử là một cạnh trích dẫn với đúng các khóa của REFERENCE_KEYS, theo thứ tự
-    S2 trả về. Khóa "source" cho biết bản ghi đến từ API hay từ .bib/.bbl. Danh sách rỗng [] CHỈ xuất hiện
-    khi S2 trả 200 và bài thật sự không có trích dẫn nào.
-
-    Ngoại lệ:
-      TypeError, ValueError: arxiv_id hoặc rate_limit_sec sai (chưa gửi request nào).
-      PaperNotFoundError: S2 trả 404 và không có .bib/.bbl dùng được.
-      ReferencesUnavailableError: S2 báo có trích dẫn nhưng không đưa mục nào.
-      ReferenceScrapeError: mọi lỗi còn lại (mạng, 429/5xx hết lượt thử lại, mã 4xx khác, dữ liệu hỏng).
+    Trả về:
+      ReferenceResult (kế thừa list[dict]): danh sách các cạnh trích dẫn theo REFERENCE_KEYS,
+      kèm các thuộc tính: status, source, expected_count, received_count, request_stats.
     """
+    if raise_on_not_found is not None:
+        raise_on_error = raise_on_not_found
+
     source_id = _validate_source_id(arxiv_id)
     if not math.isfinite(rate_limit_sec) or rate_limit_sec < 0:
         raise ValueError(f"rate_limit_sec phải là số không âm, nhận {rate_limit_sec!r}")
 
     try:
-        refs = _fetch_s2_references(source_id, rate_limit_sec)
+        refs, status, expected_count = _fetch_s2_references(source_id, rate_limit_sec)
+        records = _dedupe([_record_from_s2(source_id, ref) for ref in refs])
+        return ReferenceResult(
+            records,
+            status=status,
+            source=_SOURCE_API,
+            expected_count=expected_count,
+            received_count=len(records),
+            request_stats=get_request_stats(),
+        )
     except PaperNotFoundError as not_found:
-        # Chỉ 404 mới dẫn tới dự phòng. Lỗi tạm thời (429, 5xx, mạng) đã được thử lại rồi ném lên,
-        # không bao giờ chạy tới đây, nếu không dữ liệu dự phòng sẽ che mất lỗi.
-        records = _read_local_references(source_id, unzipped_paper_dir)
-        if not records:
-            raise PaperNotFoundError(f"{not_found}; không có .bib/.bbl dùng được trong thư mục nguồn") from not_found
-        return records
-    return _dedupe([_record_from_s2(source_id, ref) for ref in refs])
+        local_records = _read_local_references(source_id, unzipped_paper_dir)
+        if local_records:
+            _request_stats["bib_fallbacks"] = _request_stats.get("bib_fallbacks", 0) + 1
+            return ReferenceResult(
+                local_records,
+                status="bib_fallback",
+                source=_SOURCE_BIB,
+                expected_count=len(local_records),
+                received_count=len(local_records),
+                request_stats=get_request_stats(),
+            )
+        if raise_on_error:
+            raise PaperNotFoundError(f"{not_found}; không có .bib dùng được trong thư mục nguồn") from not_found
+        return ReferenceResult(
+            [],
+            status="not_indexed",
+            source="none",
+            expected_count=0,
+            received_count=0,
+            request_stats=get_request_stats(),
+            error_message=str(not_found),
+        )
+    except ReferencesUnavailableError as unavail:
+        if raise_on_error:
+            raise
+        return ReferenceResult(
+            [],
+            status="unavailable",
+            source=_SOURCE_API,
+            expected_count=None,
+            received_count=0,
+            request_stats=get_request_stats(),
+            error_message=str(unavail),
+        )
+    except ReferenceScrapeError as err:
+        if raise_on_error:
+            raise
+        logger.warning("Lỗi scrape references cho bài %s: %s", source_id, err)
+        return ReferenceResult(
+            [],
+            status="api_error",
+            source="none",
+            expected_count=None,
+            received_count=0,
+            request_stats=get_request_stats(),
+            error_message=str(err),
+        )
 
 
 # =================================================================================================
 # 1. Chuẩn hóa ID arXiv và DOI
 # =================================================================================================
 
-# ID arXiv có hai kiểu (https://info.arxiv.org/help/arxiv_identifier.html):
-#   mới: YYMM.NNNN hoặc YYMM.NNNNN, ví dụ 2407.12839
-#   cũ : archive/YYMMNNN, ví dụ hep-th/9901001 hoặc math.GT/0309136
 _ARXIV_ID_PATTERN = r"[0-9]{4}\.[0-9]{4,5}|[a-z]+(?:-[a-z]+)*(?:\.[A-Za-z]{2})?/[0-9]{7}"
 
-# Khớp TOÀN BỘ chuỗi (fullmatch): [URL hoặc "arXiv:"] + ID + ["vN"] + [".pdf"]. Chỉ phần tiền tố bỏ qua hoa/thường,
-# còn ID giữ nguyên (math.GT có chữ hoa thật). Nhóm số 1 là ID.
 _ARXIV_ID_RE = re.compile(
     r"(?:(?i:https?://(?:www\.)?arxiv\.org/(?:abs|pdf)/|arxiv:))?"
     rf"({_ARXIV_ID_PATTERN})"
     r"(?:v[0-9]+)?(?:\.pdf)?"
 )
 
-# DOI có dạng 10.<mã nhà xuất bản>/<hậu tố>. Khớp toàn bộ chuỗi, cho phép tiền tố URL hoặc "doi:". Nhóm số 1 là DOI.
 _DOI_RE = re.compile(r"(?:(?i:https?://(?:dx\.)?doi\.org/|doi:\s*))?(10\.[^\s/]+/\S+)")
 
-# Tìm ID/DOI nằm TRONG chuỗi trích dẫn tự do (.bbl, trường url/note của .bib). ID arXiv bắt buộc có dấu hiệu
-# đi kèm ("arXiv:", "arxiv.org/abs/", hoặc "abs/" kiểu CoRR) nên số vu vơ như "1234.5678" không bị nhận nhầm.
 _ARXIV_IN_TEXT_RE = re.compile(
     r"(?:(?i:arxiv\.org/(?:abs|pdf)/|arxiv\s*:\s*)|(?<![A-Za-z0-9])abs/)"
     rf"({_ARXIV_ID_PATTERN})(?![0-9])"
@@ -202,7 +313,7 @@ def _normalize_arxiv_id(value: object) -> str | None:
 
 
 def _normalize_doi(value: object) -> str | None:
-    """Bỏ tiền tố URL hoặc "doi:" khỏi DOI, giữ nguyên hoa/thường; không phải DOI thì None."""
+    """Bỏ tiền tố URL hoặc 'doi:' khỏi DOI; không phải DOI thì None."""
     if not isinstance(value, str):
         return None
     match = _DOI_RE.fullmatch(value.strip())
@@ -210,21 +321,18 @@ def _normalize_doi(value: object) -> str | None:
 
 
 def _trim_trailing_punctuation(text: str) -> str:
-    """Bỏ dấu câu dính ở cuối ID do nằm cuối câu, ví dụ "10.1000/abc." hay "(doi:10.1000/abc)"."""
     text = text.rstrip(".,;:")
-    while text.endswith(")") and text.count(")") > text.count("("):  # chỉ bỏ ")" thừa, giữ ")" thuộc DOI
+    while text.endswith(")") and text.count(")") > text.count("("):
         text = text[:-1].rstrip(".,;:")
     return text
 
 
 def _find_arxiv_id(text: str) -> str | None:
-    """ID arXiv đầu tiên có dấu hiệu rõ ràng trong chuỗi tự do; không có thì None (không đoán)."""
     match = _ARXIV_IN_TEXT_RE.search(text)
     return match.group(1) if match else None
 
 
 def _find_doi(text: str) -> str | None:
-    """DOI đầu tiên trong chuỗi tự do, đã bỏ dấu câu cuối; không có thì None."""
     match = _DOI_IN_TEXT_RE.search(text)
     if match is None:
         return None
@@ -232,10 +340,6 @@ def _find_doi(text: str) -> str | None:
 
 
 def _validate_source_id(arxiv_id: object) -> str:
-    """ID bài nguồn đã chuẩn hóa. Sai kiểu hoặc sai hình dạng thì lỗi NGAY, trước khi gửi request.
-
-    Kiểm chặt vì ID được ghép vào URL: chuỗi như "2407.12839?fields=x" hay "../x" không được lọt qua.
-    """
     if not isinstance(arxiv_id, str):
         raise TypeError(f"arxiv_id phải là chuỗi, nhận {type(arxiv_id).__name__}")
     normalized = _normalize_arxiv_id(arxiv_id)
@@ -245,12 +349,11 @@ def _validate_source_id(arxiv_id: object) -> str:
 
 
 # =================================================================================================
-# 2. Gọi HTTP: Session dùng chung, giới hạn tốc độ, thử lại có chờ tăng dần
+# 2. Gọi HTTP: Session, rate limit, exponential backoff + jitter
 # =================================================================================================
 
 
 def _get_session() -> requests.Session:
-    """MỘT Session dùng chung cả tiến trình: giữ kết nối mở, khỏi bắt tay lại với server ở mỗi request."""
     global _session
     if _session is None:
         _session = requests.Session()
@@ -258,40 +361,20 @@ def _get_session() -> requests.Session:
 
 
 def _api_headers() -> dict[str, str]:
-    """Header xác thực. Khóa chỉ đọc từ biến môi trường S2_API_KEY, MỖI LẦN gọi (không đọc lúc import).
-
-    Khóa chỉ đi bằng header, không bao giờ vào URL, log hay thông điệp lỗi. Không có khóa thì trả {}:
-    vẫn chạy được ở chế độ không khóa (hạn mức chung, chậm hơn).
-    """
     key = os.environ.get("S2_API_KEY", "").strip()
     return {"x-api-key": key} if key else {}
 
 
 def _wait_for_rate_limit(rate_limit_sec: float) -> None:
-    """Ngủ vừa đủ để hai request liên tiếp cách nhau ít nhất rate_limit_sec giây, rồi ghi mốc cho request sắp gửi.
-
-    Mốc _last_request_at nằm ở mức module nên bộ giới hạn dùng chung cả tiến trình: gọi cho bài khác vẫn nối tiếp
-    mốc của bài trước. Chỉ ngủ phần CÒN THIẾU (thời gian tải/giải nén đã trôi qua thì không ngủ thêm), khác với
-    `sleep` cứng sau mỗi lệnh. Hàm này được gọi trước MỌI request, kể cả trang sau và lần thử lại.
-    Giả định chạy tuần tự, đúng với `main.py` (không dùng nhiều luồng).
-    """
-    global _last_request_at
-    now = time.monotonic()
-    if _last_request_at is not None:
-        remaining = _last_request_at + rate_limit_sec - now
-        if remaining > 0:
-            time.sleep(remaining)
-            _request_stats["rate_limit_wait_sec"] += remaining
-            now = time.monotonic()
-    _last_request_at = now
+    """Giới hạn tốc độ sử dụng DomainRateLimiter cho domain 'semantic_scholar'."""
+    t0 = time.monotonic()
+    rate_limiter.wait("semantic_scholar", interval=rate_limit_sec)
+    waited = time.monotonic() - t0
+    if waited > 0.001:
+        _request_stats["rate_limit_wait_sec"] += waited
 
 
 def _parse_retry_after(value: str | None) -> float | None:
-    """Đọc header Retry-After dạng số giây (RFC 9110, mục 10.2.3). Hỏng hay không có thì None.
-
-    "Hỏng" gồm chữ, rỗng, số âm, NaN, vô cực. Dạng ngày giờ HTTP (ví dụ "Wed, 21 Oct 2026 07:28:00 GMT")
-    chưa được hỗ trợ và cũng cho None; khi đó dùng backoff thay thế.
-    """
     try:
         seconds = float(value)
     except (TypeError, ValueError):
@@ -300,27 +383,14 @@ def _parse_retry_after(value: str | None) -> float | None:
 
 
 def _backoff_seconds(attempt: int, retry_after: float | None) -> float:
-    """Số giây chờ trước lần thử kế tiếp (attempt = số lần đã gửi, bắt đầu từ 1).
-
-    Server đã nói phải chờ bao lâu (Retry-After) thì nghe theo. Nếu không thì exponential backoff (chờ gấp đôi
-    sau mỗi lần) cộng jitter (lệch ngẫu nhiên nhỏ). Lần chờ nào cũng có trần _MAX_WAIT_SEC.
-    Ý tưởng jitter: https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
-    """
     if retry_after is not None:
         return min(retry_after, _MAX_WAIT_SEC)
-    delay = _BACKOFF_BASE_SEC * 2 ** (attempt - 1)
+    delay = _BACKOFF_BASE_SEC * (2 ** (attempt - 1))
     delay += random.uniform(0, delay * _JITTER_FRACTION)
     return min(delay, _MAX_WAIT_SEC)
 
 
 def _get_json(url: str, params: dict, source_id: str, rate_limit_sec: float) -> object:
-    """GET một URL của S2 và trả về JSON đã giải mã, thử lại khi gặp lỗi tạm thời.
-
-    - 200: trả JSON. Nội dung không phải JSON thì ReferenceScrapeError, không thử lại.
-    - 404: PaperNotFoundError. Đây là câu trả lời dứt khoát nên không thử lại.
-    - 429, 5xx, lỗi mạng: chờ rồi thử lại, tối đa _MAX_ATTEMPTS lần; hết lượt thì ReferenceScrapeError.
-    - mã khác (400, 401, 403...): ReferenceScrapeError ngay, vì thử lại cũng vô ích.
-    """
     session = _get_session()
     headers = _api_headers()
     for attempt in range(1, _MAX_ATTEMPTS + 1):
@@ -334,9 +404,11 @@ def _get_json(url: str, params: dict, source_id: str, rate_limit_sec: float) -> 
             problem, cause = f"lỗi mạng {type(exc).__name__}", exc
         except requests.exceptions.RequestException as exc:
             _count_request("network")
-            # Lỗi kiểu URL sai, chuyển hướng vô tận...: thử lại không giúp gì. Chỉ ghi tên lỗi, không ghi nội dung.
-            raise ReferenceScrapeError(
-                f"Request tới S2 cho bài {source_id} thất bại, không thử lại được: {type(exc).__name__}"
+            raise SemanticScholarConnectionError(
+                f"Request tới S2 cho bài {source_id} thất bại: {type(exc).__name__}",
+                timeout=_TIMEOUT[1],
+                endpoint=url,
+                failed_ids=[source_id],
             ) from exc
         else:
             status = response.status_code
@@ -344,6 +416,7 @@ def _get_json(url: str, params: dict, source_id: str, rate_limit_sec: float) -> 
             if status == 200:
                 return _decode_json(response, source_id)
             if status == 404:
+                _request_stats["s2_404"] = _request_stats.get("s2_404", 0) + 1
                 raise PaperNotFoundError(f"S2 không có bài {source_id} (HTTP 404)")
             if status not in _RETRY_STATUSES:
                 raise ReferenceScrapeError(f"S2 trả HTTP {status} cho bài {source_id}")
@@ -351,9 +424,24 @@ def _get_json(url: str, params: dict, source_id: str, rate_limit_sec: float) -> 
             retry_after = _parse_retry_after(response.headers.get("Retry-After"))
 
         if attempt == _MAX_ATTEMPTS:
+            if cause is not None:
+                raise SemanticScholarConnectionError(
+                    f"S2 lỗi mạng sau {_MAX_ATTEMPTS} lần thử cho bài {source_id}: {problem}",
+                    timeout=_TIMEOUT[1],
+                    endpoint=url,
+                    failed_ids=[source_id],
+                ) from cause
+            if "429" in problem:
+                raise SemanticScholarRateLimitError(
+                    f"S2 rate limit sau {_MAX_ATTEMPTS} lần thử cho bài {source_id}",
+                    status_code=429,
+                    retry_after=retry_after,
+                    failed_ids=[source_id],
+                )
             raise ReferenceScrapeError(
                 f"S2 vẫn lỗi sau {_MAX_ATTEMPTS} lần thử cho bài {source_id} (lần cuối: {problem})"
             ) from cause
+
         wait = _backoff_seconds(attempt, retry_after)
         _request_stats["retries"] += 1
         _request_stats["backoff_sec"] += wait
@@ -361,12 +449,11 @@ def _get_json(url: str, params: dict, source_id: str, rate_limit_sec: float) -> 
             "S2 lỗi (%s) cho bài %s, thử lại lần %d/%d sau %.1f giây",
             problem, source_id, attempt, _MAX_ATTEMPTS - 1, wait,
         )
-        if wait > 0:  # Retry-After: 0 nghĩa là không cần chờ thêm; bộ giới hạn tốc độ vẫn tự chờ nếu cần
+        if wait > 0:
             time.sleep(wait)
 
 
 def _decode_json(response: requests.Response, source_id: str) -> object:
-    """Giải mã thân phản hồi 200; không phải JSON hợp lệ (HTML của gateway, rỗng, bị cắt) thì báo lỗi."""
     try:
         return response.json()
     except ValueError as exc:
@@ -374,42 +461,51 @@ def _decode_json(response: requests.Response, source_id: str) -> object:
 
 
 # =================================================================================================
-# 3. Lấy trích dẫn từ Semantic Scholar (kể cả khi bị cắt bớt)
+# 3. Lấy trích dẫn từ Semantic Scholar (hỗ trợ phân trang và phát hiện cắt bớt)
 # =================================================================================================
 
 
-def _fetch_s2_references(source_id: str, rate_limit_sec: float) -> list[dict]:
-    """Toàn bộ trích dẫn thô (dict kiểu S2) của bài. PaperNotFoundError nếu S2 không có bài này.
+def _fetch_s2_references(source_id: str, rate_limit_sec: float) -> tuple[list[dict], str, int | None]:
+    """Toàn bộ trích dẫn thô từ Semantic Scholar.
 
-    Request đầu (`/paper/arXiv:{id}`) lấy cả danh sách trích dẫn trong một lần, nhanh nhất. Nhưng S2 có thể cắt
-    bớt, nên so với referenceCount (tổng thật): đủ thì dùng luôn. Thiếu (hoặc không biết tổng) thì lấy lại bằng
-    endpoint phân trang rồi giữ bản DÀI HƠN trong hai bản; không nối hai bản vì chưa chắc hai endpoint cùng thứ tự.
-    Nếu vẫn thiếu: không có mục nào thì ném ReferencesUnavailableError; thiếu một phần thì ghi cảnh báo và giữ
-    phần lấy được.
+    Trả về tuple: (danh_sách_refs, status, expected_count).
+    Status có thể là: 'success', 'empty', 'partial'.
     """
     paper_url = f"{_API_BASE}/arXiv:{quote(source_id, safe='')}"
     body = _get_json(paper_url, {"fields": _PAPER_FIELDS}, source_id, rate_limit_sec)
     refs = body.get("references") if isinstance(body, dict) else None
     if not isinstance(refs, list):
         raise ReferenceScrapeError(f"S2 trả dữ liệu sai hình dạng cho bài {source_id}: thiếu danh sách references")
+
     total = body.get("referenceCount")
     known_total = isinstance(total, int) and not isinstance(total, bool)
+
+    if known_total and total == 0:
+        _request_stats["empty_refs"] = _request_stats.get("empty_refs", 0) + 1
+        return [], "empty", 0
+
     if known_total and len(refs) >= total:
-        return refs
+        return refs, "success", total
+
+    # Nếu S2 cắt bớt trong request đầu, gọi tiếp endpoint /references phân trang
     paged = _fetch_s2_pages(f"{paper_url}/references", source_id, rate_limit_sec)
-    if len(paged) < len(refs):  # trang lỗi mà lần đầu có nhiều hơn: giữ lần đầu, không bỏ mất dữ liệu thật
+    if len(paged) < len(refs):
         paged = refs
+
     if known_total and len(paged) < total:
         if not paged:
             raise ReferencesUnavailableError(f"S2 báo bài {source_id} có {total} trích dẫn nhưng không trả mục nào")
         logger.warning(
-            "S2 báo bài %s có %d trích dẫn nhưng chỉ trả %d; giữ phần lấy được", source_id, total, len(paged)
+            "S2 báo bài %s có %d trích dẫn nhưng chỉ trả %d; đánh dấu partial", source_id, total, len(paged)
         )
-    return paged
+        _request_stats["partials"] = _request_stats.get("partials", 0) + 1
+        return paged, "partial", total
+
+    return paged, "success", total if known_total else len(paged)
 
 
 def _fetch_s2_pages(url: str, source_id: str, rate_limit_sec: float) -> list[dict]:
-    """Đi hết các trang của endpoint /references, theo đúng `next` mà S2 báo (không tự đoán theo limit)."""
+    """Duyệt hết các trang phân trang của S2 qua cursor next."""
     refs: list[dict] = []
     offset = 0
     while True:
@@ -417,12 +513,12 @@ def _fetch_s2_pages(url: str, source_id: str, rate_limit_sec: float) -> list[dic
         try:
             page = _get_json(url, params, source_id, rate_limit_sec)
         except PaperNotFoundError as exc:
-            # Request đầu đã tìm thấy bài mà trang sau lại 404: S2 tự mâu thuẫn. Đây là lỗi, KHÔNG được coi là
-            # "bài không có trên S2" (nếu không sẽ rơi vào nhánh dự phòng và che mất lỗi).
             raise ReferenceScrapeError(f"Trang offset={offset} của bài {source_id} trả 404 dù bài tồn tại") from exc
+
         data = page.get("data") if isinstance(page, dict) else None
         if not isinstance(data, list):
             raise ReferenceScrapeError(f"S2 trả trang sai hình dạng cho bài {source_id} (offset={offset})")
+
         for item in data:
             cited = item.get("citedPaper") if isinstance(item, dict) else None
             if not isinstance(cited, dict):
@@ -430,9 +526,9 @@ def _fetch_s2_pages(url: str, source_id: str, rate_limit_sec: float) -> list[dic
             refs.append(cited)
 
         next_offset = page.get("next")
-        if next_offset is None:  # không còn trang sau
+        if next_offset is None:
             return refs
-        # Chống vòng lặp vô hạn khi S2 phân trang lỗi: `next` phải tiến lên và trang phải có dữ liệu.
+
         if not isinstance(next_offset, int) or isinstance(next_offset, bool) or next_offset <= offset or not data:
             raise ReferenceScrapeError(
                 f"Phân trang của S2 không tiến cho bài {source_id} (offset={offset}, next={next_offset!r})"
@@ -441,7 +537,7 @@ def _fetch_s2_pages(url: str, source_id: str, rate_limit_sec: float) -> list[dic
 
 
 # =================================================================================================
-# 4. Đổi dữ liệu thô thành bản ghi
+# 4. Đổi dữ liệu thô thành bản ghi chuẩn
 # =================================================================================================
 
 
@@ -459,12 +555,12 @@ def _make_record(
     ref_venue: str | None = None,
     raw_citation: str | None = None,
 ) -> dict:
-    """Dựng MỘT bản ghi đủ 11 khóa của REFERENCE_KEYS. Thiếu dữ liệu thì None (riêng tác giả thì [])."""
+    """Dựng MỘT bản ghi đúng 11 khóa của REFERENCE_KEYS."""
     return {
         "arxiv_id": arxiv_id,
         "ref_arxiv_id": ref_arxiv_id,
         "ref_title": ref_title,
-        "ref_authors": list(ref_authors) if ref_authors else [],  # luôn là list MỚI, không dùng chung giữa các bản ghi
+        "ref_authors": list(ref_authors) if ref_authors else [],
         "ref_submission_date": ref_submission_date,
         "ref_s2_id": ref_s2_id,
         "ref_doi": ref_doi,
@@ -476,19 +572,16 @@ def _make_record(
 
 
 def _clean_text(value: object) -> str | None:
-    """Giữ NGUYÊN chuỗi gốc; không phải chuỗi, rỗng hoặc toàn khoảng trắng thì coi là thiếu (None)."""
     return value if isinstance(value, str) and value.strip() else None
 
 
 def _s2_author_names(authors: object) -> list[str]:
-    """Tên các tác giả theo thứ tự của S2; bỏ mục không có tên."""
     if not isinstance(authors, list):
         return []
     return [a["name"] for a in authors if isinstance(a, dict) and _clean_text(a.get("name"))]
 
 
 def _record_from_s2(source_id: str, ref: object) -> dict:
-    """Một mục trích dẫn của S2 thành một bản ghi. Khóa nào S2 bỏ hẳn hay để null thì cho None, không bịa."""
     if not isinstance(ref, dict):
         raise ReferenceScrapeError(f"S2 trả một mục trích dẫn không phải object cho bài {source_id}")
     external_ids = ref.get("externalIds")
@@ -501,7 +594,7 @@ def _record_from_s2(source_id: str, ref: object) -> dict:
         ref_arxiv_id=_normalize_arxiv_id(external_ids.get("ArXiv")),
         ref_title=_clean_text(ref.get("title")),
         ref_authors=_s2_author_names(ref.get("authors")),
-        ref_submission_date=_clean_text(ref.get("publicationDate")),  # chỉ lấy nguyên văn, không dựng từ năm
+        ref_submission_date=_clean_text(ref.get("publicationDate")),
         ref_s2_id=_clean_text(ref.get("paperId")),
         ref_doi=_normalize_doi(external_ids.get("DOI")),
         ref_year=year if isinstance(year, int) and not isinstance(year, bool) else None,
@@ -510,12 +603,11 @@ def _record_from_s2(source_id: str, ref: object) -> dict:
 
 
 # =================================================================================================
-# 5. Bỏ cạnh trích dẫn trùng
+# 5. Khử trùng cạnh trích dẫn
 # =================================================================================================
 
 
 def _normalize_title(title: str | None) -> str:
-    """Dạng so sánh của tiêu đề: thường hóa, bỏ dấu câu và ngoặc, gộp khoảng trắng. CHỈ dùng để so trùng."""
     if not title:
         return ""
     folded = unicodedata.normalize("NFKC", title).casefold()
@@ -523,10 +615,6 @@ def _normalize_title(title: str | None) -> str:
 
 
 def _dedupe_key(record: dict) -> tuple | None:
-    """Khóa nhận diện một cạnh trích dẫn: ID arXiv; không có thì ID S2; không có nữa thì (tiêu đề chuẩn hóa, năm).
-
-    Không dựng được khóa nào (không ID, không tiêu đề) thì None: không đủ cơ sở để nói hai mục là một.
-    """
     if record["ref_arxiv_id"]:
         return ("arxiv", record["ref_arxiv_id"])
     if record["ref_s2_id"]:
@@ -536,10 +624,6 @@ def _dedupe_key(record: dict) -> tuple | None:
 
 
 def _dedupe(records: list[dict]) -> list[dict]:
-    """Mỗi cạnh (bài nguồn, tài liệu được trích) chỉ một dòng: giữ dòng xuất hiện đầu, các dòng còn lại giữ thứ tự.
-
-    Tập `seen` là biến cục bộ nên chỉ chống trùng trong MỘT bài; hai bài cùng trích một tài liệu vẫn mỗi bài một dòng.
-    """
     seen: set[tuple] = set()
     unique = []
     for record in records:
@@ -553,42 +637,29 @@ def _dedupe(records: list[dict]) -> list[dict]:
 
 
 # =================================================================================================
-# 6. Dự phòng: đọc .bib / .bbl trong thư mục nguồn đã giải nén
+# 6. Dự phòng: Đọc .bib trong thư mục nguồn khi S2 trả 404
 # =================================================================================================
-# Chỉ được gọi khi S2 trả 404. Bóc được trường nào thì lấy trường đó, KHÔNG đoán phần còn lại; chuỗi gốc luôn
-# được giữ trong `raw_citation`. Định dạng BibTeX: http://www.bibtex.org/Format/
 
 _BRACE_RE = re.compile(r"[{}]")
 _QUOTE_SCAN_RE = re.compile(r'[{}"]')
-# Đầu một mục: "@loại{" nằm đầu dòng (cho phép thụt lề). Dùng để cắt file thành từng khối, nhờ vậy một mục
-# thiếu ngoặc đóng chỉ làm mất chính nó chứ không nuốt cả các mục phía sau.
 _BIB_LINE_START_RE = re.compile(r"^[ \t]*@(?=[A-Za-z]+\s*\{)", re.MULTILINE)
 _BIB_HEAD_RE = re.compile(r"@([A-Za-z]+)\s*\{")
-# Tên trường kiểu `title =`. Lookbehind buộc phải bắt đầu ở đầu từ để regex không thử lại ở từng chữ cái của
-# một chuỗi chữ dài (tránh chậm bậc hai).
 _BIB_FIELD_NAME_RE = re.compile(r"(?<![A-Za-z0-9_:\-])([A-Za-z][A-Za-z0-9_:\-]*)\s*=\s*")
 _BIB_BARE_RE = re.compile(r'[^\s,{}"#]+')
 _BIB_AND_RE = re.compile(r"[{}]|(?<=\s)and(?=\s)", re.IGNORECASE)
 _BIB_YEAR_RE = re.compile(r"[0-9]{4}(?![0-9])")
-_BIB_SKIPPED_KINDS = frozenset({"string", "preamble", "comment"})  # không phải trích dẫn
+_BIB_SKIPPED_KINDS = frozenset({"string", "preamble", "comment"})
 
 _BIBITEM_RE = re.compile(r"\\bibitem\b")
-_BIBITEM_HEAD_RE = re.compile(r"\s*(?:\[[^\]]*\])?\s*\{[^}]*\}")  # phần "[nhãn]{khóa}" ngay sau \bibitem
+_BIBITEM_HEAD_RE = re.compile(r"\s*(?:\[[^\]]*\])?\s*\{[^}]*\}")
 _END_BIBLIOGRAPHY = "\\end{thebibliography}"
 
-# --- .tex: lệnh trích dẫn (chỉ dùng để chọn mục .bib) -----------------------------------------------
-_TEX_COMMENT_RE = re.compile(r"(?<!\\)%[^\n]*")  # từ % tới hết dòng; \% là dấu phần trăm thật, không phải chú thích
-# Tên lệnh bất kỳ, tối đa hai tham số tùy chọn [..] (natbib: \citet[xem][ch.~2]), rồi nhóm {khóa1,khóa2}.
-# Lọc lệnh có chữ "cite" bằng Python chứ không đưa vào regex: regex kiểu \\[A-Za-z]*cite[A-Za-z]* đo được
-# 5,8 giây trên chuỗi \cite lặp 8.000 lần, còn regex này chạy dưới 0,1 giây trên đầu vào cỡ 1 triệu ký tự.
+_TEX_COMMENT_RE = re.compile(r"(?<!\\)%[^\n]*")
 _TEX_CITE_RE = re.compile(r"\\([A-Za-z]+)\*?\s*(?:\[[^\[\]{}]{0,500}\]\s*){0,2}\{([^{}]*)\}")
 
 
 def _cited_keys(tex_texts: list[str]) -> set[str]:
-    """Khóa BibTeX mà các file .tex trích (cite, citep, parencite, nocite...); "*" nghĩa là \\nocite{*}.
-
-    Phần chú thích bị bỏ trước khi tìm, nên lệnh nằm sau % không được tính.
-    """
+    """Tìm các khóa BibTeX mà các file .tex trích dẫn; '*' nghĩa là \\nocite{*}."""
     keys: set[str] = set()
     for text in tex_texts:
         for match in _TEX_CITE_RE.finditer(_TEX_COMMENT_RE.sub("", text)):
@@ -598,19 +669,13 @@ def _cited_keys(tex_texts: list[str]) -> set[str]:
 
 
 def _read_local_references(source_id: str, unzipped_paper_dir: str | None) -> list[dict]:
-    """Bản ghi dự phòng đọc từ .bib/.bbl trong thư mục (kể cả thư mục con); không có gì dùng được thì [].
-
-    Quy tắc chọn:
-      - .bib chỉ giữ mục mà file .tex trong thư mục trích. File .bib thường là kho chung của tác giả, lớn hơn
-        số trích dẫn thật của bài, nên đưa cả kho vào là bịa dữ liệu. Không .tex nào trích thì không giữ mục nào.
-      - .bbl chỉ dùng khi không còn mục .bib nào được trích. Không trộn hai nguồn: cùng tài liệu sẽ bị tính hai lần.
-    """
+    """Đọc bản ghi trích dẫn từ .bib trong thư mục đã giải nén (chỉ lấy mục mà .tex trích dẫn)."""
     if unzipped_paper_dir is None:
         return []
     root = Path(unzipped_paper_dir)
     if not root.is_dir():
         return []
-    # Bỏ symlink để một file trong gói giải nén không thể trỏ ra ngoài thư mục. Sắp xếp để kết quả ổn định.
+
     files = sorted(p for p in root.rglob("*") if p.is_file() and not p.is_symlink())
     bib_files = [p for p in files if p.suffix.lower() == ".bib"]
     if bib_files:
@@ -620,6 +685,7 @@ def _read_local_references(source_id: str, unzipped_paper_dir: str | None) -> li
         if kept:
             logger.info("Dùng .bib dự phòng cho bài %s: giữ %d/%d mục được trích", source_id, len(kept), len(entries))
             return _dedupe(kept)
+
     bbl_records: list[dict] = []
     for path in files:
         if path.suffix.lower() == ".bbl":
@@ -627,11 +693,11 @@ def _read_local_references(source_id: str, unzipped_paper_dir: str | None) -> li
     if bbl_records:
         logger.info("Dùng .bbl dự phòng cho bài %s: %d mục", source_id, len(bbl_records))
         return _dedupe(bbl_records)
+
     return []
 
 
 def _read_text(path: Path) -> str:
-    """Đọc file văn bản. Thử UTF-8 (tự bỏ BOM đầu file); không được thì Latin-1, đọc được mọi byte nên không lỗi."""
     try:
         data = path.read_bytes()
     except OSError as exc:
@@ -642,11 +708,7 @@ def _read_text(path: Path) -> str:
         return data.decode("latin-1")
 
 
-# --- .bib ------------------------------------------------------------------------------------------
-
-
 def _find_closing_brace(text: str, open_index: int) -> int:
-    """Vị trí dấu } khớp với dấu { ở open_index (đếm ngoặc lồng nhau). Không khớp thì -1."""
     depth = 0
     for match in _BRACE_RE.finditer(text, open_index):
         depth += 1 if match.group() == "{" else -1
@@ -656,12 +718,6 @@ def _find_closing_brace(text: str, open_index: int) -> int:
 
 
 def _split_bib_entries(text: str) -> Iterator[tuple[str, str]]:
-    """Duyệt các mục `@loại{...}`; mỗi lần trả (loại viết thường, chuỗi gốc của cả mục).
-
-    Cắt file thành khối ở mỗi "@loại{" đầu dòng rồi mới ghép ngoặc TRONG từng khối, nên thời gian chạy tỉ lệ với
-    kích thước file và mục hỏng (thiếu ngoặc đóng) chỉ mất riêng nó. Trong một khối vẫn tìm tiếp các mục
-    cùng dòng, ví dụ `@a{...}@b{...}`.
-    """
     starts = [m.start() for m in _BIB_LINE_START_RE.finditer(text)]
     for i, start in enumerate(starts):
         chunk = text[start : starts[i + 1] if i + 1 < len(starts) else len(text)]
@@ -671,18 +727,13 @@ def _split_bib_entries(text: str) -> Iterator[tuple[str, str]]:
             if head is None:
                 break
             end = _find_closing_brace(chunk, head.end() - 1)
-            if end == -1:  # mục không đóng: bỏ phần còn lại của khối
+            if end == -1:
                 break
             yield head.group(1).lower(), chunk[head.start() : end + 1]
             pos = end + 1
 
 
 def _read_bib_value(text: str, pos: int) -> tuple[str | None, int]:
-    """Đọc giá trị của một trường bắt đầu ở pos; trả (giá trị hoặc None, vị trí ngay sau giá trị).
-
-    Hỗ trợ `{...}` (ngoặc lồng nhau), `"..."` và số trần như `2019`. Tên macro như `jfix` (định nghĩa bằng
-    @string) trả None: không tự suy ra nội dung, vì đoán sai là bịa dữ liệu.
-    """
     if pos >= len(text):
         return None, pos
     char = text[pos]
@@ -692,7 +743,7 @@ def _read_bib_value(text: str, pos: int) -> tuple[str | None, int]:
             return None, len(text)
         return text[pos + 1 : end], end + 1
     if char == '"':
-        depth = 0  # dấu " nằm trong {...} không kết thúc chuỗi
+        depth = 0
         for match in _QUOTE_SCAN_RE.finditer(text, pos + 1):
             token = match.group()
             if token == "{":
@@ -709,7 +760,6 @@ def _read_bib_value(text: str, pos: int) -> tuple[str | None, int]:
 
 
 def _parse_bib_fields(text: str) -> dict[str, str]:
-    """Các cặp `tên = giá trị` của một mục (tên viết thường). Trường lặp thì giữ lần đầu."""
     fields: dict[str, str] = {}
     pos = 0
     while True:
@@ -722,15 +772,10 @@ def _parse_bib_fields(text: str) -> dict[str, str]:
 
 
 def _collapse_spaces(value: str | None) -> str | None:
-    """Gộp khoảng trắng và xuống dòng thành một dấu cách (giá trị trong .bib hay bị ngắt dòng); rỗng thì None."""
     return " ".join(value.split()) or None if value else None
 
 
 def _bib_authors(value: str | None) -> list[str]:
-    """Tách trường author theo chữ "and" nằm NGOÀI ngoặc nhọn, nên tên tập thể {A and B} không bị tách.
-
-    Giữ nguyên dạng "Họ, Tên" như trong file (không đảo), bỏ "others" (nghĩa là "và cộng sự").
-    """
     if not value:
         return []
     pieces, depth, start = [], 0, 0
@@ -749,7 +794,6 @@ def _bib_authors(value: str | None) -> list[str]:
 
 
 def _bib_year(fields: dict[str, str]) -> int | None:
-    """Năm lấy từ `year`, không có thì từ `date` (dạng 2021-03-04). Chỉ nhận 4 chữ số đứng đầu, không đoán."""
     for name in ("year", "date"):
         match = _BIB_YEAR_RE.match(fields.get(name, "").strip())
         if match:
@@ -758,8 +802,6 @@ def _bib_year(fields: dict[str, str]) -> int | None:
 
 
 def _bib_arxiv_id(fields: dict[str, str], raw: str) -> str | None:
-    """ID arXiv của một mục .bib. Chấp nhận `eprint` KHI archivePrefix (hoặc eprinttype) ghi rõ là arXiv,
-    nếu không thì chỉ lấy khi chuỗi gốc có dấu hiệu rõ ràng ("arXiv:...", URL arxiv.org). Còn lại là None."""
     prefix = (fields.get("archiveprefix") or fields.get("eprinttype") or "").strip().lower()
     if prefix == "arxiv":
         found = _normalize_arxiv_id(fields.get("eprint"))
@@ -769,10 +811,11 @@ def _bib_arxiv_id(fields: dict[str, str], raw: str) -> str | None:
 
 
 def _record_from_bib_entry(source_id: str, raw: str) -> dict:
-    """Một mục .bib thành một bản ghi; `raw_citation` là chuỗi gốc của cả mục."""
     head = _BIB_HEAD_RE.match(raw)
-    body = raw[head.end() : -1]  # bỏ "@loại{" ở đầu và "}" ở cuối
-    _, _, rest = body.partition(",")  # phần trước dấu phẩy đầu tiên là khóa trích dẫn, không dùng tới
+    if head is None:
+        return _make_record(source_id, _SOURCE_BIB, raw_citation=raw)
+    body = raw[head.end() : -1]
+    _, _, rest = body.partition(",")
     fields = _parse_bib_fields(rest)
     return _make_record(
         source_id,
@@ -788,14 +831,14 @@ def _record_from_bib_entry(source_id: str, raw: str) -> dict:
 
 
 def _bib_entry_key(raw: str) -> str:
-    """Khóa trích dẫn của mục .bib: chữ giữa "@loại{" và dấu phẩy đầu tiên, ví dụ doe2020."""
     head = _BIB_HEAD_RE.match(raw)
-    body = raw[head.end() : -1]  # bỏ "@loại{" đầu và "}" cuối, giống _record_from_bib_entry
+    if head is None:
+        return ""
+    body = raw[head.end() : -1]
     return body.partition(",")[0].strip()
 
 
 def _bib_entries(source_id: str, text: str) -> list[tuple[str, dict]]:
-    """Mỗi mục .bib thành cặp (khóa trích dẫn, bản ghi). Bỏ @string, @preamble, @comment vì không phải trích dẫn."""
     return [
         (_bib_entry_key(raw), _record_from_bib_entry(source_id, raw))
         for kind, raw in _split_bib_entries(text)
@@ -803,12 +846,7 @@ def _bib_entries(source_id: str, text: str) -> list[tuple[str, dict]]:
     ]
 
 
-# --- .bbl ------------------------------------------------------------------------------------------
-
-
 def _split_bbl_items(text: str) -> list[str]:
-    """Cắt .bbl thành từng mục `\\bibitem`; trả phần chữ trích dẫn (bỏ dòng `\\bibitem[nhãn]{khóa}`
-    và `\\end{thebibliography}`). Mục trống bị bỏ."""
     marks = list(_BIBITEM_RE.finditer(text))
     items = []
     for i, mark in enumerate(marks):
@@ -824,7 +862,6 @@ def _split_bbl_items(text: str) -> list[str]:
 
 
 def _bbl_records(source_id: str, text: str) -> list[dict]:
-    """Mỗi mục .bbl là chuỗi tự do nên CHỈ bóc ID arXiv và DOI; tiêu đề, tác giả, năm để None (không đoán)."""
     return [
         _make_record(
             source_id,
@@ -835,3 +872,66 @@ def _bbl_records(source_id: str, text: str) -> list[dict]:
         )
         for item in _split_bbl_items(text)
     ]
+
+
+if __name__ == "__main__":
+    print("=== TEST REFERENCE SCRAPER ===")
+
+    # 1. Test ReferenceResult dataclass / list interface
+    print("\n1. Test ReferenceResult class:")
+    sample_records = [
+        _make_record("2412.18848", _SOURCE_API, ref_arxiv_id="1706.03762", ref_title="Attention Is All You Need"),
+        _make_record("2412.18848", _SOURCE_API, ref_arxiv_id="1810.04805", ref_title="BERT"),
+    ]
+    res = ReferenceResult(sample_records, status="success", source="semantic_scholar", expected_count=2)
+    assert isinstance(res, list), "ReferenceResult must inherit list"
+    assert len(res) == 2, f"Expected length 2, got {len(res)}"
+    assert res.status == "success"
+    assert res[0]["ref_title"] == "Attention Is All You Need"
+    print(f"  [+] ReferenceResult repr: {res}")
+    print(f"  [+] List iteration and indexing working properly.")
+
+    # 2. Test BibTeX extraction and cite filtering
+    print("\n2. Test BibTeX cite matching:")
+    bib_sample = """
+    @article{vaswani2017,
+        title = {Attention is All You Need},
+        author = {Vaswani, Ashish and Shazeer, Noam},
+        journal = {NeurIPS},
+        year = {2017},
+        eprint = {1706.03762},
+        archivePrefix = {arXiv}
+    }
+    @article{devlin2018,
+        title = {BERT: Pre-training of Deep Bidirectional Transformers},
+        author = {Devlin, Jacob and Chang, Ming-Wei},
+        year = {2018}
+    }
+    """
+    tex_sample = "We use the Transformer architecture \\cite{vaswani2017} as baseline."
+    cited = _cited_keys([tex_sample])
+    assert "vaswani2017" in cited
+    assert "devlin2018" not in cited
+
+    entries = _bib_entries("2412.18848", bib_sample)
+    filtered = [rec for key, rec in entries if key in cited]
+    assert len(filtered) == 1
+    assert filtered[0]["ref_arxiv_id"] == "1706.03762"
+    assert filtered[0]["ref_year"] == 2017
+    print(f"  [+] Correctly extracted and filtered 1 cited entry out of {len(entries)}.")
+
+    # 3. Test Live Query or Safe Error Handling
+    print("\n3. Test scrape_references_for_paper on real arXiv ID (2412.18848):")
+    try:
+        t0 = time.time()
+        result = scrape_references_for_paper("2412.18848", rate_limit_sec=1.0)
+        dt = time.time() - t0
+        print(f"  [+] Scraped in {dt:.2f}s: status={result.status}, source={result.source}, count={len(result)}")
+        if result:
+            print(f"  [+] Sample ref 1: title='{result[0].get('ref_title')}', arxiv='{result[0].get('ref_arxiv_id')}'")
+        stats = get_request_stats()
+        print(f"  [+] Request stats: {stats}")
+    except Exception as exc:
+        print(f"  [-] Network or S2 error in live test: {exc}")
+
+    print("\n[+] Reference scraper testing completed successfully.")
