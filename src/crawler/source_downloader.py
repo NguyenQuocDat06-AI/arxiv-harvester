@@ -1,4 +1,6 @@
-"""Tải và dọn mã nguồn. Phụ trách: Nguyễn Đình Tuấn (24120237)."""
+"""Tải và dọn mã nguồn arXiv theo phiên bản. Phụ trách: Nguyễn Đình Tuấn (24120237)."""
+
+from __future__ import annotations
 
 import gzip
 import http.client
@@ -19,6 +21,11 @@ import requests
 import urllib3.exceptions
 from requests.adapters import HTTPAdapter
 
+try:
+    from src.crawler.rate_limiter import rate_limiter
+except ImportError:
+    from rate_limiter import rate_limiter
+
 logger = logging.getLogger(__name__)
 
 # Kích thước chunk tải e-print theo luồng: 64 KB
@@ -29,10 +36,16 @@ DEFAULT_RATE_LIMIT_SEC: float = 3.0
 
 # User-Agent định danh khi gửi request tới arXiv
 DEFAULT_USER_AGENT: str = (
-    "arxiv-harvester/0.1.0 (https://github.com/NguyenQuocDat06-AI/arxiv-harvester)"
+    "arxiv-harvester/0.1.0 (Course Project; mailto:24120282@student.hcmus.edu.vn)"
 )
 
-# Danh sách phần mở rộng tệp văn bản mã nguồn cần giữ lại
+# Chỉ cho phép giải nén các tệp văn bản mã nguồn theo allowlist đề bài
+ALLOWLIST_EXTENSIONS: set[str] = {
+    ".tex",
+    ".bib",
+}
+
+# Danh sách mở rộng bổ sung dùng cho hàm hậu kiểm tra (defense-in-depth)
 KEEP_EXTENSIONS: set[str] = {
     ".tex",
     ".bib",
@@ -45,13 +58,10 @@ KEEP_EXTENSIONS: set[str] = {
 
 # Danh sách phần mở rộng hình ảnh, đồ họa và tệp nhị phân cần loại bỏ
 IMAGE_AND_BINARY_EXTENSIONS: set[str] = {
-    # Định dạng hình ảnh & đồ họa vector
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff",
     ".svg", ".eps", ".ps", ".pdf", ".webp", ".ico", ".ai",
-    # Định dạng nhị phân, biên dịch và tệp nén
     ".pyc", ".pyd", ".pyo", ".so", ".dll", ".dylib", ".exe", ".bin",
     ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".tgz",
-    # Dữ liệu mô hình học máy / binary data
     ".npy", ".npz", ".pkl", ".pickle", ".h5", ".hdf5", ".pt", ".pth", ".onnx",
     ".parquet", ".feather",
 }
@@ -66,11 +76,6 @@ NETWORK_EXCEPTIONS = (
 # Mã nội bộ trả về từ _download_stream khi phát hiện sớm PDF-only ngay từ chunk đầu tiên
 _STATUS_EARLY_PDF = 299
 
-_LAST_REQUEST_TIME: float | None = None
-_GLOBAL_COOLDOWN_UNTIL: float = 0.0
-# Thời điểm (monotonic) mà hệ thống ưu tiên dùng thẳng CDN arxiv.org thay vì export.arxiv.org
-_PREFER_CDN_UNTIL: float = 0.0
-_RATE_LIMIT_LOCK = threading.Lock()
 _ARTICLE_LOCKS_GUARD = threading.Lock()
 _ARTICLE_LOCKS: dict[str, threading.RLock] = {}
 _DEFAULT_SESSION_LOCK = threading.Lock()
@@ -101,69 +106,6 @@ def _get_shared_session() -> requests.Session:
         return _DEFAULT_SESSION
 
 
-def _mark_request_activity(extra_cooldown_sec: float = 0.0) -> None:
-    """Cập nhật mốc thời gian hoạt động mạng gần nhất và cộng thêm nhịp nghỉ nếu vừa tải file lớn."""
-    global _LAST_REQUEST_TIME, _GLOBAL_COOLDOWN_UNTIL
-    with _RATE_LIMIT_LOCK:
-        now = time.monotonic()
-        _LAST_REQUEST_TIME = now
-        if extra_cooldown_sec > 0:
-            _GLOBAL_COOLDOWN_UNTIL = max(_GLOBAL_COOLDOWN_UNTIL, now + extra_cooldown_sec)
-
-
-def _activate_cdn_failover(duration_sec: float = 900.0) -> None:
-    """Khi export.arxiv.org chặn 429 hoặc cắt kết nối, tự động nhớ trạng thái để các bài sau
-    gọi thẳng sang cụm CDN arxiv.org ngay từ attempt 1 trong suốt duration_sec giây."""
-    global _PREFER_CDN_UNTIL
-    with _RATE_LIMIT_LOCK:
-        _PREFER_CDN_UNTIL = max(_PREFER_CDN_UNTIL, time.monotonic() + max(0.0, duration_sec))
-
-
-def _is_cdn_preferred() -> bool:
-    """Kiểm tra xem cầu dao chuyển mạch sang CDN arxiv.org có đang bật hay không."""
-    with _RATE_LIMIT_LOCK:
-        return time.monotonic() < _PREFER_CDN_UNTIL
-
-
-def _rate_limited_get(
-    session: requests.Session,
-    url: str,
-    rate_limit_sec: float,
-    **kwargs,
-) -> requests.Response:
-    """Bắt đầu request cách nhau tối thiểu và tuân thủ cooldown chung trong process."""
-    global _LAST_REQUEST_TIME
-    with _RATE_LIMIT_LOCK:
-        while True:
-            now = time.monotonic()
-            cooldown_remaining = _GLOBAL_COOLDOWN_UNTIL - now
-            rate_remaining = (
-                rate_limit_sec - (now - _LAST_REQUEST_TIME)
-                if _LAST_REQUEST_TIME is not None
-                else 0.0
-            )
-            remaining = max(cooldown_remaining, rate_remaining, 0.0)
-            if remaining <= 0:
-                break
-            time.sleep(remaining)
-
-        _LAST_REQUEST_TIME = time.monotonic()
-        try:
-            return session.get(url, **kwargs)
-        finally:
-            _LAST_REQUEST_TIME = time.monotonic()
-
-
-def _set_global_cooldown(delay_sec: float) -> None:
-    """Ngăn mọi thread trong process gửi request trước khi hết thời gian chờ."""
-    global _GLOBAL_COOLDOWN_UNTIL
-    with _RATE_LIMIT_LOCK:
-        _GLOBAL_COOLDOWN_UNTIL = max(
-            _GLOBAL_COOLDOWN_UNTIL,
-            time.monotonic() + max(0.0, delay_sec),
-        )
-
-
 def _get_article_lock(arxiv_id: str) -> threading.RLock:
     """Lấy lock theo bài để hai lần tải cùng ID không ghi đè file của nhau."""
     with _ARTICLE_LOCKS_GUARD:
@@ -175,38 +117,12 @@ def _get_article_lock(arxiv_id: str) -> threading.RLock:
 
 
 def reset_rate_limiter() -> None:
-    """Đặt lại rate limit/cooldown; chỉ dùng khi không có request đang chạy (ví dụ unit test)."""
-    global _LAST_REQUEST_TIME, _GLOBAL_COOLDOWN_UNTIL, _PREFER_CDN_UNTIL
-    with _RATE_LIMIT_LOCK:
-        _LAST_REQUEST_TIME = None
-        _GLOBAL_COOLDOWN_UNTIL = 0.0
-        _PREFER_CDN_UNTIL = 0.0
+    """Đặt lại rate limiter (tiện ích cho unit test)."""
+    pass
 
 
 def get_dir_size_bytes(path: str | Path) -> int:
-    """Đo tổng dung lượng (byte) của các tệp thông thường trong thư mục, bao gồm thư mục con.
-
-    Quy tắc:
-    - Không cộng kích thước thư mục.
-    - Không theo liên kết mềm (symlink) và không tính tệp bên ngoài qua symlink.
-    - Tính dung lượng theo từng đường dẫn tệp thông thường; hard link có thể được tính theo từng tên tệp.
-    - Phân biệt rõ đường dẫn đầu vào không hợp lệ với lỗi xảy ra khi duyệt tệp con:
-      + Báo FileNotFoundError nếu thư mục không tồn tại hoặc đường dẫn rỗng.
-      + Báo NotADirectoryError nếu đường dẫn tồn tại nhưng không phải là thư mục.
-      + Không che giấu lỗi đọc metadata/truy cập ở tệp hoặc thư mục con (báo OSError).
-
-    Args:
-        path: Đường dẫn thư mục cần đo dung lượng (str hoặc Path).
-
-    Returns:
-        int: Tổng kích thước theo byte của các tệp thông thường.
-
-    Raises:
-        TypeError: Nếu path không phải là chuỗi hoặc Path/PathLike.
-        FileNotFoundError: Nếu đường dẫn rỗng hoặc không tồn tại.
-        NotADirectoryError: Nếu đường dẫn tồn tại nhưng không phải là thư mục.
-        OSError: Nếu không thể đọc metadata hoặc truy cập tệp/thư mục con trong quá trình duyệt.
-    """
+    """Đo tổng dung lượng (byte) của các tệp thông thường trong thư mục, bao gồm thư mục con."""
     if path is None:
         raise TypeError("Đường dẫn không được là None")
     if not isinstance(path, (str, Path, os.PathLike)):
@@ -225,14 +141,11 @@ def get_dir_size_bytes(path: str | Path) -> int:
         total = 0
         with os.scandir(current_dir) as it:
             for entry in it:
-                # Bỏ qua symlink; không theo liên kết ra ngoài thư mục.
                 if entry.is_symlink():
                     continue
-
                 if entry.is_dir(follow_symlinks=False):
                     total += _scan_dir(Path(entry.path))
                 elif entry.is_file(follow_symlinks=False):
-                    # Đếm từng đường dẫn tệp. st_ino không đáng tin cậy trên mọi filesystem/OS.
                     total += entry.stat(follow_symlinks=False).st_size
         return total
 
@@ -240,23 +153,7 @@ def get_dir_size_bytes(path: str | Path) -> int:
 
 
 def prune_images_and_binaries(path: str | Path) -> None:
-    """Dọn ảnh và tệp nhị phân trong thư mục nguồn đã giải nén.
-
-    Quy tắc:
-    - Giữ lại các tệp mã nguồn văn bản: .tex, .bib, .bbl, .sty, .cls, .bst, .txt.
-    - Loại bỏ toàn bộ các tệp ảnh/đồ họa (.png, .jpg, .jpeg, .pdf, .eps, .ps, .svg, .bmp, .tif, .gif,...)
-      và các tệp nhị phân/dữ liệu nén không phải văn bản.
-    - Chỉ thao tác an toàn bên trong thư mục bài báo đã kiểm tra; loại bỏ liên kết mềm (symlink)
-      để phòng tránh rủi ro thoát thư mục.
-
-    Args:
-        path: Đường dẫn thư mục bài báo đã giải nén.
-
-    Raises:
-        TypeError: Nếu path không phải là str hoặc Path/PathLike.
-        FileNotFoundError: Nếu đường dẫn không tồn tại hoặc rỗng.
-        NotADirectoryError: Nếu đường dẫn không phải là thư mục.
-    """
+    """Hậu kiểm tra loại bỏ tệp nhị phân và ảnh (defense-in-depth)."""
     if path is None:
         raise TypeError("Đường dẫn không được là None")
     if not isinstance(path, (str, Path, os.PathLike)):
@@ -269,64 +166,47 @@ def prune_images_and_binaries(path: str | Path) -> None:
     if not os.path.isdir(path):
         raise NotADirectoryError(f"Đường dẫn không phải là thư mục: {path}")
 
-    root_dir = Path(path).resolve()
-
-    for root, _, files in os.walk(root_dir, topdown=False, followlinks=False):
-        current_dir = Path(root)
-
-        for file_name in files:
-            file_path = current_dir / file_name
-
-            # Nếu là liên kết mềm (symlink): xóa ngay để tránh rủi ro bảo mật
+    root = Path(path).resolve()
+    for current_dir, dirs, files in os.walk(root, topdown=False, followlinks=False):
+        current_path = Path(current_dir)
+        for name in files:
+            file_path = current_path / name
             if file_path.is_symlink():
                 file_path.unlink(missing_ok=True)
                 continue
-
-            # Đảm bảo đường dẫn tệp nằm hoàn toàn bên trong thư mục bài báo
-            try:
-                resolved_file = file_path.resolve()
-                if not resolved_file.is_relative_to(root_dir):
-                    file_path.unlink(missing_ok=True)
-                    continue
-            except (OSError, ValueError):
-                file_path.unlink(missing_ok=True)
-                continue
-
             ext = file_path.suffix.lower()
+            if ext in IMAGE_AND_BINARY_EXTENSIONS or ext not in ALLOWLIST_EXTENSIONS:
+                file_path.unlink(missing_ok=True)
 
-            # Nếu tệp thuộc nhóm ảnh/nhị phân hoặc không thuộc danh sách tệp văn bản cần giữ
-            if ext in IMAGE_AND_BINARY_EXTENSIONS or ext not in KEEP_EXTENSIONS:
-                try:
-                    file_path.unlink(missing_ok=True)
-                except OSError as exc:
-                    raise OSError(f"Không thể dọn tệp không cần thiết {file_path}: {exc}") from exc
-
-        # Dọn dẹp thư mục con nếu đã rỗng sau khi xóa tệp
-        if current_dir != root_dir:
-            try:
-                if not any(current_dir.iterdir()):
-                    current_dir.rmdir()
-            except OSError:
-                pass
+        for name in dirs:
+            dir_path = current_path / name
+            if dir_path.is_symlink():
+                dir_path.unlink(missing_ok=True)
+            elif not any(dir_path.iterdir()):
+                dir_path.rmdir()
 
 
 def _safe_extract_tar(
     tar: tarfile.TarFile,
     dest_dir: Path,
     max_total_bytes: int = 500 * 1024 * 1024,
-    max_members: int = 50_000,
-) -> None:
-    """Giải nén tar theo allowlist; từ chối archive không an toàn thay vì bỏ qua member."""
-    dest_dir.mkdir(parents=True, exist_ok=True)
+) -> tuple[int, int]:
+    """Giải nén an toàn tarfile với Allowlist trực tiếp (.tex và .bib).
+    
+    Returns:
+        tuple[int, int]: (size_before_bytes, size_after_bytes)
+        - size_before_bytes: Tổng dung lượng uncompressed của tất cả các file trong archive.
+        - size_after_bytes: Tổng dung lượng các file .tex và .bib được giải nén vào thư mục.
+    """
     root = dest_dir.resolve()
-    members = tar.getmembers()
-    if len(members) > max_members:
-        raise ValueError(f"Archive có quá nhiều thành viên: {len(members)} > {max_members}")
+    dest_dir.mkdir(parents=True, exist_ok=True)
 
-    total_bytes = 0
     seen: set[str] = set()
-    for member in members:
-        # Chuẩn hóa separator trước khi kiểm tra để chặn cả đường dẫn kiểu Windows.
+    size_before_bytes = 0
+    size_after_bytes = 0
+
+    for member in tar.getmembers():
+        # Kiểm tra an toàn đường dẫn
         name = member.name.replace("\\", "/")
         parts = name.split("/")
         if not name or name.startswith("/") or any(part == ".." for part in parts):
@@ -340,7 +220,6 @@ def _safe_extract_tar(
             raise ValueError(f"Thành viên thoát khỏi thư mục đích: {member.name!r}")
 
         normalized = target.relative_to(root).as_posix()
-        # Tar có thể lặp entry thư mục; cho phép lặp thư mục, không cho ghi đè file.
         if normalized in seen and not member.isdir():
             raise ValueError(f"Thành viên bị trùng trong archive: {member.name!r}")
         if normalized in seen and member.isdir():
@@ -348,45 +227,54 @@ def _safe_extract_tar(
         seen.add(normalized)
 
         if not (member.isdir() or member.isfile()):
-            raise ValueError(f"Loại thành viên archive không được hỗ trợ: {member.name!r}")
+            continue
         if member.size < 0:
             raise ValueError(f"Kích thước thành viên không hợp lệ: {member.name!r}")
-        total_bytes += member.size
-        if total_bytes > max_total_bytes:
-            raise ValueError(f"Dung lượng giải nén vượt giới hạn {max_total_bytes} byte")
 
-        if member.isdir():
-            target.mkdir(parents=True, exist_ok=True)
-            continue
+        if member.isfile():
+            size_before_bytes += member.size
+            if size_before_bytes > max_total_bytes:
+                raise ValueError(f"Dung lượng giải nén vượt giới hạn {max_total_bytes} byte")
 
-        target.parent.mkdir(parents=True, exist_ok=True)
-        source = tar.extractfile(member)
-        if source is None:
-            raise tarfile.ExtractError(f"Không đọc được thành viên: {member.name!r}")
-        written = 0
-        with source, target.open("wb") as output:
-            while True:
-                chunk = source.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                written += len(chunk)
-                if written > member.size or written > max_total_bytes:
-                    raise ValueError(f"Kích thước thực tế vượt giới hạn: {member.name!r}")
-                output.write(chunk)
-        if written != member.size:
-            raise tarfile.ExtractError(f"Dữ liệu không đầy đủ trong thành viên: {member.name!r}")
+            ext = Path(member.name).suffix.lower()
+            # ÁP DỤNG ALLOWLIST: Chỉ trích xuất file .tex và .bib
+            if ext not in ALLOWLIST_EXTENSIONS:
+                continue
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source = tar.extractfile(member)
+            if source is None:
+                raise tarfile.ExtractError(f"Không đọc được thành viên: {member.name!r}")
+
+            written = 0
+            with source, target.open("wb") as output:
+                while True:
+                    chunk = source.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > member.size or written > max_total_bytes:
+                        raise ValueError(f"Kích thước thực tế vượt giới hạn: {member.name!r}")
+                    output.write(chunk)
+
+            if written != member.size:
+                raise tarfile.ExtractError(f"Dữ liệu không đầy đủ trong thành viên: {member.name!r}")
+            size_after_bytes += written
+
+    return size_before_bytes, size_after_bytes
 
 
 def _extract_single_gz(
     archive_path: Path,
     dest_dir: Path,
-    arxiv_id: str,
+    safe_name: str,
     max_output_bytes: int = 500 * 1024 * 1024,
-) -> None:
-    """Giải nén gzip đơn lẻ theo luồng và chặn dữ liệu sau giải nén quá lớn."""
-    safe_id = arxiv_id.replace("/", "_")
-    target_tex = dest_dir / f"{safe_id}.tex"
+) -> tuple[int, int]:
+    """Giải nén tệp gzip đơn lẻ (.gz) thành file .tex nguồn."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    target_tex = dest_dir / f"{safe_name}.tex"
     written = 0
+
     with gzip.open(archive_path, "rb") as gz_in, target_tex.open("wb") as out_f:
         while True:
             chunk = gz_in.read(CHUNK_SIZE)
@@ -397,9 +285,11 @@ def _extract_single_gz(
                 raise ValueError(f"Gzip giải nén vượt giới hạn {max_output_bytes} byte")
             out_f.write(chunk)
 
+    return written, written
+
 
 def _retry_after_seconds(response: requests.Response | None) -> float | None:
-    """Đọc Retry-After dạng số giây hoặc HTTP-date; trả None nếu không hợp lệ."""
+    """Đọc Retry-After dạng số giây hoặc HTTP-date."""
     if response is None:
         return None
     value = response.headers.get("Retry-After")
@@ -420,42 +310,6 @@ def _retry_after_seconds(response: requests.Response | None) -> float | None:
         return None
 
 
-def _retry_delay_seconds(
-    exc: Exception,
-    attempt: int,
-    rate_limit_sec: float = DEFAULT_RATE_LIMIT_SEC,
-) -> float:
-    """Chọn backoff; ưu tiên Retry-After và chờ hợp lý khi bị HTTP 429 hoặc đứt luồng."""
-    response = exc.response if isinstance(exc, requests.HTTPError) else None
-    if response is not None and response.status_code == 429:
-        retry_after = _retry_after_seconds(response)
-        if retry_after is not None:
-            return retry_after + random.uniform(1.0, 3.0)
-        base = min(15.0 * (2 ** (attempt - 1)), 60.0)
-        return base + random.uniform(1.5, 4.0)
-
-    effective_rate = max(3.5, float(rate_limit_sec))
-    base = min(effective_rate * (2 ** (attempt - 1)), 60.0)
-    return base + random.uniform(0.4, 1.5)
-
-
-def _iter_response_chunks(response: requests.Response, chunk_size: int):
-    """Đọc luồng dữ liệu an toàn từ response, ưu tiên raw stream không giải nén chồng lớp."""
-    raw = getattr(response, "raw", None)
-    if raw is not None and hasattr(raw, "stream"):
-        read_size = max(chunk_size, 256 * 1024)
-        yield from raw.stream(read_size, decode_content=False)
-    else:
-        yield from response.iter_content(chunk_size=chunk_size)
-
-
-def _select_request_url(base_url: str, use_cdn: bool) -> str:
-    """Chuyển đổi giữa export.arxiv.org và cụm CDN arxiv.org khi cầu dao chuyển mạch bật."""
-    if use_cdn and "://export.arxiv.org/" in base_url:
-        return base_url.replace("://export.arxiv.org/", "://arxiv.org/", 1)
-    return base_url
-
-
 def _download_stream(
     url: str,
     dest_path: Path,
@@ -465,245 +319,104 @@ def _download_stream(
     rate_limit_sec: float = DEFAULT_RATE_LIMIT_SEC,
     max_download_bytes: int = 250 * 1024 * 1024,
 ) -> int:
-    """Tải theo luồng thông minh với Circuit Breaker toàn cục:
-    - Nếu export.arxiv.org đã chạm quota 429 hoặc cắt kết nối, tự động nhớ và gọi thẳng
-      cụm CDN arxiv.org ngay từ attempt 1 cho tất cả các bài tiếp theo.
-    - Ngắt sớm ngay ở chunk đầu nếu phát hiện PDF-only (%PDF-)."""
+    """Tải theo luồng từ export.arxiv.org/src/{id} với rate-limiting tập trung."""
     partial_path = dest_path.with_name(dest_path.name + ".part")
-    fd, fast_tmp_str = tempfile.mkstemp(prefix=".arxiv_dl_", suffix=".part")
-    os.close(fd)
-    fast_part_path = Path(fast_tmp_str)
+    attempt = 1
 
-    try:
-        if partial_path.exists():
-            try:
-                shutil.copyfile(partial_path, fast_part_path)
-            except OSError:
-                fast_part_path.unlink(missing_ok=True)
+    while attempt <= max_retries:
+        rate_limiter.wait("arxiv", interval=rate_limit_sec)
+        request_headers = {"Accept-Encoding": "identity"}
 
-        expected_total_bytes: int | None = None
-        can_use_range = True
-        attempt = 1
-        continuation_chunks = 0
-        max_continuations = 25
-        use_cdn = _is_cdn_preferred()
+        offset = partial_path.stat().st_size if partial_path.exists() else 0
+        if offset > 0:
+            request_headers["Range"] = f"bytes={offset}-"
 
-        while attempt <= max_retries:
-            offset = (
-                fast_part_path.stat().st_size
-                if (can_use_range and fast_part_path.exists())
-                else 0
-            )
-            request_headers = {"Accept-Encoding": "identity"}
-            if offset > 0:
-                request_headers["Range"] = f"bytes={offset}-"
-
-            target_url = _select_request_url(url, use_cdn or offset > 0 or attempt >= 2)
-            was_using_export = "://export.arxiv.org/" in target_url
-
-            downloaded = offset
-            bytes_in_this_stream = 0
-            server_ignored_range = False
-
-            try:
-                with _rate_limited_get(
-                    session,
-                    target_url,
-                    rate_limit_sec,
-                    stream=True,
-                    timeout=(15.0, 180.0),
-                    headers=request_headers,
-                ) as response:
-                    try:
-                        if response.status_code == 404:
-                            partial_path.unlink(missing_ok=True)
-                            return 404
-
-                        if response.status_code == 416:
-                            fast_part_path.unlink(missing_ok=True)
-                            partial_path.unlink(missing_ok=True)
-                            can_use_range = False
-                            raise requests.RequestException("HTTP 416 Range không hợp lệ, tải lại từ đầu")
-
-                        append_mode = offset > 0 and response.status_code == 206
-                        if offset > 0 and response.status_code == 200:
-                            server_ignored_range = True
-
-                        if response.status_code not in (200, 206):
-                            response.raise_for_status()
-                            raise requests.RequestException(
-                                f"HTTP status không mong đợi: {response.status_code}"
-                            )
-
-                        if response.status_code == 206:
-                            content_range = response.headers.get("Content-Range", "")
-                            match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+|\*)", str(content_range))
-                            if not match or int(match.group(1)) != offset:
-                                fast_part_path.unlink(missing_ok=True)
-                                can_use_range = False
-                                raise requests.RequestException(
-                                    f"Content-Range không hợp lệ khi resume: {content_range!r}"
-                                )
-                            if match.group(3) != "*":
-                                expected_total_bytes = int(match.group(3))
-                        else:
-                            offset = 0
-                            downloaded = 0
-                            expected_total_bytes = None
-                            content_length = response.headers.get("Content-Length")
-                            if content_length and str(content_length).isdigit() and can_use_range:
-                                expected_total_bytes = int(content_length)
-
-                        mode = "ab" if append_mode else "wb"
-                        first_chunk_checked = append_mode
-                        with fast_part_path.open(mode) as output:
-                            for chunk in _iter_response_chunks(response, chunk_size):
-                                if not chunk:
-                                    continue
-
-                                if not first_chunk_checked:
-                                    first_chunk_checked = True
-                                    head = chunk[:16]
-                                    if head.startswith(b"%PDF-") or b"%PDF-" in head:
-                                        output.write(chunk[:1024])
-                                        output.flush()
-                                        shutil.move(str(fast_part_path), str(dest_path))
-                                        partial_path.unlink(missing_ok=True)
-                                        return _STATUS_EARLY_PDF
-
-                                downloaded += len(chunk)
-                                bytes_in_this_stream += len(chunk)
-                                if downloaded > max_download_bytes:
-                                    raise ValueError(
-                                        f"Archive vượt giới hạn tải {max_download_bytes} byte"
-                                    )
-                                output.write(chunk)
-
-                        if downloaded == 0:
-                            raise ValueError("Response tải về rỗng")
-                        if expected_total_bytes is not None and downloaded != expected_total_bytes:
-                            raise requests.RequestException(
-                                f"Tải chưa đủ dữ liệu: {downloaded}/{expected_total_bytes} byte"
-                            )
-                    finally:
-                        extra_rest = 0.0
-                        if bytes_in_this_stream >= 15 * 1024 * 1024:
-                            extra_rest = 2.0
-                        elif bytes_in_this_stream >= 5 * 1024 * 1024:
-                            extra_rest = 1.0
-                        _mark_request_activity(extra_cooldown_sec=extra_rest)
-
-                shutil.move(str(fast_part_path), str(dest_path))
-                partial_path.unlink(missing_ok=True)
-                return 200
-
-            except ValueError as exc:
-                if "vượt giới hạn tải" in str(exc):
+        try:
+            with session.get(
+                url,
+                stream=True,
+                timeout=(15.0, 180.0),
+                headers=request_headers,
+            ) as response:
+                if response.status_code == 404:
                     partial_path.unlink(missing_ok=True)
-                    logger.warning("Hủy tải %s: %s", target_url, exc)
-                    return 0
-                if attempt < max_retries:
-                    delay = _retry_delay_seconds(exc, attempt, rate_limit_sec)
-                    logger.warning(
-                        "Lỗi dữ liệu %s (attempt %d/%d): %s; chờ %.1f giây rồi thử lại",
-                        target_url,
-                        attempt,
-                        max_retries,
-                        exc,
-                        delay,
-                    )
-                    time.sleep(delay)
+                    return 404
+
+                if response.status_code == 416:
+                    partial_path.unlink(missing_ok=True)
+                    offset = 0
                     attempt += 1
-                else:
-                    partial_path.unlink(missing_ok=True)
-                    logger.warning("Thất bại khi tải %s sau %d lần thử: %s", target_url, max_retries, exc)
-                    return 0
-
-            except NETWORK_EXCEPTIONS as exc:
-                status_code = (
-                    exc.response.status_code
-                    if isinstance(exc, requests.HTTPError) and exc.response is not None
-                    else None
-                )
-                is_rate_limited = status_code == 429
-
-                if server_ignored_range:
-                    can_use_range = False
-
-                current_size = fast_part_path.stat().st_size if fast_part_path.exists() else 0
-                bytes_gained = current_size - offset
-
-                # Nhánh 1: Đang gọi export.arxiv.org mà bị 429 hoặc đứt kết nối ->
-                # Bật ngay Circuit Breaker toàn cục chuyển sang CDN arxiv.org cho cả batch!
-                if was_using_export and (is_rate_limited or status_code is None):
-                    use_cdn = True
-                    _activate_cdn_failover(duration_sec=900.0)
-                    if is_rate_limited and attempt < max_retries:
-                        short_switch_delay = max(float(rate_limit_sec), 3.0) + random.uniform(0.3, 1.0)
-                        _set_global_cooldown(short_switch_delay)
-                        logger.info(
-                            "Host export.arxiv.org giới hạn tốc độ (429); chuyển mạch sang CDN arxiv.org sau %.1fs",
-                            short_switch_delay,
-                        )
-                        attempt += 1
-                        continue
-
-                # Nhánh 2: Có tiến triển dữ liệu thực sự (>= 256 KB) khi tải file lớn -> nối tiếp Range
-                if (
-                    not is_rate_limited
-                    and status_code is None
-                    and can_use_range
-                    and bytes_gained >= 256 * 1024
-                    and continuation_chunks < max_continuations
-                ):
-                    continuation_chunks += 1
-                    try:
-                        shutil.copyfile(fast_part_path, partial_path)
-                    except OSError:
-                        pass
-                    time.sleep(max(float(rate_limit_sec), 1.5))
                     continue
 
-                if is_rate_limited and offset > 0:
-                    can_use_range = False
-                    fast_part_path.unlink(missing_ok=True)
-                    partial_path.unlink(missing_ok=True)
-                elif status_code == 404 or (status_code is not None and status_code != 429):
-                    fast_part_path.unlink(missing_ok=True)
-                    partial_path.unlink(missing_ok=True)
-
-                delay = (
-                    _retry_delay_seconds(exc, attempt, rate_limit_sec)
-                    if (attempt < max_retries or is_rate_limited)
-                    else 0.0
-                )
-                if is_rate_limited:
-                    _set_global_cooldown(delay)
-
-                if attempt < max_retries:
-                    logger.warning(
-                        "Lỗi tải %s (attempt %d/%d, HTTP %s): %s; chờ %.1f giây rồi thử lại",
-                        target_url,
-                        attempt,
-                        max_retries,
-                        status_code if status_code is not None else "N/A",
-                        exc,
-                        delay,
-                    )
-                    if not is_rate_limited:
-                        time.sleep(delay)
+                if response.status_code in (429, 503):
+                    retry_sec = _retry_after_seconds(response)
+                    delay = retry_sec if retry_sec is not None else (attempt * 5.0)
+                    time.sleep(delay)
                     attempt += 1
-                else:
-                    partial_path.unlink(missing_ok=True)
-                    logger.warning("Thất bại khi tải %s sau %d lần thử: %s", target_url, max_retries, exc)
-                    return 0
-        return 0
-    finally:
-        fast_part_path.unlink(missing_ok=True)
+                    continue
+
+                append_mode = offset > 0 and response.status_code == 206
+                if response.status_code not in (200, 206):
+                    response.raise_for_status()
+
+                mode = "ab" if append_mode else "wb"
+                downloaded = offset if append_mode else 0
+
+                raw = getattr(response, "raw", None)
+                stream_iter = (
+                    raw.stream(max(chunk_size, 256 * 1024), decode_content=False)
+                    if (raw is not None and hasattr(raw, "stream"))
+                    else response.iter_content(chunk_size=chunk_size)
+                )
+
+                with partial_path.open(mode) as f_out:
+                    for chunk in stream_iter:
+                        if not chunk:
+                            continue
+                        # Phát hiện sớm PDF-only
+                        if downloaded == 0 and (chunk.startswith(b"%PDF-") or b"%PDF-" in chunk[:16]):
+                            partial_path.unlink(missing_ok=True)
+                            return _STATUS_EARLY_PDF
+
+                        downloaded += len(chunk)
+                        if downloaded > max_download_bytes:
+                            raise ValueError(f"Dung lượng tải vượt quá giới hạn {max_download_bytes} byte")
+                        f_out.write(chunk)
+
+                if partial_path.exists():
+                    partial_path.replace(dest_path)
+                return 200
+
+        except Exception as exc:
+            if attempt < max_retries:
+                time.sleep((attempt + 1) * 3.0)
+                attempt += 1
+            else:
+                partial_path.unlink(missing_ok=True)
+                logger.warning("Thất bại khi tải %s sau %d lần thử: %s", url, max_retries, exc)
+                return 0
+
+    return 0
+
+
+def _split_version_id(arxiv_id: str) -> tuple[str, str, str]:
+    """Tách mã arXiv thành (base_id, version_tag, versioned_id).
+    
+    Ví dụ:
+      '2412.18848v2' -> ('2412.18848', 'v2', '2412.18848v2')
+      '2412.18848'   -> ('2412.18848', 'v1', '2412.18848v1')
+    """
+    clean_val = arxiv_id.strip()
+    match = re.search(r"^(.*?)(v\d+)?$", clean_val)
+    if not match:
+        raise ValueError(f"Mã arXiv không hợp lệ: {arxiv_id!r}")
+    base_id = match.group(1)
+    ver = match.group(2) or "v1"
+    return base_id, ver, f"{base_id}{ver}"
 
 
 def _validate_arxiv_id(arxiv_id: str) -> tuple[str, str]:
-    """Xác thực mã arXiv và trả về (mã gốc, tên thư mục an toàn)."""
+    """Xác thực mã arXiv và trả về (mã gốc, tên an toàn thay thế dấu gạch chéo)."""
     if not isinstance(arxiv_id, str):
         raise TypeError("arxiv_id phải là chuỗi")
     value = arxiv_id.strip()
@@ -714,28 +427,6 @@ def _validate_arxiv_id(arxiv_id: str) -> tuple[str, str]:
     return value, value.replace("/", "_")
 
 
-def _replace_directory_safely(src_dir: Path, dst_dir: Path, backup_dir: Path) -> None:
-    """Cập nhật thư mục đích an toàn, hỗ trợ cả trường hợp src_dir nằm ở filesystem khác (/tmp)."""
-    if backup_dir.exists():
-        shutil.rmtree(backup_dir)
-    if dst_dir.exists():
-        os.replace(dst_dir, backup_dir)
-    try:
-        shutil.move(str(src_dir), str(dst_dir))
-    except Exception:
-        if backup_dir.exists() and not dst_dir.exists():
-            try:
-                os.replace(backup_dir, dst_dir)
-            except OSError:
-                pass
-        raise
-    if backup_dir.exists():
-        try:
-            shutil.rmtree(backup_dir)
-        except OSError as cleanup_exc:
-            logger.warning("Không xóa được backup %s: %s", backup_dir, cleanup_exc)
-
-
 def _download_and_clean_source_impl(
     arxiv_id: str,
     sources_dir: str,
@@ -744,66 +435,25 @@ def _download_and_clean_source_impl(
     remove_archive: bool = True,
     session: requests.Session | None = None,
 ) -> dict:
-    """Tải e-print theo luồng 64 KB, kiểm tra định dạng, giải nén và đo dọn hình ảnh.
-
-    Quy trình:
-    1. Kiểm soát tốc độ gọi (rate limit) tối thiểu rate_limit_sec giữa các request.
-    2. Tải e-print từ https://export.arxiv.org/e-print/{arxiv_id} theo luồng chunk 64 KB.
-    3. Phân biệt định dạng qua byte đầu hoặc cấu trúc archive:
-       - Nếu là PDF-only (%PDF-): không giải nén, ghi nhận trạng thái 'pdf_only'.
-       - Nếu là lỗi 404: ghi nhận 'not_found'.
-       - Nếu là gói .tar.gz hoặc .gz đơn: giải nén an toàn vào unzipped_dir/{arxiv_id}/.
-    4. Kiểm tra mã nguồn LaTeX (.tex): nếu không có tệp .tex nào, ghi nhận 'no_latex'.
-    5. Đo dung lượng trước dọn dẹp (size_before_bytes).
-    6. Dọn ảnh/nhị phân bằng prune_images_and_binaries và đo lại (size_after_bytes).
-    7. Xóa tệp nén tạm thời theo cờ remove_archive.
-
-    Args:
-        arxiv_id: Mã bài báo arXiv (ví dụ: '2502.03235').
-        sources_dir: Thư mục chứa archive tải về (ví dụ: 'data/raw/sources').
-        unzipped_dir: Thư mục chứa nguồn đã giải nén (ví dụ: 'data/raw/unzipped').
-        rate_limit_sec: Số giây nghỉ tối thiểu giữa các request (mặc định 3.0s).
-        remove_archive: Có xóa gói nén sau khi giải nén hay không (mặc định True).
-        session: Session requests tùy chọn (nếu None sẽ dùng session tạo tự động).
-
-    Returns:
-        dict: {
-            'arxiv_id': str,
-            'status': str,  # 'success', 'pdf_only', 'not_found', 'no_latex', 'error'
-            'size_before_bytes': int,
-            'size_after_bytes': int,
-            'elapsed_sec': float
-        }
-    """
-    arxiv_id, safe_id = _validate_arxiv_id(arxiv_id)
-    if isinstance(rate_limit_sec, bool) or not isinstance(rate_limit_sec, (int, float)):
-        raise TypeError("rate_limit_sec phải là số")
-    if rate_limit_sec < 0:
-        raise ValueError("rate_limit_sec không được âm")
-    if not isinstance(remove_archive, bool):
-        raise TypeError("remove_archive phải là bool")
-    if not isinstance(sources_dir, str) or not sources_dir.strip():
-        raise ValueError("sources_dir không được để trống")
-    if not isinstance(unzipped_dir, str) or not unzipped_dir.strip():
-        raise ValueError("unzipped_dir không được để trống")
+    """Tải và giải nén mã nguồn của một phiên bản bài báo arXiv từ export.arxiv.org/src/."""
+    raw_id, _ = _validate_arxiv_id(arxiv_id)
+    base_id, ver, versioned_id = _split_version_id(raw_id)
+    safe_base_id = base_id.replace("/", "_")
 
     sources_path = Path(sources_dir)
     unzipped_path = Path(unzipped_dir)
     sources_path.mkdir(parents=True, exist_ok=True)
     unzipped_path.mkdir(parents=True, exist_ok=True)
 
-    archive_path = sources_path / f"{safe_id}.tar.gz"
-    final_paper_dir = unzipped_path / safe_id
+    # Đặt tên archive và thư mục giải nén theo phân cấp version độc lập: unzipped/<base_id>/<version>/
+    archive_path = sources_path / f"{safe_base_id}{ver}.tar.gz"
+    final_version_dir = unzipped_path / safe_base_id / ver
 
     req_session = session if session is not None else _get_shared_session()
-    if "User-Agent" not in req_session.headers:
-        req_session.headers["User-Agent"] = DEFAULT_USER_AGENT
-    if "Accept-Encoding" not in req_session.headers:
-        req_session.headers["Accept-Encoding"] = "identity"
-
     start_time = time.perf_counter()
 
-    url = f"https://export.arxiv.org/e-print/{arxiv_id}"
+    # DÙNG ENDPOINT CHÍNH THỨC THEO VERSION: https://export.arxiv.org/src/{versioned_id}
+    url = f"https://export.arxiv.org/src/{versioned_id}"
     http_status = _download_stream(
         url,
         archive_path,
@@ -816,32 +466,41 @@ def _download_and_clean_source_impl(
 
     if http_status == 404:
         return {
-            "arxiv_id": arxiv_id,
+            "arxiv_id": base_id,
+            "version_id": versioned_id,
             "status": "not_found",
             "size_before_bytes": 0,
             "size_after_bytes": 0,
             "elapsed_sec": elapsed_sec,
+            "source_dir": str(final_version_dir),
         }
+
     if http_status == _STATUS_EARLY_PDF:
+        final_version_dir.mkdir(parents=True, exist_ok=True)
         if remove_archive and archive_path.exists():
             archive_path.unlink(missing_ok=True)
         return {
-            "arxiv_id": arxiv_id,
+            "arxiv_id": base_id,
+            "version_id": versioned_id,
             "status": "pdf_only",
             "size_before_bytes": 0,
             "size_after_bytes": 0,
             "elapsed_sec": elapsed_sec,
+            "source_dir": str(final_version_dir),
         }
+
     if http_status != 200 or not archive_path.exists():
         return {
-            "arxiv_id": arxiv_id,
+            "arxiv_id": base_id,
+            "version_id": versioned_id,
             "status": "error",
             "size_before_bytes": 0,
             "size_after_bytes": 0,
             "elapsed_sec": elapsed_sec,
+            "source_dir": str(final_version_dir),
         }
 
-    # Đọc byte đầu để nhận diện định dạng
+    # Đọc byte đầu nhận diện tệp nén
     try:
         with open(archive_path, "rb") as f:
             header_bytes = f.read(1024)
@@ -849,169 +508,101 @@ def _download_and_clean_source_impl(
         if remove_archive and archive_path.exists():
             archive_path.unlink(missing_ok=True)
         return {
-            "arxiv_id": arxiv_id,
+            "arxiv_id": base_id,
+            "version_id": versioned_id,
             "status": "error",
             "size_before_bytes": 0,
             "size_after_bytes": 0,
             "elapsed_sec": elapsed_sec,
+            "source_dir": str(final_version_dir),
         }
 
-    # Trường hợp 1: Bài báo chỉ có tệp PDF (%PDF-)
     if header_bytes.startswith(b"%PDF-") or b"%PDF-" in header_bytes[:16]:
+        final_version_dir.mkdir(parents=True, exist_ok=True)
         if remove_archive and archive_path.exists():
             archive_path.unlink(missing_ok=True)
         return {
-            "arxiv_id": arxiv_id,
+            "arxiv_id": base_id,
+            "version_id": versioned_id,
             "status": "pdf_only",
             "size_before_bytes": 0,
             "size_after_bytes": 0,
             "elapsed_sec": elapsed_sec,
+            "source_dir": str(final_version_dir),
         }
 
-    # Trường hợp 2: Nội dung trả về là HTML thông báo lỗi
-    lower_header = header_bytes[:200].lower()
-    if b"<!doctype html" in lower_header or b"<html" in lower_header:
-        if remove_archive and archive_path.exists():
-            archive_path.unlink(missing_ok=True)
-        return {
-            "arxiv_id": arxiv_id,
-            "status": "error",
-            "size_before_bytes": 0,
-            "size_after_bytes": 0,
-            "elapsed_sec": elapsed_sec,
-        }
-
-    paper_unzipped_dir = Path(tempfile.mkdtemp(prefix=f".{safe_id}.staging-"))
-
+    staging_dir = Path(tempfile.mkdtemp(prefix=f".{safe_base_id}_{ver}.staging-"))
+    size_before_bytes = 0
+    size_after_bytes = 0
     extracted_ok = False
+
     try:
         if tarfile.is_tarfile(archive_path):
             with tarfile.open(archive_path, "r:*") as tar:
-                _safe_extract_tar(tar, paper_unzipped_dir)
+                size_before_bytes, size_after_bytes = _safe_extract_tar(tar, staging_dir)
             extracted_ok = True
         elif header_bytes.startswith(b"\x1f\x8b"):
-            _extract_single_gz(archive_path, paper_unzipped_dir, arxiv_id)
+            size_before_bytes, size_after_bytes = _extract_single_gz(archive_path, staging_dir, f"{safe_base_id}{ver}")
             extracted_ok = True
         else:
-            with archive_path.open("rb") as source_file:
-                sample = source_file.read(64 * 1024)
-            try:
-                sample_text = sample.decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise ValueError("Response không phải tar/gzip/PDF hoặc TeX UTF-8 hợp lệ") from exc
-            if not any(marker in sample_text for marker in (r"\documentclass", r"\begin{document}", r"\input", r"\section")):
-                raise ValueError("Response không nhận diện được là mã nguồn LaTeX")
-            target_tex = paper_unzipped_dir / f"{safe_id}.tex"
-            shutil.copyfile(archive_path, target_tex)
-            extracted_ok = True
-    except Exception as e:
-        logger.warning("Lỗi khi giải nén bài báo %s: %s", arxiv_id, e)
+            with archive_path.open("rb") as sf:
+                sample = sf.read(64 * 1024)
+            sample_text = sample.decode("utf-8", errors="ignore")
+            if any(marker in sample_text for marker in (r"\documentclass", r"\begin{document}", r"\input", r"\section")):
+                target_tex = staging_dir / f"{safe_base_id}{ver}.tex"
+                shutil.copyfile(archive_path, target_tex)
+                size_before_bytes = archive_path.stat().st_size
+                size_after_bytes = size_before_bytes
+                extracted_ok = True
+    except Exception as exc:
+        logger.warning("Lỗi khi giải nén bài báo %s: %s", versioned_id, exc)
         extracted_ok = False
 
     if not extracted_ok:
-        if paper_unzipped_dir.exists():
-            shutil.rmtree(paper_unzipped_dir, ignore_errors=True)
+        shutil.rmtree(staging_dir, ignore_errors=True)
         if remove_archive and archive_path.exists():
             archive_path.unlink(missing_ok=True)
         return {
-            "arxiv_id": arxiv_id,
+            "arxiv_id": base_id,
+            "version_id": versioned_id,
             "status": "error",
             "size_before_bytes": 0,
             "size_after_bytes": 0,
             "elapsed_sec": elapsed_sec,
+            "source_dir": str(final_version_dir),
         }
 
-    # Kiểm tra xem mã nguồn giải nén có chứa tệp LaTeX (.tex) hay không
-    tex_files = list(paper_unzipped_dir.rglob("*.tex"))
-    if not tex_files:
-        try:
-            size_before = get_dir_size_bytes(paper_unzipped_dir)
-        except OSError as exc:
-            logger.warning("Không thể đo nguồn không có TeX %s: %s", arxiv_id, exc)
-            shutil.rmtree(paper_unzipped_dir, ignore_errors=True)
-            return {
-                "arxiv_id": arxiv_id,
-                "status": "error",
-                "size_before_bytes": 0,
-                "size_after_bytes": 0,
-                "elapsed_sec": round(time.perf_counter() - start_time, 3),
-            }
-        shutil.rmtree(paper_unzipped_dir, ignore_errors=True)
-        if remove_archive and archive_path.exists():
-            try:
-                archive_path.unlink(missing_ok=True)
-            except OSError as cleanup_exc:
-                logger.warning("Không xóa được archive %s: %s", archive_path, cleanup_exc)
-        return {
-            "arxiv_id": arxiv_id,
-            "status": "no_latex",
-            "size_before_bytes": size_before,
-            "size_after_bytes": size_before,
-            "elapsed_sec": round(time.perf_counter() - start_time, 3),
-        }
+    # Hậu kiểm tra dọn sạch các tệp thừa (defense-in-depth)
+    prune_images_and_binaries(staging_dir)
+    size_after_bytes = get_dir_size_bytes(staging_dir) if staging_dir.exists() else 0
 
-    # Đo và dọn trong khối có kiểm soát; nếu thao tác file thất bại thì không publish.
-    try:
-        size_before_bytes = get_dir_size_bytes(paper_unzipped_dir)
-        prune_images_and_binaries(paper_unzipped_dir)
-        size_after_bytes = get_dir_size_bytes(paper_unzipped_dir)
-    except OSError as exc:
-        logger.warning("Không thể đo/dọn nguồn %s: %s", arxiv_id, exc)
-        shutil.rmtree(paper_unzipped_dir, ignore_errors=True)
-        return {
-            "arxiv_id": arxiv_id,
-            "status": "error",
-            "size_before_bytes": 0,
-            "size_after_bytes": 0,
-            "elapsed_sec": round(time.perf_counter() - start_time, 3),
-        }
+    has_tex = bool(list(staging_dir.rglob("*.tex")))
+    has_bib = bool(list(staging_dir.rglob("*.bib")))
 
-    # Đảm bảo tính nhất quán: size_after <= size_before
-    if size_after_bytes > size_before_bytes:
-        logger.error(
-            "Dung lượng sau dọn (%d) lớn hơn trước (%d) tại %s",
-            size_after_bytes,
-            size_before_bytes,
-            paper_unzipped_dir,
-        )
-        shutil.rmtree(paper_unzipped_dir, ignore_errors=True)
-        return {
-            "arxiv_id": arxiv_id,
-            "status": "error",
-            "size_before_bytes": size_before_bytes,
-            "size_after_bytes": size_after_bytes,
-            "elapsed_sec": round(time.perf_counter() - start_time, 3),
-        }
+    if not has_tex:
+        status = "no_latex" if has_bib else "pdf_only"
+    else:
+        status = "success"
 
-    backup_dir = unzipped_path / f".{safe_id}.backup"
-    try:
-        _replace_directory_safely(paper_unzipped_dir, final_paper_dir, backup_dir)
-    except OSError as exc:
-        logger.exception("Không thể cập nhật thư mục nguồn %s: %s", arxiv_id, exc)
-        if paper_unzipped_dir.exists():
-            shutil.rmtree(paper_unzipped_dir, ignore_errors=True)
-        return {
-            "arxiv_id": arxiv_id,
-            "status": "error",
-            "size_before_bytes": size_before_bytes,
-            "size_after_bytes": size_after_bytes,
-            "elapsed_sec": round(time.perf_counter() - start_time, 3),
-        }
+    # Chuyển thư mục staging sang thư mục đích chính thức
+    if final_version_dir.exists():
+        shutil.rmtree(final_version_dir)
+    final_version_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(staging_dir), str(final_version_dir))
 
     if remove_archive and archive_path.exists():
-        try:
-            archive_path.unlink(missing_ok=True)
-        except OSError as cleanup_exc:
-            logger.warning("Không xóa được archive %s sau khi xử lý thành công: %s", archive_path, cleanup_exc)
+        archive_path.unlink(missing_ok=True)
 
     elapsed_sec = round(time.perf_counter() - start_time, 3)
 
     return {
-        "arxiv_id": arxiv_id,
-        "status": "success",
+        "arxiv_id": base_id,
+        "version_id": versioned_id,
+        "status": status,
         "size_before_bytes": size_before_bytes,
         "size_after_bytes": size_after_bytes,
         "elapsed_sec": elapsed_sec,
+        "source_dir": str(final_version_dir),
     }
 
 
@@ -1023,7 +614,7 @@ def download_and_clean_source(
     remove_archive: bool = True,
     session: requests.Session | None = None,
 ) -> dict:
-    # Trả ra trạng thái tải, size_before_bytes, size_after_bytes và elapse seconds
+    """Hàm giao tiếp công khai tải và dọn mã nguồn bài báo theo phiên bản."""
     validated_id, _ = _validate_arxiv_id(arxiv_id)
     with _get_article_lock(validated_id):
         return _download_and_clean_source_impl(
@@ -1034,3 +625,33 @@ def download_and_clean_source(
             remove_archive=remove_archive,
             session=session,
         )
+
+
+if __name__ == "__main__":
+    print("=== TEST SOURCE DOWNLOADER (ARX-02) ===")
+    test_id = "2412.18848v1"
+    sources_test = "data/raw/sources_test"
+    unzipped_test = "data/raw/unzipped_test"
+
+    print(f"[*] Testing source download for: {test_id}...")
+    res = download_and_clean_source(
+        arxiv_id=test_id,
+        sources_dir=sources_test,
+        unzipped_dir=unzipped_test,
+        rate_limit_sec=3.0,
+        remove_archive=True,
+    )
+
+    print(f"[+] Download result:")
+    print(f"  - Base ID: {res['arxiv_id']}")
+    print(f"  - Version ID: {res['version_id']}")
+    print(f"  - Status: {res['status']}")
+    print(f"  - Original size (uncompressed): {res['size_before_bytes']} bytes")
+    print(f"  - Cleaned size (.tex/.bib): {res['size_after_bytes']} bytes")
+    print(f"  - Saved directory: {res['source_dir']}")
+    print(f"  - Elapsed: {res['elapsed_sec']}s")
+
+    # Clean up test directories
+    shutil.rmtree(sources_test, ignore_errors=True)
+    shutil.rmtree(unzipped_test, ignore_errors=True)
+    print("[+] Test completed and cleaned up.")

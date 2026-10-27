@@ -1,4 +1,12 @@
-"""Khung CLI điều phối. Phụ trách: Trịnh Vỹ Triết (24120474)."""
+"""Khung CLI điều phối. Phụ trách: Trịnh Vỹ Triết (24120474).
+
+Nhiệm vụ chính:
+  1. Phân tích tham số dòng lệnh và cấu hình dải ID cá nhân.
+  2. Quản lý trạng thái checkpoint và khôi phục khi gián đoạn (--resume).
+  3. Điều phối quy trình đa phiên bản: discovery -> tải nguồn v1..vN -> references -> lưu Parquet.
+  4. Thu thập số liệu tài nguyên (ResourceProfiler) và xuất báo cáo stats.json.
+  5. Tùy chọn xuất bảng dữ liệu chuẩn môn học (--export-course).
+"""
 
 import argparse
 import json
@@ -7,14 +15,19 @@ import os
 import re
 import sys
 from itertools import islice
-from typing import Iterable, Iterator
+from typing import Any, Iterable, Iterator
 
 from .discovery import discover_metadata_batch
 from .id_range import iter_assigned_arxiv_ids
 from .profiler import ResourceProfiler
-from .reference_scraper import scrape_references_for_paper
+from .reference_scraper import ReferenceResult, scrape_references_for_paper
 from .source_downloader import download_and_clean_source
-from .storage import save_publications_parquet, save_references_parquet
+from .storage import (
+    export_to_course_spec,
+    resolve_paper_source_status,
+    save_publications_parquet,
+    save_references_parquet,
+)
 
 logger = logging.getLogger("crawler")
 
@@ -98,6 +111,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Tiếp tục từ checkpoint, bỏ qua các bài đã hoàn thành",
     )
+    parser.add_argument(
+        "--max-papers",
+        type=_positive_int,
+        default=None,
+        help="Giới hạn số bài tối đa cần xử lý (hữu ích cho smoke test và gỡ lỗi)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Chạy thử nghiệm khám phá metadata mà không tải tệp nguồn hoặc gọi Semantic Scholar thật",
+    )
+    parser.add_argument(
+        "--export-course",
+        action="store_true",
+        help="Tự động xuất papers.parquet và references.parquet theo chuẩn đề bài 6+6 cột sau khi hoàn tất",
+    )
+    parser.add_argument(
+        "--course-export-dir",
+        default=None,
+        help="Thư mục xuất chuẩn môn học (mặc định: <output-dir>/course_export)",
+    )
     return parser
 
 
@@ -175,6 +209,8 @@ class Checkpoint:
                 "references": 0,
                 "source_size_before_bytes": 0,
                 "source_size_after_bytes": 0,
+                "versions_attempted": 0,
+                "versions_succeeded": 0,
             },
         }
         os.makedirs(self.dir, exist_ok=True)
@@ -213,23 +249,112 @@ def _read_parts(checkpoint: Checkpoint, kind: str) -> list[dict]:
 
 
 def _process_paper(
-    arxiv_id: str, args: argparse.Namespace, profiler: ResourceProfiler, sources_dir: str, unzipped_dir: str
+    arxiv_id: str,
+    args: argparse.Namespace,
+    profiler: ResourceProfiler,
+    sources_dir: str,
+    unzipped_dir: str,
+    paper_record: dict | None = None,
 ) -> tuple[dict, list[dict]]:
-    """Tải/dọn nguồn và lấy trích dẫn cho một bài; lỗi được ném lên để ghi nhận."""
-    with profiler.phase("download_clean"):
-        download = download_and_clean_source(
-            arxiv_id,
-            sources_dir,
-            unzipped_dir,
-            rate_limit_sec=args.rate_limit_sec,
-        )
+    """Tải/dọn nguồn đa phiên bản và lấy trích dẫn cho một bài báo."""
+    if paper_record is None:
+        paper_record = {}
+
+    dry_run = getattr(args, "dry_run", False)
+    versions = paper_record.get("versions")
+
+    download_summary: dict[str, Any] = {
+        "arxiv_id": arxiv_id,
+        "status": "success",
+        "size_before_bytes": 0,
+        "size_after_bytes": 0,
+        "version_results": [],
+    }
+
+    # Nếu bài báo có danh sách struct versions từ discovery
+    if versions and isinstance(versions, list):
+        version_statuses = []
+        sizes_before = []
+        sizes_after = []
+
+        for v_entry in versions:
+            v_tag = v_entry.get("version") or "v1"
+            versioned_id = f"{arxiv_id}{v_tag}"
+
+            if dry_run:
+                res = {
+                    "arxiv_id": arxiv_id,
+                    "version_id": versioned_id,
+                    "status": "dry_run",
+                    "size_before_bytes": 0,
+                    "size_after_bytes": 0,
+                }
+            else:
+                with profiler.phase("download_clean"):
+                    res = download_and_clean_source(
+                        versioned_id,
+                        sources_dir,
+                        unzipped_dir,
+                        rate_limit_sec=args.rate_limit_sec,
+                    )
+
+            v_entry["size_before_bytes"] = res.get("size_before_bytes")
+            v_entry["size_after_bytes"] = res.get("size_after_bytes")
+            v_entry["source_status"] = res.get("status")
+            version_statuses.append(res.get("status"))
+
+            if res.get("size_before_bytes") is not None:
+                sizes_before.append(res["size_before_bytes"])
+            if res.get("size_after_bytes") is not None:
+                sizes_after.append(res["size_after_bytes"])
+            download_summary["version_results"].append(res)
+
+        download_summary["size_before_bytes"] = sum(sizes_before) if sizes_before else 0
+        download_summary["size_after_bytes"] = sum(sizes_after) if sizes_after else 0
+        download_summary["status"] = resolve_paper_source_status(version_statuses) or "success"
+
+        paper_record["versions"] = versions
+        paper_record["size_before_bytes"] = download_summary["size_before_bytes"]
+        paper_record["size_after_bytes"] = download_summary["size_after_bytes"]
+        paper_record["source_status"] = download_summary["status"]
+    else:
+        # Nhánh tương thích khi chạy mock test hoặc metadata không có struct versions
+        if dry_run:
+            res = {
+                "arxiv_id": arxiv_id,
+                "status": "dry_run",
+                "size_before_bytes": 0,
+                "size_after_bytes": 0,
+            }
+        else:
+            with profiler.phase("download_clean"):
+                res = download_and_clean_source(
+                    arxiv_id,
+                    sources_dir,
+                    unzipped_dir,
+                    rate_limit_sec=args.rate_limit_sec,
+                )
+        download_summary["size_before_bytes"] = res.get("size_before_bytes") or 0
+        download_summary["size_after_bytes"] = res.get("size_after_bytes") or 0
+        download_summary["status"] = res.get("status") or "success"
+        download_summary["version_results"].append(res)
+
+        paper_record["size_before_bytes"] = download_summary["size_before_bytes"]
+        paper_record["size_after_bytes"] = download_summary["size_after_bytes"]
+        paper_record["source_status"] = download_summary["status"]
+
     paper_dir = os.path.join(unzipped_dir, arxiv_id)
-    with profiler.phase("references"):
-        references = scrape_references_for_paper(
-            arxiv_id,
-            paper_dir if os.path.isdir(paper_dir) else None,
-        )
-    return download, references
+    if dry_run:
+        references: list[dict] = []
+    else:
+        with profiler.phase("references"):
+            references = scrape_references_for_paper(
+                arxiv_id,
+                paper_dir if os.path.isdir(paper_dir) else None,
+                rate_limit_sec=args.rate_limit_sec,
+            )
+
+    return download_summary, references
 
 
 def run_pipeline(args: argparse.Namespace, profiler: ResourceProfiler, checkpoint: Checkpoint) -> dict:
@@ -246,6 +371,9 @@ def run_pipeline(args: argparse.Namespace, profiler: ResourceProfiler, checkpoin
         all_ids = list(
             iter_assigned_arxiv_ids(args.start_month, args.start_id, args.end_month, args.end_id)
         )
+    if getattr(args, "max_papers", None):
+        all_ids = all_ids[: args.max_papers]
+
     pending = [arxiv_id for arxiv_id in all_ids if arxiv_id not in done]
     logger.info("Tổng %d ID, đã xong %d, cần xử lý %d", len(all_ids), len(all_ids) - len(pending), len(pending))
 
@@ -273,20 +401,31 @@ def run_pipeline(args: argparse.Namespace, profiler: ResourceProfiler, checkpoin
         publications: list[dict] = []
         references: list[dict] = []
         finished: list[str] = []
+
         for arxiv_id in batch:
             if arxiv_id not in found:
                 counts["not_found"] += 1
                 finished.append(arxiv_id)
                 continue
+
+            paper_record = found[arxiv_id]
             try:
-                download, paper_refs = _process_paper(arxiv_id, args, profiler, sources_dir, unzipped_dir)
+                download, paper_refs = _process_paper(
+                    arxiv_id,
+                    args,
+                    profiler,
+                    sources_dir,
+                    unzipped_dir,
+                    paper_record=paper_record,
+                )
             except NotImplementedError:
                 raise
             except Exception as exc:
-                logger.warning("Bỏ qua %s: %s", arxiv_id, exc)
+                logger.warning("Lỗi xử lý %s: %s", arxiv_id, exc)
                 state["failed"][arxiv_id] = repr(exc)
                 continue
-            publications.append(found[arxiv_id])
+
+            publications.append(paper_record)
             references.extend(paper_refs)
             counts["succeeded"] += 1
             counts["references"] += len(paper_refs)
@@ -305,6 +444,7 @@ def run_pipeline(args: argparse.Namespace, profiler: ResourceProfiler, checkpoin
                 name = f"references_{batch_no:05d}.parquet"
                 save_references_parquet(references, checkpoint.part_path(name))
                 state["parts"]["references"].append(name)
+
         state["done_ids"].extend(finished)
         state["next_batch"] = batch_no + 1
         checkpoint.save()
@@ -385,6 +525,8 @@ def main(argv: list[str] | None = None) -> None:
             "rate_limit_sec": args.rate_limit_sec,
             "raw_dir": args.raw_dir,
             "output_dir": args.output_dir,
+            "max_papers": getattr(args, "max_papers", None),
+            "dry_run": getattr(args, "dry_run", False),
         },
     }
     profiler.start()
@@ -401,6 +543,16 @@ def main(argv: list[str] | None = None) -> None:
             "Trạng thái %s sau %.1f s, peak RSS %.1f MB; đã ghi %s",
             stats["status"], stats["runtime_sec"], stats["memory"]["peak_rss_mb"], stats_path,
         )
+
+    # Xuất bảng dữ liệu chuẩn theo đề bài Lab Book nếu có yêu cầu
+    if getattr(args, "export_course", False):
+        course_dir = args.course_export_dir or os.path.join(args.output_dir, "course_export")
+        os.makedirs(course_dir, exist_ok=True)
+        try:
+            papers_path, refs_path = export_to_course_spec(args.output_dir, course_dir)
+            logger.info("Đã xuất bảng chuẩn 6+6 cột vào: %s và %s", papers_path, refs_path)
+        except Exception as exc:
+            logger.error("Lỗi xuất bảng chuẩn môn học: %s", exc)
 
 
 if __name__ == "__main__":
