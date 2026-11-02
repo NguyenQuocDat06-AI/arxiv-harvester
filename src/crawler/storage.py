@@ -18,11 +18,8 @@ import pyarrow.parquet as pq
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# 1. Định nghĩa Schemas
-# ---------------------------------------------------------------------------
 
-# Schema cho struct version con trong bảng publications (các trường con nullable)
+# Metadata và trạng thái nguồn theo version.
 VERSION_STRUCT_TYPE = pa.struct([
     pa.field("version", pa.string(), nullable=True),
     pa.field("created", pa.timestamp("us", tz="UTC"), nullable=True),
@@ -31,61 +28,61 @@ VERSION_STRUCT_TYPE = pa.struct([
     pa.field("source_status", pa.string(), nullable=True),
 ])
 
-# Working Schema đầy đủ cho publications.parquet (16 cột: id nullable=False, còn lại nullable=True)
+# Bảng publications nội bộ.
 PUBLICATIONS_SCHEMA = pa.schema([
-    pa.field("id", pa.string(), nullable=False),  # Khóa chính base ID, non-null
-    pa.field("title", pa.string(), nullable=True),  # Tiêu đề bài báo, nullable
-    pa.field("abstract", pa.string(), nullable=True),  # Tóm tắt, nullable
-    pa.field("authors", pa.list_(pa.string()), nullable=True),  # Danh sách tác giả, nullable
-    pa.field("primary_category", pa.string(), nullable=True),  # Chuyên ngành chính, nullable
-    pa.field("categories", pa.list_(pa.string()), nullable=True),  # Các chuyên ngành, nullable
-    pa.field("published", pa.timestamp("us", tz="UTC"), nullable=True),  # Thời điểm xuất bản, nullable
-    pa.field("updated", pa.timestamp("us", tz="UTC"), nullable=True),  # Thời điểm cập nhật, nullable
-    pa.field("doi", pa.string(), nullable=True),  # Digital Object Identifier, nullable
-    pa.field("journal_ref", pa.string(), nullable=True),  # Thông tin tạp chí, nullable
-    pa.field("comments", pa.string(), nullable=True),  # Ghi chú tác giả, nullable
-    pa.field("venue", pa.string(), nullable=True),  # Nơi công bố / hội nghị, nullable
-    pa.field("source_status", pa.string(), nullable=True),  # Trạng thái tải nguồn cấp bài, nullable
-    pa.field("size_before_bytes", pa.int64(), nullable=True),  # Dung lượng gói nguồn trước giải nén, nullable
-    pa.field("size_after_bytes", pa.int64(), nullable=True),  # Dung lượng sau giải nén, nullable
-    pa.field("versions", pa.list_(VERSION_STRUCT_TYPE), nullable=True),  # Danh sách struct version con, nullable
+    pa.field("id", pa.string(), nullable=False),
+    pa.field("title", pa.string(), nullable=True),
+    pa.field("abstract", pa.string(), nullable=True),
+    pa.field("authors", pa.list_(pa.string()), nullable=True),
+    pa.field("primary_category", pa.string(), nullable=True),
+    pa.field("categories", pa.list_(pa.string()), nullable=True),
+    pa.field("published", pa.timestamp("us", tz="UTC"), nullable=True),
+    pa.field("updated", pa.timestamp("us", tz="UTC"), nullable=True),
+    pa.field("doi", pa.string(), nullable=True),
+    pa.field("journal_ref", pa.string(), nullable=True),
+    pa.field("comments", pa.string(), nullable=True),
+    pa.field("venue", pa.string(), nullable=True),
+    pa.field("source_status", pa.string(), nullable=True),
+    pa.field("size_before_bytes", pa.int64(), nullable=True),
+    pa.field("size_after_bytes", pa.int64(), nullable=True),
+    pa.field("versions", pa.list_(VERSION_STRUCT_TYPE), nullable=True),
 ])
 
-# Working Schema đầy đủ cho references.parquet (11 cột: arxiv_id nullable=False, còn lại nullable=True)
+# Bảng references nội bộ.
 REFERENCES_SCHEMA = pa.schema([
-    pa.field("arxiv_id", pa.string(), nullable=False),  # Khóa chính bài nguồn, non-null
-    pa.field("ref_arxiv_id", pa.string(), nullable=True),  # arXiv ID của bài được trích dẫn, nullable
-    pa.field("ref_title", pa.string(), nullable=True),  # Tiêu đề trích dẫn, nullable
-    pa.field("ref_authors", pa.list_(pa.string()), nullable=True),  # Danh sách tác giả trích dẫn, nullable
-    pa.field("ref_submission_date", pa.string(), nullable=True),  # Ngày nộp dạng YYYY-MM-DD, nullable
-    pa.field("ref_s2_id", pa.string(), nullable=True),  # Mã Semantic Scholar Corpus ID, nullable
-    pa.field("ref_doi", pa.string(), nullable=True),  # DOI của trích dẫn, nullable
-    pa.field("ref_year", pa.int32(), nullable=True),  # Năm xuất bản, nullable
-    pa.field("ref_venue", pa.string(), nullable=True),  # Tạp chí / hội nghị trích dẫn, nullable
-    pa.field("raw_citation", pa.string(), nullable=True),  # Chuỗi trích dẫn thô / BibTeX fallback, nullable
-    pa.field("source", pa.string(), nullable=True),  # Nguồn trích dẫn ("semantic_scholar" | "bib_fallback"), nullable
+    pa.field("arxiv_id", pa.string(), nullable=False),
+    pa.field("ref_arxiv_id", pa.string(), nullable=True),
+    pa.field("ref_title", pa.string(), nullable=True),
+    pa.field("ref_authors", pa.list_(pa.string()), nullable=True),
+    pa.field("ref_submission_date", pa.string(), nullable=True),
+    pa.field("ref_s2_id", pa.string(), nullable=True),  # Semantic Scholar paperId.
+    pa.field("ref_doi", pa.string(), nullable=True),
+    pa.field("ref_year", pa.int32(), nullable=True),
+    pa.field("ref_venue", pa.string(), nullable=True),
+    pa.field("raw_citation", pa.string(), nullable=True),
+    pa.field("source", pa.string(), nullable=True),
 ])
 
 # Schema chuẩn nộp bài theo đề Lab Book Milestone 1
 COURSE_PAPERS_SCHEMA = pa.schema([
-    pa.field("arxiv_id", pa.string(), nullable=False),  # non-null
-    pa.field("title", pa.string(), nullable=True),  # nullable
-    pa.field("authors", pa.list_(pa.string()), nullable=True),  # list of strings
-    pa.field("submission_date", pa.string(), nullable=True),  # ISO string, nullable
-    pa.field("revised_dates", pa.list_(pa.string()), nullable=True),  # list of ISO strings
-    pa.field("venue", pa.string(), nullable=True),  # nullable
+    pa.field("arxiv_id", pa.string(), nullable=False),
+    pa.field("title", pa.string(), nullable=True),
+    pa.field("authors", pa.list_(pa.string()), nullable=True),
+    pa.field("submission_date", pa.string(), nullable=True),
+    pa.field("revised_dates", pa.list_(pa.string()), nullable=True),
+    pa.field("venue", pa.string(), nullable=True),
 ])
 
 COURSE_REFERENCES_SCHEMA = pa.schema([
-    pa.field("arxiv_id", pa.string(), nullable=False),  # non-null
-    pa.field("ref_arxiv_id", pa.string(), nullable=False),  # non-null theo đề
-    pa.field("ref_title", pa.string(), nullable=True),  # nullable
-    pa.field("ref_authors", pa.list_(pa.string()), nullable=True),  # list of strings
-    pa.field("ref_submission_date", pa.string(), nullable=True),  # string
-    pa.field("ref_s2_id", pa.string(), nullable=True),  # string
+    pa.field("arxiv_id", pa.string(), nullable=False),
+    pa.field("ref_arxiv_id", pa.string(), nullable=False),
+    pa.field("ref_title", pa.string(), nullable=True),
+    pa.field("ref_authors", pa.list_(pa.string()), nullable=True),
+    pa.field("ref_submission_date", pa.string(), nullable=True),
+    pa.field("ref_s2_id", pa.string(), nullable=True),
 ])
 
-VALID_SOURCE_STATUSES = frozenset({"success", "partial_success", "pdf_only", "no_latex", "error"})
+VALID_SOURCE_STATUSES = frozenset({"success", "partial_success", "pdf_only", "no_latex", "error", "not_found", "pending"})
 _VERSION_SUFFIX_RE = re.compile(r"v\d+$")
 _WARNED_UNKNOWN_STATUSES: set[str] = set()
 _DATE_REGEX = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -94,43 +91,38 @@ _DROPPED_REF_DATES_COUNT: int = 0
 
 
 def get_synthesized_v1_count() -> int:
-    """Lấy số lượng bài báo tự động tổng hợp struct versions v1 mặc định."""
+    """Số bài được bổ sung version v1 mặc định."""
     return _PAPERS_WITH_SYNTHESIZED_V1_COUNT
 
 
 def reset_synthesized_v1_count() -> None:
-    """Đặt lại bộ đếm số bài báo tự động tổng hợp v1 về 0."""
+    """Đặt lại bộ đếm version v1 mặc định."""
     global _PAPERS_WITH_SYNTHESIZED_V1_COUNT
     _PAPERS_WITH_SYNTHESIZED_V1_COUNT = 0
 
 
 def get_dropped_ref_dates_count() -> int:
-    """Lấy số lượng ngày trích dẫn ref_submission_date không hợp lệ (khác null) bị loại bỏ."""
+    """Số ngày trích dẫn không hợp lệ đã loại bỏ."""
     return _DROPPED_REF_DATES_COUNT
 
 
 def reset_dropped_ref_dates_count() -> None:
-    """Đặt lại bộ đếm ngày trích dẫn bị loại bỏ về 0."""
+    """Đặt lại bộ đếm ngày bị loại bỏ."""
     global _DROPPED_REF_DATES_COUNT
     _DROPPED_REF_DATES_COUNT = 0
 
 
 def _parse_version_num(ver_str: Any) -> int:
-    """Trích xuất số nguyên từ chuỗi version (ví dụ 'v1' -> 1, 'v12' -> 12)."""
+    """Lấy số thứ tự version, ví dụ v12 thành 12."""
     m = re.search(r"\d+", str(ver_str))
     return int(m.group()) if m else 999999
 
 
-# ---------------------------------------------------------------------------
-# 2. Tiện ích Chuẩn hóa & Hỗ trợ Round-trip
-# ---------------------------------------------------------------------------
+# Tiện ích Chuẩn hóa & Hỗ trợ Round-trip
+
 
 def _is_null(val: Any) -> bool:
-    """Kiểm tra giá trị null: chỉ coi None, float NaN, pd.NA/pd.NaT là null.
-    
-    Tuyệt đối không so khớp chuỗi literal 'nan', 'NaN', '<NA>', 'NaT' vì đó có thể là
-    từ khóa, tên viết tắt hoặc nội dung văn bản hợp lệ của người dùng.
-    """
+    """Nhận diện None, NaN, pd.NA và pd.NaT; giữ nguyên các chuỗi cùng tên."""
     if val is None:
         return True
     if isinstance(val, str):
@@ -149,7 +141,7 @@ def _is_null(val: Any) -> bool:
 
 
 def _to_clean_string(val: Any) -> str | None:
-    """Chuyển thành chuỗi rút gọn khoảng trắng hoặc None nếu rỗng/null."""
+    """Rút gọn khoảng trắng; trả None nếu rỗng hoặc null."""
     if _is_null(val):
         return None
     s = str(val).strip()
@@ -157,7 +149,7 @@ def _to_clean_string(val: Any) -> str | None:
 
 
 def _to_utc_timestamp(val: Any) -> datetime | None:
-    """Chuyển chuỗi ISO, datetime, hoặc timestamp sang datetime tz UTC chuẩn."""
+    """Chuyển thời gian sang UTC."""
     if _is_null(val):
         return None
     if isinstance(val, datetime):
@@ -180,7 +172,7 @@ def _to_utc_timestamp(val: Any) -> datetime | None:
 
 
 def _to_string_list(val: Any) -> list[str]:
-    """Chuyển đổi list, tuple, ndarray thành list[str]. Trả về [] nếu null/rỗng."""
+    """Chuyển list, tuple hoặc ndarray thành list[str]; null thành []."""
     if _is_null(val):
         return []
     if isinstance(val, str):
@@ -198,7 +190,7 @@ def _to_string_list(val: Any) -> list[str]:
 
 
 def _to_non_negative_int(val: Any) -> int | None:
-    """Chuyển đổi int; số âm, giá trị vô hạn (inf/-inf), hoặc lỗi chuyển đổi thành None."""
+    """Đổi sang số nguyên không âm; giá trị không hợp lệ thành None."""
     if _is_null(val):
         return None
     try:
@@ -211,10 +203,7 @@ def _to_non_negative_int(val: Any) -> int | None:
 
 
 def _validate_ref_submission_date(val: Any) -> str | None:
-    """Chỉ chấp nhận chuỗi định dạng 'YYYY-MM-DD' hợp lệ theo lịch, không thì trả về None.
-    
-    Không suy đoán ngày nộp từ ref_year. Tăng bộ đếm _DROPPED_REF_DATES_COUNT nếu giá trị khác null bị bỏ.
-    """
+    """Kiểm tra ngày YYYY-MM-DD và đếm ngày lỗi; không suy ngày từ ref_year."""
     global _DROPPED_REF_DATES_COUNT
     if _is_null(val):
         return None
@@ -233,7 +222,7 @@ def _validate_ref_submission_date(val: Any) -> str | None:
 
 
 def _clean_base_id(val: Any) -> str | None:
-    """Chuẩn hóa arXiv ID: bỏ khoảng trắng và bỏ suffix vN nếu có."""
+    """Bỏ khoảng trắng và hậu tố version khỏi arXiv ID."""
     s = _to_clean_string(val)
     if not s:
         return None
@@ -241,23 +230,24 @@ def _clean_base_id(val: Any) -> str | None:
 
 
 def resolve_paper_source_status(statuses: list[str | None]) -> str | None:
-    """Quy tắc phân giải trạng thái cấp bài từ danh sách trạng thái của các version:
-    1. Nếu tất cả version đều 'success' -> 'success'.
-    2. Nếu có ít nhất 1 'success' và có version khác -> 'partial_success'.
-    3. Nếu không có 'success' nào:
-       - Có 'error' -> 'error'.
-       - Có 'no_latex' -> 'no_latex'.
-       - Có 'pdf_only' -> 'pdf_only'.
+    """Tổng hợp trạng thái các version.
+
+    Toàn bộ success: success; chỉ một phần success: partial_success.
+    Nếu không có success, ưu tiên error, no_latex, rồi pdf_only.
     """
-    clean = [st for st in statuses if st in VALID_SOURCE_STATUSES]
-    if not clean:
+    if not statuses or not any(st in VALID_SOURCE_STATUSES for st in statuses):
         return None
+    clean = [st if st in VALID_SOURCE_STATUSES else "pending" for st in statuses]
     if all(st == "success" for st in clean):
         return "success"
     if any(st == "success" for st in clean):
         return "partial_success"
     if "error" in clean:
         return "error"
+    if "not_found" in clean:
+        return "not_found"
+    if "pending" in clean:
+        return "pending"
     if "no_latex" in clean:
         return "no_latex"
     if "pdf_only" in clean:
@@ -265,14 +255,11 @@ def resolve_paper_source_status(statuses: list[str | None]) -> str | None:
     return clean[0]
 
 
-# ---------------------------------------------------------------------------
-# 3. Chuẩn hóa Bản ghi (Normalizer) & Phân loại Hỏng
-# ---------------------------------------------------------------------------
+# Chuẩn hóa Bản ghi (Normalizer) & Phân loại Hỏng
+
 
 def normalize_publication_record(record: dict[str, Any], index: int = 0) -> tuple[dict[str, Any] | None, list[str]]:
-    """Chuẩn hóa một bản ghi bài báo.
-    Chỉ bản ghi mất hoàn toàn id hoặc id rỗng mới bị coi là không cứu được (trả về None).
-    """
+    """Chuẩn hóa publication; trả None nếu thiếu ID."""
     errors: list[str] = []
     if not isinstance(record, dict):
         return None, [f"Bản ghi index {index} không phải là dict (kiểu: {type(record).__name__})"]
@@ -332,11 +319,11 @@ def normalize_publication_record(record: dict[str, Any], index: int = 0) -> tupl
                     "source_status": v_st,
                 })
 
-    # Sắp xếp các version tăng dần theo số phiên bản (int) trước khi áp dụng quy tắc
+    # Sắp xếp version theo số thứ tự.
     if clean_versions:
         clean_versions.sort(key=lambda x: _parse_version_num(x.get("version")))
 
-    # Nếu bài báo chưa có struct versions nào, khởi tạo ít nhất 1 version mặc định
+    # Bổ sung v1 nếu thiếu danh sách versions.
     if not clean_versions:
         global _PAPERS_WITH_SYNTHESIZED_V1_COUNT
         _PAPERS_WITH_SYNTHESIZED_V1_COUNT += 1
@@ -352,15 +339,15 @@ def normalize_publication_record(record: dict[str, Any], index: int = 0) -> tupl
             "source_status": source_status,
         }]
     else:
-        # Áp dụng Quy tắc 3: Khi thượng nguồn chỉ có kết quả cấp bài (các version con đều None về size/status)
-        # Ghi size/status vào struct versions của version cuối (vN), các version trước để None.
+        # Nếu chỉ có số đo cấp bài, gán cho version cuối.
+
         has_any_version_metric = any(v["source_status"] is not None or v["size_before_bytes"] is not None for v in clean_versions)
         if not has_any_version_metric and (source_status is not None or size_before is not None or size_after is not None):
             clean_versions[-1]["size_before_bytes"] = size_before
             clean_versions[-1]["size_after_bytes"] = size_after
             clean_versions[-1]["source_status"] = source_status
 
-    # Ngược lại, nếu trong clean_versions có metric mà cấp bài thiếu, tính tổng hợp cấp bài
+    # Tổng hợp từ versions nếu cấp bài thiếu số đo.
     if size_before is None:
         v_sizes_before = [v["size_before_bytes"] for v in clean_versions if v["size_before_bytes"] is not None]
         if v_sizes_before:
@@ -371,7 +358,7 @@ def normalize_publication_record(record: dict[str, Any], index: int = 0) -> tupl
         if v_sizes_after:
             size_after = sum(v_sizes_after)
 
-    if source_status is None:
+    if source_status is None or any(v["source_status"] is not None for v in clean_versions):
         source_status = resolve_paper_source_status([v["source_status"] for v in clean_versions])
 
     normalized = {
@@ -396,9 +383,7 @@ def normalize_publication_record(record: dict[str, Any], index: int = 0) -> tupl
 
 
 def normalize_reference_record(record: dict[str, Any], index: int = 0) -> tuple[dict[str, Any] | None, list[str]]:
-    """Chuẩn hóa một bản ghi trích dẫn (reference).
-    Chỉ bản ghi mất hẳn arxiv_id bài nguồn mới bị cách ly.
-    """
+    """Chuẩn hóa reference; trả None nếu thiếu ID bài nguồn."""
     errors: list[str] = []
     if not isinstance(record, dict):
         return None, [f"Bản ghi index {index} không phải là dict (kiểu: {type(record).__name__})"]
@@ -439,12 +424,11 @@ def normalize_reference_record(record: dict[str, Any], index: int = 0) -> tuple[
     return normalized, errors
 
 
-# ---------------------------------------------------------------------------
-# 4. Ghi File Nguyên Tử & Quản lý Rejected
-# ---------------------------------------------------------------------------
+# Ghi File Nguyên Tử & Quản lý Rejected
+
 
 def _write_parquet_atomic(table: pa.Table, output_path: str, compression: str = "snappy") -> None:
-    """Ghi bảng PyArrow ra tệp Parquet thông qua tệp tạm cùng thư mục rồi rename."""
+    """Ghi Parquet qua tệp tạm cùng thư mục rồi rename."""
     directory = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(directory, exist_ok=True)
     tmp_path = f"{output_path}.tmp.{os.getpid()}"
@@ -460,7 +444,7 @@ def _write_parquet_atomic(table: pa.Table, output_path: str, compression: str = 
 
 
 def _quarantine_rejected_records(rejected: list[tuple[dict[str, Any], list[str]]], output_path: str) -> None:
-    """Ghi các bản ghi hỏng ra file _rejected_*.jsonl cùng thư mục, không ghi trùng dòng khi chạy lại."""
+    """Lưu bản ghi lỗi vào JSONL; bỏ qua dòng đã có."""
     if not rejected:
         return
     directory = os.path.dirname(os.path.abspath(output_path))
@@ -493,19 +477,15 @@ def _quarantine_rejected_records(rejected: list[tuple[dict[str, Any], list[str]]
         logger.warning("Đã cách ly %d bản ghi hỏng mới vào %s", len(new_lines), rejected_path)
 
 
-# ---------------------------------------------------------------------------
-# 5. Giao diện Ghi Parquet Chính thức
-# ---------------------------------------------------------------------------
+# Giao diện Ghi Parquet Chính thức
+
 
 def save_publications_parquet(
     records: list[dict],
     output_path: str,
     on_invalid: str = "quarantine",
 ) -> None:
-    """Kiểm tra schema và ghi danh sách bài báo ra tệp publications.parquet.
-    - on_invalid='quarantine': ghi các bản ghi tốt, cách ly bản ghi hỏng ra jsonl.
-    - on_invalid='raise': ném ValueError tổng hợp khi có bản ghi hỏng.
-    """
+    """Ghi publications theo schema. on_invalid chọn quarantine hoặc raise."""
     valid_records: list[dict] = []
     rejected: list[tuple[dict, list[str]]] = []
     all_errors: list[str] = []
@@ -524,7 +504,7 @@ def save_publications_parquet(
     if rejected:
         _quarantine_rejected_records(rejected, output_path)
 
-    # Chuyển đổi thành PyArrow Table theo PUBLICATIONS_SCHEMA (kể cả khi rỗng)
+
     if valid_records:
         table = pa.Table.from_pylist(valid_records, schema=PUBLICATIONS_SCHEMA)
     else:
@@ -538,7 +518,7 @@ def save_references_parquet(
     output_path: str,
     on_invalid: str = "quarantine",
 ) -> None:
-    """Kiểm tra schema và ghi danh sách trích dẫn ra tệp references.parquet."""
+    """Ghi references theo schema."""
     valid_records: list[dict] = []
     rejected: list[tuple[dict, list[str]]] = []
     all_errors: list[str] = []
@@ -565,20 +545,14 @@ def save_references_parquet(
     _write_parquet_atomic(table, output_path, compression="snappy")
 
 
-# ---------------------------------------------------------------------------
-# 6. Hàm Xuất Sang Chuẩn Đề Môn Học (export_to_course_spec)
-# ---------------------------------------------------------------------------
+# Hàm Xuất Sang Chuẩn Đề Môn Học (export_to_course_spec)
+
 
 def export_to_course_spec(processed_dir: str, export_dir: str) -> tuple[str, str]:
-    """Xuất từ Working Parquet sang đúng định dạng 6 cột bảng papers và 6 cột references theo đề Lab Book.
-    
-    Quy tắc:
-    - papers: 1 dòng mỗi base ID.
-      + submission_date: ngày tạo v1 (fallback sang published, rồi updated).
-      + revised_dates: nếu bài chỉ có 1 version -> []; nếu có >= 2 version -> ngày các version sau (fallback updated nếu null), khử trùng lặp và sắp xếp tăng dần.
-    - references:
-      + Lọc bắt buộc ref_arxiv_id khác null.
-      + Khử trùng lặp theo cặp (arxiv_id, ref_arxiv_id).
+    """Xuất hai bảng sáu cột theo đề.
+
+    papers lấy ngày v1 và các ngày revision đã biết. references chỉ giữ
+    cạnh có ref_arxiv_id và khử trùng theo cặp (arxiv_id, ref_arxiv_id).
     """
     os.makedirs(export_dir, exist_ok=True)
     pub_in = os.path.join(processed_dir, "publications.parquet")
@@ -587,7 +561,7 @@ def export_to_course_spec(processed_dir: str, export_dir: str) -> tuple[str, str
     papers_out = os.path.join(export_dir, "papers.parquet")
     refs_out = os.path.join(export_dir, "references.parquet")
 
-    # 1. Chuyển đổi bảng papers
+    # Chuyển đổi bảng papers
     if os.path.exists(pub_in):
         working_pubs = pq.read_table(pub_in).to_pylist()
     else:
@@ -616,7 +590,7 @@ def export_to_course_spec(processed_dir: str, export_dir: str) -> tuple[str, str
             c = versions[0]["created"]
             sub_date = c.isoformat() if isinstance(c, datetime) else str(c)
         if not sub_date:
-            sub_date = published_iso or updated_iso
+            sub_date = published_iso
 
         # Tính revised_dates
         revised_dates: list[str] = []
@@ -625,8 +599,6 @@ def export_to_course_spec(processed_dir: str, export_dir: str) -> tuple[str, str
             for v in versions[1:]:
                 c = v.get("created")
                 d_str = c.isoformat() if isinstance(c, datetime) else (str(c) if c else None)
-                if not d_str:
-                    d_str = updated_iso
                 if d_str:
                     raw_revised.append(d_str)
             # Khử trùng lặp và sắp xếp tăng dần
@@ -649,7 +621,7 @@ def export_to_course_spec(processed_dir: str, export_dir: str) -> tuple[str, str
         papers_table = COURSE_PAPERS_SCHEMA.empty_table()
     _write_parquet_atomic(papers_table, papers_out, compression="snappy")
 
-    # 2. Chuyển đổi bảng references
+    # Chuyển đổi bảng references
     if os.path.exists(ref_in):
         working_refs = pq.read_table(ref_in).to_pylist()
     else:
@@ -661,7 +633,7 @@ def export_to_course_spec(processed_dir: str, export_dir: str) -> tuple[str, str
     for r in working_refs:
         ref_arxiv_id = r.get("ref_arxiv_id")
         if not ref_arxiv_id:
-            # Lọc bắt buộc: chỉ lấy trích dẫn có arXiv ID
+            # Course export chỉ giữ target có arXiv ID.
             continue
         arxiv_id = r["arxiv_id"]
         pair_key = (arxiv_id, ref_arxiv_id)

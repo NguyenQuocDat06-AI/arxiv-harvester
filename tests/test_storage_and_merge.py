@@ -29,14 +29,11 @@ from src.crawler.storage import (
 )
 
 
-# ---------------------------------------------------------------------------
-# 1. Tests cho storage.py (Round-trip, Normalizer, on_invalid, export)
-# ---------------------------------------------------------------------------
+# Tests cho storage.py (Round-trip, Normalizer, on_invalid, export)
+
 
 def test_publications_round_trip(tmp_path):
-    """Kiểm thử Round-trip: ghi -> đọc bằng pq.read_table().to_pylist() -> ghi lại.
-    Schema và giá trị phải bảo toàn chính xác.
-    """
+    """Ghi, đọc và ghi lại publications; giữ nguyên schema và dữ liệu."""
     file_path = str(tmp_path / "pubs.parquet")
     file_path_2 = str(tmp_path / "pubs_re.parquet")
 
@@ -98,7 +95,7 @@ def test_publications_round_trip(tmp_path):
 
 
 def test_references_round_trip(tmp_path):
-    """Kiểm thử Round-trip cho bảng references."""
+    """Kiểm tra round-trip của references."""
     file_path = str(tmp_path / "refs.parquet")
     file_path_2 = str(tmp_path / "refs_re.parquet")
 
@@ -298,9 +295,8 @@ def test_export_to_course_spec(tmp_path):
     assert refs_list[0]["ref_arxiv_id"] == "2301.00005"
 
 
-# ---------------------------------------------------------------------------
-# 2. Tests cho generate_mock_data.py
-# ---------------------------------------------------------------------------
+# Tests cho generate_mock_data.py
+
 
 from src.crawler.generate_mock_data import generate_all_mock_data, MEMBERS_CONFIG
 
@@ -364,9 +360,8 @@ def test_mock_data_guard_against_overwriting_real_data(tmp_path):
     assert data_forced["is_mock"] is True
 
 
-# ---------------------------------------------------------------------------
-# 3. Tests cho merge_shards.py
-# ---------------------------------------------------------------------------
+# Tests cho merge_shards.py
+
 
 from src.crawler.merge_shards import merge_all_shards
 
@@ -423,7 +418,7 @@ def test_merge_shards_rejects_mixed_mock_and_real(tmp_path):
 
 
 def test_quarantine_datetime_serializable(tmp_path):
-    """Bản ghi mất ID chứa datetime trong published và versions[].created vẫn serialize được qua jsonl (default=str)."""
+    """Bản ghi lỗi chứa datetime vẫn ghi được vào JSONL."""
     pub_path = str(tmp_path / "quarantine_dt.parquet")
     records = [
         {
@@ -476,13 +471,7 @@ def test_mock_data_separation_defaults():
 
 
 def test_merge_shards_missing_status_and_size(tmp_path):
-    """Khi bài báo trong shard không có source_status và size:
-    - paper_crawl_success_rate = None
-    - source_version_coverage_rate = None
-    - total_source_size_before_bytes = None
-    - total_source_size_after_bytes = None
-    - source_status_breakdown = {}
-    - paper_success_rate_from_stats tính từ stats.json dự phòng."""
+    """Thiếu số đo nguồn: giữ None và dùng stats dự phòng cho tỷ lệ cấp bài."""
     shards_dir = str(tmp_path / "shards")
     output_dir = str(tmp_path / "processed")
     member_dir = os.path.join(shards_dir, "24120470")
@@ -535,21 +524,18 @@ def test_merge_shards_missing_status_and_size(tmp_path):
 
 
 def test_merge_shards_directory_defaults(tmp_path, monkeypatch):
-    """Kiểm tra mặc định thư mục của merge_shards bằng monkeypatch.chdir(tmp_path) không mock exists:
-    - Khi shards_dir=None: allow_mock=False trỏ về data/shards, allow_mock=True trỏ về data/mock/shards.
-    - Khi shards_dir tùy biến (không phải mặc định) và output_dir=None: xuất ra processed cạnh shards_dir.
-    """
+    """Kiểm tra thư mục mặc định và processed cạnh thư mục shard tùy chọn."""
     monkeypatch.chdir(tmp_path)
 
-    # 1. shards_dir=None, allow_mock=False -> FileNotFoundError trỏ tới data/shards
+    # shards_dir=None, allow_mock=False -> FileNotFoundError trỏ tới data/shards
     with pytest.raises(FileNotFoundError, match="data/shards"):
         merge_all_shards(shards_dir=None, output_dir=None, allow_mock=False)
 
-    # 2. shards_dir=None, allow_mock=True -> FileNotFoundError trỏ tới data/mock/shards
+    # shards_dir=None, allow_mock=True -> FileNotFoundError trỏ tới data/mock/shards
     with pytest.raises(FileNotFoundError, match="data/mock/shards"):
         merge_all_shards(shards_dir=None, output_dir=None, allow_mock=True)
 
-    # 3. shards_dir tùy biến và output_dir=None -> xuất ra processed cạnh shards_dir
+    # shards_dir tùy biến và output_dir=None -> xuất ra processed cạnh shards_dir
     custom_shards = tmp_path / "custom" / "shards"
     custom_member = custom_shards / "24120470"
     custom_member.mkdir(parents=True, exist_ok=True)
@@ -611,15 +597,11 @@ def test_unknown_source_status_paper_and_version(caplog):
     assert any("weird_sub_status" in r.message for r in caplog.records)
 
 
-# ---------------------------------------------------------------------------
-# 4. Tests Bổ sung: Schema Nullability, String Preservation, Inf, Quarantine Dedup, Date Validation
-# ---------------------------------------------------------------------------
+# Tests Bổ sung: Schema Nullability, String Preservation, Inf, Quarantine Dedup, Date Validation
+
 
 def test_schemas_nullability():
-    """Kiểm tra tính nullability của các trường trong Schema:
-    - PUBLICATIONS_SCHEMA: duy nhất 'id' có nullable=False, 15 trường còn lại nullable=True.
-    - REFERENCES_SCHEMA: duy nhất 'arxiv_id' có nullable=False, 10 trường còn lại nullable=True.
-    """
+    """Chỉ id của publications và arxiv_id của references là non-null."""
     id_field = PUBLICATIONS_SCHEMA.field("id")
     assert id_field.nullable is False
     for f in PUBLICATIONS_SCHEMA:
@@ -634,9 +616,7 @@ def test_schemas_nullability():
 
 
 def test_is_null_string_and_nan_preservation(tmp_path):
-    """Kiểm tra _is_null không xem các chuỗi 'nan', 'NaN', '<NA>', 'NaT' là null,
-    đồng thời bảo toàn các chuỗi này khi ghi Parquet.
-    """
+    """Giữ nguyên chuỗi nan/NaN/<NA>/NaT khi ghi Parquet."""
     import math
     import pandas as pd
     import numpy as np
@@ -726,9 +706,7 @@ def test_ref_submission_date_strict_calendar_validation():
 
 
 def test_empty_versions_synthesizes_v1_and_counts(caplog):
-    """Kiểm tra bài báo có versions rỗng [] sẽ tự động tạo struct version v1 mặc định,
-    log cảnh báo và tăng bộ đếm papers_with_synthesized_v1.
-    """
+    """Versions rỗng được bổ sung v1, ghi cảnh báo và tăng bộ đếm."""
     import logging
     reset_synthesized_v1_count()
     start_count = get_synthesized_v1_count()
@@ -756,12 +734,7 @@ def test_empty_versions_synthesizes_v1_and_counts(caplog):
 
 
 def test_mock_data_edge_cases_and_merge_stats(tmp_path):
-    """Kiểm thử dữ liệu mock bao gồm các ca biên theo yêu cầu:
-    1. Bài thiếu title, authors, abstract.
-    2. Bài versions rỗng (được tổng hợp v1).
-    3. Reference có ref_arxiv_id = None.
-    4. overall_stats có papers_with_synthesized_v1 > 0.
-    """
+    """Kiểm tra metadata thiếu, versions rỗng và reference không có arXiv ID."""
     reset_synthesized_v1_count()
     shards_dir = str(tmp_path / "shards")
     output_dir = str(tmp_path / "processed")
@@ -799,17 +772,13 @@ def test_mock_data_edge_cases_and_merge_stats(tmp_path):
 
 
 def test_merge_shard_without_synthesized_v1_key_ignores_global_counter(tmp_path):
-    """(a) Merge một shard không có key papers_with_synthesized_v1 trong stats.json,
-    trong khi trước đó cùng tiến trình test đã gọi save_publications_parquet với bản ghi versions rỗng
-    (làm bộ đếm toàn cục tăng).
-    Assert overall_stats KHÔNG có key papers_with_synthesized_v1.
-    """
-    # 1. Gọi save_publications_parquet với versions rỗng để tăng bộ đếm toàn cục
+    """Stats thiếu bộ đếm v1 không được lấy giá trị từ bộ đếm toàn cục."""
+    # Gọi save_publications_parquet với versions rỗng để tăng bộ đếm toàn cục
     dummy_pub = str(tmp_path / "dummy_synth.parquet")
     save_publications_parquet([{"id": "2406.99999", "versions": []}], dummy_pub)
     assert get_synthesized_v1_count() > 0
 
-    # 2. Tạo shard không có key papers_with_synthesized_v1 trong stats.json
+    # Tạo shard không có key papers_with_synthesized_v1 trong stats.json
     shards_dir = tmp_path / "shards"
     member_dir = shards_dir / "24120470"
     member_dir.mkdir(parents=True, exist_ok=True)
@@ -832,19 +801,17 @@ def test_merge_shard_without_synthesized_v1_key_ignores_global_counter(tmp_path)
     with open(member_dir / "stats.json", "w", encoding="utf-8") as f:
         json.dump(stats_data, f)
 
-    # 3. Merge shards
+    # Merge shards
     out_dir = tmp_path / "processed"
     res = merge_all_shards(shards_dir=str(shards_dir), output_dir=str(out_dir), allow_mock=False)
 
-    # 4. Assert overall_stats không có key papers_with_synthesized_v1
+    # Assert overall_stats không có key papers_with_synthesized_v1
     assert "papers_with_synthesized_v1" not in res
     assert "synthesized_v1_note" not in res
 
 
 def test_merge_shards_with_synthesized_v1_key_sums_and_adds_note(tmp_path):
-    """(b) Merge hai shard mock có key này (ví dụ 1 và 2).
-    Assert kết quả là 3 và có synthesized_v1_note.
-    """
+    """Cộng bộ đếm v1 từ các shard và ghi synthesized_v1_note."""
     shards_dir = tmp_path / "shards"
     shard1 = shards_dir / "24120470"
     shard2 = shards_dir / "24120474"
@@ -884,11 +851,7 @@ def test_merge_shards_with_synthesized_v1_key_sums_and_adds_note(tmp_path):
 
 
 def test_dropped_ref_dates_count_and_retention(tmp_path):
-    """(c) Gọi reset_dropped_ref_dates_count(), ghi references với ngày
-    '2023-13-45', '2023-01', '2023-01-15' và None.
-    Assert bộ đếm bằng 2 (chỉ hai giá trị không hợp lệ khác null)
-    và hai bản ghi hợp lệ/null được giữ đúng.
-    """
+    """Đếm ngày lỗi, giữ nguyên ngày hợp lệ và None."""
     reset_dropped_ref_dates_count()
 
     refs = [
@@ -912,14 +875,11 @@ def test_dropped_ref_dates_count_and_retention(tmp_path):
     assert table[3]["ref_submission_date"] is None  # vốn là None -> giữ nguyên
 
 
-# ---------------------------------------------------------------------------
-# 5. Tests bổ sung cho Deduplication, ID Coverage robustness, và Before Dedup
-# ---------------------------------------------------------------------------
+# Tests bổ sung cho Deduplication, ID Coverage robustness, và Before Dedup
+
 
 def test_dedup_publications_newer_updated_wins(tmp_path):
-    """Hai shard cùng id 2406.17937, updated khác nhau, title khác nhau.
-    Assert bản có updated mới hơn thắng (kiểm bằng title) và duplicate_publications_removed == 1.
-    """
+    """Cùng ID: giữ bản có updated mới hơn và đếm bản trùng."""
     shards_dir = tmp_path / "shards"
     shard1 = shards_dir / "24120470"
     shard2 = shards_dir / "24120474"
@@ -953,9 +913,7 @@ def test_dedup_publications_newer_updated_wins(tmp_path):
 
 
 def test_dedup_publications_tie_fewer_nulls_wins(tmp_path):
-    """Cùng id, cùng updated, một bản có doi/journal_ref và một bản thiếu (None).
-    Assert bản ít None thắng.
-    """
+    """Cùng ID và updated: giữ bản ít null hơn."""
     shards_dir = tmp_path / "shards"
     shard1 = shards_dir / "24120470"
     shard2 = shards_dir / "24120474"
@@ -1090,9 +1048,7 @@ def test_references_cross_shard_duplicate_removed(tmp_path):
 
 
 def test_references_fallback_dedup_no_identifiers(tmp_path):
-    """Hai reference chỉ khác ref_year (không s2/arxiv/doi/title/raw_citation) -> ra 2 hàng;
-    hai reference y hệt nhau -> ra 1 hàng.
-    """
+    """Reference thiếu định danh chỉ gộp khi toàn bộ nội dung trùng nhau."""
     # Ca 1: Khác ref_year -> 2 hàng
     shards_dir1 = tmp_path / "shards_diff_year"
     shard1 = shards_dir1 / "24120470"
@@ -1132,7 +1088,7 @@ def test_check_id_coverage_malformed_inputs():
     """_check_id_coverage với id_range = 'abc', {'start_id': 'x'}, {} -> không ném, has_assigned_range False."""
     from src.crawler.merge_shards import _check_id_coverage
 
-    # 1. id_range là chuỗi
+    # id_range là chuỗi
     res_str = _check_id_coverage("abc", {"2406.00001"})
     assert res_str["has_assigned_range"] is False
     assert res_str["total_found"] == 1
@@ -1141,14 +1097,14 @@ def test_check_id_coverage_malformed_inputs():
     assert res_str["tail_unverified"] is False
     assert "coverage_error" in res_str
 
-    # 2. id_range có start_id không parse được int hoặc thiếu end_id
+    # id_range có start_id không parse được int hoặc thiếu end_id
     res_val = _check_id_coverage({"start_id": "x"}, {"2406.00001"})
     assert res_val["has_assigned_range"] is False
     assert res_val["total_found"] == 1
     assert res_val["missing_count"] == 0
     assert "coverage_error" in res_val
 
-    # 3. id_range rỗng {} (giữ nguyên hành vi gốc, không thêm coverage_error)
+    # id_range rỗng {} (giữ nguyên hành vi gốc, không thêm coverage_error)
     res_empty = _check_id_coverage({}, {"2406.00001"})
     assert res_empty["has_assigned_range"] is False
     assert res_empty["total_found"] == 1
@@ -1159,9 +1115,7 @@ def test_check_id_coverage_malformed_inputs():
 
 
 def test_merge_all_shards_with_malformed_id_range(tmp_path):
-    """merge_all_shards với một shard có id_range sai định dạng -> chạy xong, shard vẫn được gộp,
-    member_breakdown của shard đó có id_coverage.has_assigned_range == False.
-    """
+    """Shard có id_range lỗi vẫn được gộp và báo thiếu bằng chứng coverage."""
     shards_dir = tmp_path / "shards"
     shard = shards_dir / "24120470"
     shard.mkdir(parents=True, exist_ok=True)
@@ -1189,9 +1143,7 @@ def test_merge_all_shards_with_malformed_id_range(tmp_path):
 
 
 def test_check_id_coverage_same_month_missing_id():
-    """_check_id_coverage cùng tháng (ví dụ 2502.03235 -> 2502.03240, thiếu 1 ID)
-    -> missing_count == 1, tail_unverified False.
-    """
+    """Dải cùng tháng thiếu một ID: missing_count=1, tail_unverified=False."""
     from src.crawler.merge_shards import _check_id_coverage
 
     assigned_range = {
@@ -1217,11 +1169,7 @@ def test_check_id_coverage_same_month_missing_id():
 
 
 def test_overall_stats_records_before_dedup(tmp_path):
-    """Thêm số bản ghi TRƯỚC gộp vào overall_stats:
-    assert before_pub == total_publications + duplicate_publications_removed,
-    và before_ref == total_references + duplicate_references_removed.
-    Dựng dữ liệu sao cho không có bản ghi mất id.
-    """
+    """Số dòng trước gộp bằng số dòng sau gộp cộng số dòng trùng."""
     shards_dir = tmp_path / "shards"
     shard1 = shards_dir / "24120470"
     shard2 = shards_dir / "24120474"
@@ -1270,6 +1218,5 @@ def test_overall_stats_records_before_dedup(tmp_path):
     assert res["total_references"] == 4
     assert res["duplicate_references_removed"] == 1
     assert res["total_references_before_dedup"] == res["total_references"] + res["duplicate_references_removed"]
-
 
 
