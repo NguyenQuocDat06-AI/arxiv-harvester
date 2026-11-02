@@ -1,12 +1,12 @@
 class CrawlerError(Exception):
-    """ Base class for crawler exception"""
+    """Base crawler error with affected IDs."""
     def __init__(self, message:str, failed_ids:list[str] | None = None) -> None:
         super().__init__(message)
         self.failed_ids = failed_ids or []
 
 
 class RateLimitError(CrawlerError):
-    """ Exception raised when rate limit is exceeded"""
+    """Request rate limit exceeded."""
     def __init__(self, message: str, status_code: int = 429,
         retry_after: float | None = None,
         failed_ids: list[str] | None = None
@@ -16,14 +16,14 @@ class RateLimitError(CrawlerError):
         self.retry_after = retry_after
 
 class NetworkTimeoutError(CrawlerError):
-    """ Exception raised when request timeout"""
+    """Network request failed or timed out."""
     def __init__(self, message: str, timeout: float, endpoint: str, failed_ids: list[str] | None = None) -> None:
         super().__init__(message, failed_ids=failed_ids)
         self.timeout = timeout
         self.endpoint = endpoint
 
 class CorruptedDataError(CrawlerError):
-    """ Exception raised when corrupted data """
+    """Response data could not be parsed."""
     def __init__(self, message: str, endpoint: str, failed_ids: list[str] | None = None) -> None:
         super().__init__(message, failed_ids=failed_ids)
         self.endpoint = endpoint
@@ -34,7 +34,7 @@ arXivConnectionError = NetworkTimeoutError
 arXivMalformedXMLError = CorruptedDataError
 
 if __name__ == "__main__":
-    print("=== TEST CRAWLER EXCEPTIONS ===")
+    print("Crawler exception tests")
 
     # Test RateLimitError
     print("\n1. Test RateLimitError:")
@@ -46,11 +46,11 @@ if __name__ == "__main__":
             failed_ids=["2412.18848", "2412.18849"],
         )
     except CrawlerError as err:
-        print(f"  [+] Caught by CrawlerError base class: {err}")
+        print(f"  Caught by CrawlerError base class: {err}")
         if isinstance(err, RateLimitError):
-            print(f"  [+] Status Code: {err.status_code}")
-            print(f"  [+] Retry After: {err.retry_after}s")
-            print(f"  [+] Failed IDs ({len(err.failed_ids)} papers): {err.failed_ids}")
+            print(f"  Status Code: {err.status_code}")
+            print(f"  Retry After: {err.retry_after}s")
+            print(f"  Failed IDs ({len(err.failed_ids)} papers): {err.failed_ids}")
 
     # Test NetworkTimeoutError
     print("\n2. Test NetworkTimeoutError:")
@@ -62,10 +62,10 @@ if __name__ == "__main__":
             failed_ids=["2501.00001"],
         )
     except NetworkTimeoutError as err:
-        print(f"  [+] Message: {err}")
-        print(f"  [+] Timeout threshold: {err.timeout}s")
-        print(f"  [+] Endpoint: {err.endpoint}")
-        print(f"  [+] Failed IDs: {err.failed_ids}")
+        print(f"  Message: {err}")
+        print(f"  Timeout threshold: {err.timeout}s")
+        print(f"  Endpoint: {err.endpoint}")
+        print(f"  Failed IDs: {err.failed_ids}")
 
     # Test CorruptedDataError
     print("\n3. Test CorruptedDataError:")
@@ -76,14 +76,14 @@ if __name__ == "__main__":
             failed_ids=["2412.99999"],
         )
     except CorruptedDataError as err:
-        print(f"  [+] Message: {err}")
-        print(f"  [+] Endpoint: {err.endpoint}")
-        print(f"  [+] Failed IDs: {err.failed_ids}")
+        print(f"  Message: {err}")
+        print(f"  Endpoint: {err.endpoint}")
+        print(f"  Failed IDs: {err.failed_ids}")
 
     # Test Alias
     print("\n4. Test Aliases:")
     assert issubclass(arXivRateLimitError, DiscoveryError)
     assert issubclass(arXivConnectionError, CrawlerError)
     assert issubclass(arXivMalformedXMLError, CrawlerError)
-    print("  [+] All aliases (DiscoveryError, arXivRateLimitError, ...) are working correctly!")
-    print("\n[+] Exception testing completed.")
+    print("  Exception aliases verified.")
+    print("\nException testing completed.")

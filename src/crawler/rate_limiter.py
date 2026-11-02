@@ -1,28 +1,31 @@
 import time
+import threading
+import math
 
 class DomainRateLimiter:
-    """ Rate limit for a domain ( arXiv, Semantic, Scholar, ...)"""
+    """Track request intervals per domain."""
     def __init__(self, default_interval: float = 3.0) -> None:
         self.default_interval = default_interval
-        # Last time call for domain
+        # Last request time per domain.
         self._last_called: dict[str,float] = {}
+        self._lock = threading.Lock()
 
     def wait(self, domain: str = "arxiv", interval: float | None = None) -> None:
         """ Wait until the next request is allowed."""
         wait_time = interval if interval is not None else self.default_interval
-        now = time.time()
-        last_time = self._last_called.get(domain, 0.0)
-        elapsed = now - last_time
-
-        if elapsed < wait_time:
-            time.sleep(wait_time - elapsed)
-        
-        self._last_called[domain] = time.time()
+        if not math.isfinite(wait_time) or wait_time < 0:
+            raise ValueError("Rate limit interval must be finite and nonnegative")
+        with self._lock:
+            now = time.monotonic()
+            remaining = wait_time - (now - self._last_called.get(domain, float("-inf")))
+            if remaining > 0:
+                time.sleep(remaining)
+            self._last_called[domain] = time.monotonic()
 
 rate_limiter = DomainRateLimiter(default_interval=3.0)
 
 if __name__ == "__main__":
-    print("=== TEST DOMAIN RATE LIMIT ===")
+    print("Domain rate limit test")
     limiter = DomainRateLimiter(default_interval=1.0)
     print("\n1. Test same domain 'arxiv':")
     start_total = time.time()
@@ -41,4 +44,4 @@ if __name__ == "__main__":
     limiter.wait("semantic_scholar", interval=0.5)
     print(f"  - Called 'semantic_scholar': {time.time() - t_s2:.3f}s")
 
-    print("\n[+] Done test.")
+    print("\nDone test.")

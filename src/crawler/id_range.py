@@ -1,13 +1,13 @@
 import re
 from typing import Iterator
-from src.crawler.discovery import discover_metadata_batch
-from src.crawler.exceptions import arXivConnectionError
+from .discovery import discover_metadata_batch
+from .exceptions import arXivConnectionError
 
 MAX_ARXIV_SEQ = 99999
 _LAST_ID_CACHE: dict[str, int] = {}
 
 def normalize_yymm(month_str: str) -> str:
-    """Normalize YYYY-MM or YYMM to YYMM format."""
+    """Normalize YYYY-MM or YYMM to YYMM."""
     if not isinstance(month_str, str):
         raise TypeError("Month must be string")
     cleaned = month_str.strip()
@@ -25,7 +25,7 @@ def normalize_yymm(month_str: str) -> str:
 
 
 def _get_month_sequence(start_month: str, end_month: str) -> list[str]:
-    """Generate sequential YYMM list between start_month and end_month."""
+    """List months from start_month through end_month."""
     s_norm = normalize_yymm(start_month)
     e_norm = normalize_yymm(end_month)
 
@@ -54,7 +54,7 @@ def find_last_id_of_month(
     rate_limit_sec: float = 3.0,
     use_cache: bool = True,
 ) -> int:
-    """Find last arxiv ID of month using binary search with error classification."""
+    """Find the last monthly ID by binary search; propagate request errors."""
     norm_yymm = normalize_yymm(yymm)
     if use_cache and norm_yymm in _LAST_ID_CACHE:
         return _LAST_ID_CACHE[norm_yymm]
@@ -62,7 +62,7 @@ def find_last_id_of_month(
     if start_seq < 1 or start_seq > MAX_ARXIV_SEQ:
         raise ValueError(f"start_seq should be between 1 and {MAX_ARXIV_SEQ}, got {start_seq}")
 
-    # 1. Verify that start_seq exists on arXiv
+    # Verify the lower bound.
     start_id = f"{norm_yymm}.{start_seq:05d}"
     res_start = discover_metadata_batch([start_id], rate_limit_sec=rate_limit_sec)
     if start_id not in res_start.records_by_id:
@@ -77,7 +77,7 @@ def find_last_id_of_month(
     low = start_seq
     high = min(max(30000, start_seq + 5000), MAX_ARXIV_SEQ)
 
-    # 2. Expand upper bound if necessary without exceeding MAX_ARXIV_SEQ
+    # Expand the upper bound up to MAX_ARXIV_SEQ.
     while high <= MAX_ARXIV_SEQ:
         probe_id = f"{norm_yymm}.{high:05d}"
         res = discover_metadata_batch([probe_id], rate_limit_sec=rate_limit_sec)
@@ -95,7 +95,7 @@ def find_last_id_of_month(
                 failed_ids=[probe_id],
             )
 
-    # 3. Binary search safely within [low, high]
+    # Binary search within [low, high].
     while low <= high:
         mid = (low + high) // 2
         arxiv_id = f"{norm_yymm}.{mid:05d}"
@@ -107,7 +107,7 @@ def find_last_id_of_month(
         elif arxiv_id in res.missing_confirmed:
             high = mid - 1
         else:
-            # Stop safely if encountering network error to avoid narrowing the bound wrongly
+            # A request error cannot determine which bound to move.
             raise arXivConnectionError(
                 f"Transient error probing {arxiv_id}, halting binary search safely.",
                 failed_ids=[arxiv_id],
@@ -126,7 +126,7 @@ def iter_assigned_arxiv_ids(
     end_id: int,
     rate_limit_sec: float = 3.0,
 ) -> Iterator[str]:
-    """Generate sequential arXiv IDs for any given month range and sequence boundaries."""
+    """Generate IDs within the assigned month and sequence bounds."""
     if start_id < 1 or start_id > MAX_ARXIV_SEQ:
         raise ValueError(f"Start ID must be between 1 and {MAX_ARXIV_SEQ}, got {start_id}")
     if end_id < 1 or end_id > MAX_ARXIV_SEQ:
@@ -134,7 +134,7 @@ def iter_assigned_arxiv_ids(
 
     months = _get_month_sequence(start_month, end_month)
 
-    # Case 1: Range stays within a single month
+    # Single-month range.
     if len(months) == 1:
         single_month = months[0]
         if start_id > end_id:
@@ -145,26 +145,26 @@ def iter_assigned_arxiv_ids(
             yield f"{single_month}.{seq:05d}"
         return
 
-    # Case 2: Range spans two or more months
+    # Multi-month range.
     for idx, month in enumerate(months):
         if idx == 0:
-            # First month: from start_id to the last paper of this month
+            # First month starts at start_id.
             last_seq = find_last_id_of_month(month, start_seq=start_id, rate_limit_sec=rate_limit_sec)
             for seq in range(start_id, last_seq + 1):
                 yield f"{month}.{seq:05d}"
         elif idx == len(months) - 1:
-            # Last month: from 00001 to end_id
+            # Last month ends at end_id.
             for seq in range(1, end_id + 1):
                 yield f"{month}.{seq:05d}"
         else:
-            # Intermediate months (if range spans 3+ months): all papers in that month
+            # Include every ID in intermediate months.
             last_seq = find_last_id_of_month(month, start_seq=1, rate_limit_sec=rate_limit_sec)
             for seq in range(1, last_seq + 1):
                 yield f"{month}.{seq:05d}"
 
 
 if __name__ == "__main__":
-    print("=== 1. Test normalize_yymm ===")
+    print("Test normalize_yymm")
     test_months = [
         ("2024-12", "2412"),
         ("2025-01", "2501"),
@@ -184,12 +184,12 @@ if __name__ == "__main__":
         except (ValueError, TypeError):
             print(f"  [OK] Caught expected error for: {case}")
 
-    print("\n=== 2. Test month sequence across multiple months ===")
+    print("\nTest month sequence")
     seq_months = _get_month_sequence("2024-11", "2025-02")
     assert seq_months == ["2411", "2412", "2501", "2502"]
     print(f"  [OK] Sequence 4 months: {seq_months}")
 
-    print("\n=== 3. Test iter_assigned_arxiv_ids (Same month - No network call) ===")
+    print("\nTest single-month ID range")
     sample_same_month = list(iter_assigned_arxiv_ids("2024-12", 1, "2024-12", 5))
     print(f"  Generated IDs: {sample_same_month}")
     assert sample_same_month == [
@@ -201,12 +201,12 @@ if __name__ == "__main__":
     ], "Mismatch in same month ID generation"
     print("  [OK] Same month generation passed")
 
-    print("\n=== 4. Test find_last_id_of_month (Personal Range: 2412) ===")
-    print("  [*] Finding last ID of 2412 via Binary Search...")
+    print("\nTest last ID for month 2412")
+    print("  Finding last ID of 2412 via Binary Search...")
     last_id_2412 = find_last_id_of_month("2412", start_seq=18848)
-    print(f"  [+] Result last ID 12/2024: 2412.{last_id_2412:05d}")
+    print(f"  Result last ID 12/2024: 2412.{last_id_2412:05d}")
 
     total_papers = (last_id_2412 - 18848 + 1) + 2641
-    print(f"  [+] Total papers in personal range (18848 -> {last_id_2412} and 1 -> 2641): {total_papers} papers")
+    print(f"  Total papers in personal range (18848 -> {last_id_2412} and 1 -> 2641): {total_papers} papers")
     assert total_papers == 5000, f"Expected 5000 papers, got {total_papers}"
     print("  [OK] 5000 papers assigned range fully verified.")
