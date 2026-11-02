@@ -1,18 +1,18 @@
-from src.crawler.rate_limiter import rate_limiter
-from src.crawler.exceptions import arXivConnectionError, arXivMalformedXMLError, arXivRateLimitError
+from .rate_limiter import rate_limiter
+from .exceptions import arXivConnectionError, arXivMalformedXMLError, arXivRateLimitError
 import re
 import time
 import xml.etree.ElementTree as ET
 import requests
 from dataclasses import dataclass, field
 
-API_URL = "http://export.arxiv.org/api/query"
+API_URL = "https://export.arxiv.org/api/query"
 NS = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
 BATCH_SIZE = 100
 
 @dataclass
 class DiscoveryBatchResult(list):
-    """extend dict list of batch result"""
+    """Metadata records with missing and failed ID sets."""
     records_by_id: dict[str, dict] = field(default_factory=dict)
     missing_confirmed: set[str] = field(default_factory=set)
     failed_ids: dict[str, str] = field(default_factory=dict)
@@ -25,12 +25,12 @@ class DiscoveryBatchResult(list):
 
 
 def _get_text(elem: ET.Element | None) -> str:
-    """Extract and normalize text from an element."""
+    """Extract text and collapse whitespace."""
     return " ".join(elem.text.split()) if (elem is not None and elem.text) else ""
 
 
 def _parse_entry(entry: ET.Element) -> dict | None:
-    """Parse one Atom entry element into metadata dictionary."""
+    """Parse an Atom entry into paper metadata."""
     raw_url = _get_text(entry.find("atom:id", NS))
     title = _get_text(entry.find("atom:title", NS))
     authors_raw = [
@@ -40,9 +40,10 @@ def _parse_entry(entry: ET.Element) -> dict | None:
     ]
     authors_lower = [a.lower() for a in authors_raw]
 
-    # Skip error arXiv API
+    # API errors must not be marked as missing IDs.
     if "api/errors" in raw_url or (title == "Error" and any ("arxiv api core" in a for a in authors_lower)):
-        return None
+        message = _get_text(entry.find("atom:summary", NS)) or raw_url or title
+        raise ValueError(f"arXiv API error entry: {message}")
 
     match = re.search(r"(\d{4}\.\d{4,5})(?:v(\d+))?", raw_url)
     if not match:
@@ -101,7 +102,7 @@ def _parse_entry(entry: ET.Element) -> dict | None:
 def discover_metadata_batch(
     arxiv_ids: list[str], rate_limit_sec: float = 3.0, max_retries: int = 3
 ) -> DiscoveryBatchResult:
-    """Get metadata for list of arxiv ids with batching, retry and timeout."""
+    """Fetch metadata in batches with retries and rate limiting."""
     headers = {
         "User-Agent": "arxiv-harvester/1.0 (Course Project; mailto:24120282@student.hcmus.edu.vn)"
     }
@@ -117,7 +118,7 @@ def discover_metadata_batch(
         last_exc: Exception | None = None
 
         for attempt in range(max_retries):
-            rate_limiter.wait("arxiv", interval=rate_limit_sec)
+            rate_limiter.wait("arxiv", interval=max(3.0, rate_limit_sec))
             try:
                 resp = requests.get(
                     API_URL, params=params, headers=headers, timeout=20.0
@@ -151,7 +152,7 @@ def discover_metadata_batch(
                 if attempt < max_retries - 1:
                     time.sleep((attempt + 1) * 3.0)
 
-        # After retry not got response
+        # Retries exhausted.
         if resp_text is None:
             for cid in chunk:
                 failed_ids[cid] = repr(last_exc)
@@ -175,12 +176,21 @@ def discover_metadata_batch(
                 failed_ids=chunk,
             ) from exc
 
+        if root.tag != f"{{{NS['atom']}}}feed":
+            raise arXivMalformedXMLError(
+                "Expected an arXiv Atom feed", endpoint=API_URL, failed_ids=chunk
+            )
         chunk_found: set[str] = set()
-        for entry in root.findall("atom:entry", NS):
-            rec = _parse_entry(entry)
-            if rec and rec["id"] in chunk:
-                all_records.append(rec)
-                chunk_found.add(rec["id"])
+        try:
+            for entry in root.findall("atom:entry", NS):
+                rec = _parse_entry(entry)
+                if rec and rec["id"] in chunk:
+                    all_records.append(rec)
+                    chunk_found.add(rec["id"])
+        except ValueError as exc:
+            raise arXivMalformedXMLError(
+                str(exc), endpoint=API_URL, failed_ids=chunk
+            ) from exc
 
         for cid in chunk:
             if cid not in chunk_found:
@@ -196,19 +206,19 @@ if __name__ == "__main__":
         "2412.18848",
         "2412.18849",
         "2501.00001",
-        "9999.99999", 
+        "9999.99999",
     ]
 
-    print(f"[*] Starting metadata discovery test for {len(test_ids)} sample IDs...")
+    print(f"Discovering metadata for {len(test_ids)} IDs")
     start_time = time.time()
 
     data = discover_metadata_batch(test_ids, rate_limit_sec=3.0)
 
     elapsed = time.time() - start_time
-    print(f"[+] Completed in {elapsed:.2f}s. Records retrieved: {len(data)}/{len(test_ids)}")
+    print(f"Completed in {elapsed:.2f}s. Records retrieved: {len(data)}/{len(test_ids)}")
 
     if data:
-        print("\n--- Sample Record (First Paper) ---")
+        print("\nSample record")
     sample = data[0]
     print(f"ID: {sample['id']}")
     print(f"Title: {sample['title']}")
@@ -218,5 +228,5 @@ if __name__ == "__main__":
     for ver in sample["versions"]:
             print(f"  - {ver['version']}: {ver['created']}")
 
-    print("\n--- Detailed JSON Structure ---")
+    print("\nJSON output")
     print(json.dumps(sample, indent=2, ensure_ascii=False))
