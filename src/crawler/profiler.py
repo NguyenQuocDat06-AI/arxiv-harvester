@@ -7,6 +7,9 @@ import statistics
 import sys
 import threading
 import time
+import math
+from pathlib import Path
+from contextvars import ContextVar
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Iterator
@@ -15,6 +18,14 @@ import psutil
 
 # Quy đổi đơn vị: 1 MB trong stats.json = 1024**2 byte (MiB).
 BYTES_PER_MB = 1024**2
+_ACTIVE_PROFILER = ContextVar("arxiv_resource_profiler", default=None)
+
+
+def resource_checkpoint() -> None:
+    """Sample disk usage at an operation boundary."""
+    profiler = _ACTIVE_PROFILER.get()
+    if profiler is not None:
+        profiler.capture(disk=True)
 
 
 def dir_size_bytes(path: str) -> int:
@@ -61,9 +72,8 @@ def _environment() -> dict:
         if module is not None:
             versions[name] = getattr(module, "__version__", None)
     is_colab = "google.colab" in sys.modules or "COLAB_RELEASE_TAG" in os.environ
-    has_gpu = bool(os.environ.get("CUDA_VISIBLE_DEVICES")) or os.path.exists(
-        "/dev/nvidia0"
-    )
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    has_gpu = (visible not in {"", "-1"}) or os.path.exists("/dev/nvidia0")
     return {
         "platform": platform.platform(),
         "python_version": platform.python_version(),
@@ -83,12 +93,15 @@ class ResourceProfiler:
         sample_interval_sec: float = 0.5,
         watch_dirs: dict[str, str] | None = None,
     ) -> None:
-        if sample_interval_sec <= 0:
+        if not math.isfinite(sample_interval_sec) or sample_interval_sec <= 0:
             raise ValueError("sample_interval_sec phải lớn hơn 0")
         self.sample_interval_sec = sample_interval_sec
         self.watch_dirs = dict(watch_dirs or {})
         self._process = psutil.Process()
         self._samples: list[int] = []
+        self._sample_times: list[float] = []
+        self._disk_samples: list[dict] = []
+        self._sampling_lock = threading.Lock()
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -108,20 +121,57 @@ class ResourceProfiler:
         self._disk_before = {
             label: dir_size_bytes(path) for label, path in self.watch_dirs.items()
         }
-        self._sample()
         self._start_perf = time.perf_counter()
+        self._sample()
         self._thread = threading.Thread(
             target=self._sampling_loop, name="resource-profiler", daemon=True
         )
         self._thread.start()
 
-    def _sample(self) -> None:
+    def _sample(self, disk: bool = True) -> None:
+        with self._sampling_lock:
+            self._sample_unlocked(disk)
+
+    def _sample_unlocked(self, disk: bool = True) -> None:
         try:
             rss = self._process.memory_info().rss
         except psutil.Error:
             return
+        try:
+            children = self._process.children(recursive=True)
+        except psutil.Error:
+            children = []
+        seen = {self._process.pid}
+        for child in children:
+            if child.pid in seen:
+                continue
+            seen.add(child.pid)
+            try:
+                rss += child.memory_info().rss
+            except psutil.Error:
+                pass
+        timestamp = time.perf_counter()
+        sizes = {label: dir_size_bytes(path) for label, path in self.watch_dirs.items()} if disk else {}
+        roots = []
+        for label, path in sorted(self.watch_dirs.items(), key=lambda item: len(os.path.abspath(item[1]))):
+            absolute = os.path.realpath(path)
+            def contained(parent):
+                try:
+                    return os.path.commonpath([absolute, parent]) == parent
+                except ValueError:
+                    return False
+            if not any(contained(parent) for _, parent in roots):
+                roots.append((label, absolute))
         with self._lock:
             self._samples.append(rss)
+            self._sample_times.append(timestamp)
+            if disk:
+                self._disk_samples.append({"elapsed_sec": timestamp - self._start_perf,
+                                           "total_bytes": sum(sizes[label] for label, _ in roots), "dirs": sizes})
+
+    def capture(self, disk: bool = True) -> None:
+        if self._start_perf is not None and self._end_perf is None:
+            self._sample(disk=disk)
 
     def _sampling_loop(self) -> None:
         while not self._stop_event.wait(self.sample_interval_sec):
@@ -131,12 +181,15 @@ class ResourceProfiler:
     def phase(self, name: str) -> Iterator[None]:
         """Cộng dồn thời gian của một pha, kể cả khi pha đó ném lỗi."""
         begin = time.perf_counter()
+        token = _ACTIVE_PROFILER.set(self)
         try:
             yield
         finally:
             elapsed = time.perf_counter() - begin
             self._phase_sec[name] = self._phase_sec.get(name, 0.0) + elapsed
             self._phase_calls[name] = self._phase_calls.get(name, 0) + 1
+            self.capture()
+            _ACTIVE_PROFILER.reset(token)
 
     def _stop(self) -> None:
         if self._thread is None:
@@ -149,11 +202,16 @@ class ResourceProfiler:
         self._end_perf = time.perf_counter()
 
     def stop_and_export(self, output_json_path: str, extra: dict | None = None) -> dict:
-        """Dừng đo, xuất stats.json và trả lại các số đo cùng đơn vị."""
+        """Dừng đo và ghi stats.json kèm đơn vị."""
         self._stop()
         if self._result is None:
             with self._lock:
                 samples = list(self._samples)
+                timestamps = list(self._sample_times)
+                disk_samples = list(self._disk_samples)
+            duration = sum(b - a for a, b in zip(timestamps, timestamps[1:]))
+            average = (sum(value * (b - a) for value, a, b in zip(samples, timestamps, timestamps[1:])) / duration
+                       if duration else statistics.fmean(samples))
             disk_after = {
                 label: dir_size_bytes(path) for label, path in self.watch_dirs.items()
             }
@@ -170,11 +228,12 @@ class ResourceProfiler:
                     for name, sec in self._phase_sec.items()
                 },
                 "memory": {
-                    "metric": "RSS của tiến trình Python (không phải RAM toàn máy)",
+                    "metric": "Tổng RSS tiến trình chính và tiến trình con tại cùng thời điểm",
                     "unit": "MB",
                     "bytes_per_mb": BYTES_PER_MB,
                     "peak_rss_mb": round(max(samples) / BYTES_PER_MB, 2),
-                    "avg_rss_mb": round(statistics.fmean(samples) / BYTES_PER_MB, 2),
+                    "avg_rss_mb": round(average / BYTES_PER_MB, 2),
+                    "average_method": "time_weighted_left_samples",
                     "os_reported_peak_rss_mb": (
                         round(os_peak / BYTES_PER_MB, 2) if os_peak else None
                     ),
@@ -183,6 +242,9 @@ class ResourceProfiler:
                 },
                 "disk": {
                     "unit": "bytes",
+                    "peak_bytes": max((s["total_bytes"] for s in disk_samples), default=0),
+                    "final_bytes": disk_samples[-1]["total_bytes"] if disk_samples else 0,
+                    "method": "periodic samples and operation checkpoints; nested directories counted once",
                     "dirs": {
                         label: {
                             "path": path,
@@ -194,6 +256,14 @@ class ResourceProfiler:
                 },
                 "environment": _environment(),
             }
+            samples_path = Path(output_json_path).parent / "resource_samples.jsonl"
+            samples_path.parent.mkdir(parents=True, exist_ok=True)
+            with samples_path.open("w", encoding="utf-8") as stream:
+                for timestamp, rss in zip(timestamps, samples):
+                    stream.write(json.dumps({"kind": "rss", "elapsed_sec": timestamp - self._start_perf, "rss_bytes": rss}) + "\n")
+                for sample in disk_samples:
+                    stream.write(json.dumps({"kind": "disk", **sample}) + "\n")
+            self._result["samples_file"] = str(samples_path)
         result = {**self._result, **(extra or {})}
         _write_json_atomic(output_json_path, result)
         return result
