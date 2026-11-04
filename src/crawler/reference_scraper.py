@@ -1,15 +1,7 @@
-"""Thu thập trích dẫn. Phụ trách: Trần Nguyên Tân (24120438).
+"""Thu thập references từ Semantic Scholar, dự phòng bằng BibTeX khi S2 trả 404.
 
-Các bước của `scrape_references_for_paper`:
-  1. Kiểm tra và chuẩn hóa ID bài nguồn; sai hình dạng thì lỗi ngay, chưa gửi request nào.
-  2. Hỏi Semantic Scholar (S2). Request đầu lấy luôn danh sách trích dẫn; nếu S2 cắt bớt thì lấy lại
-     bằng endpoint phân trang. Lỗi tạm thời (429, 5xx, mạng) được thử lại có chờ tăng dần (backoff + jitter).
-  3. S2 trả 404 (không biết bài này) thì đọc .bib trong thư mục nguồn đã giải nén (chỉ lấy mục mà .tex trích).
-  4. Đổi mọi thứ thành bản ghi chung (đúng các khóa của REFERENCE_KEYS) và bỏ cạnh trích dẫn trùng.
-  5. Đóng gói vào ReferenceResult (kế thừa list) mang status ("success", "empty", "partial", "not_indexed", "bib_fallback", "api_error"),
-     bảo đảm không bao giờ làm rơi metadata bài báo ở main pipeline.
-
-Tài liệu API: https://api.semanticscholar.org/api-docs/graph
+Phụ trách: Trần Nguyên Tân (24120438).
+API: https://api.semanticscholar.org/api-docs/graph
 """
 
 import logging
@@ -20,60 +12,60 @@ import re
 import time
 import unicodedata
 from collections.abc import Iterator
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote
 
 import requests
+from dotenv import dotenv_values
 
-from src.crawler.exceptions import (
+from .exceptions import (
     CrawlerError,
     NetworkTimeoutError,
     RateLimitError,
 )
-from src.crawler.rate_limiter import rate_limiter
+from .rate_limiter import rate_limiter
+from .request_policy import CooldownDeferred
 
 logger = logging.getLogger(__name__)
 
-# Danh sách khóa của MỘT bản ghi trích dẫn mà hàm trả về:
-# - 6 khóa đầu là cột bảng `references` theo đề M1:
-#   https://hcmus-cs-ta.github.io/lab-book/intro-ds/statement/crawling/
-# - 5 khóa sau là khóa nội bộ phục vụ phân tích / audit / fallback.
+# Sáu khóa đầu dùng cho course export; các khóa còn lại dùng nội bộ.
 REFERENCE_KEYS: tuple[str, ...] = (
-    # --- 6 cột của đề ---
-    "arxiv_id",             # bài ĐANG trích dẫn (base ID, không có đuôi vN)
-    "ref_arxiv_id",         # bài ĐƯỢC trích, lấy từ externalIds.ArXiv; None nếu tài liệu không có trên arXiv
+    "arxiv_id",             # Base ID của bài trích dẫn.
+    "ref_arxiv_id",         # externalIds.ArXiv của tài liệu được trích.
     "ref_title",
-    "ref_authors",          # list[str] tên tác giả, giữ thứ tự
-    "ref_submission_date",  # lấy từ publicationDate của S2 ("YYYY-MM-DD"); không tự dựng từ năm
-    "ref_s2_id",            # paperId của Semantic Scholar; None với mục S2 chưa nhận diện được
-    # --- 5 khóa nội bộ ---
-    "ref_doi",              # DOI đã bỏ tiền tố "https://doi.org/" hoặc "doi:"
-    "ref_year",             # int
-    "ref_venue",            # chuỗi rỗng từ S2 coi là thiếu, đổi thành None
-    "raw_citation",         # chuỗi gốc trong .bib/.bbl (nhánh dự phòng); None với bản ghi từ API
-    "source",               # "semantic_scholar" hoặc "bib_fallback"
+    "ref_authors",
+    "ref_submission_date",  # S2 publicationDate; không suy ngày từ năm.
+    "ref_s2_id",            # Semantic Scholar paperId.
+
+    "ref_doi",              # DOI đã bỏ tiền tố URL hoặc doi:.
+    "ref_year",
+    "ref_venue",
+    "raw_citation",         # Nội dung BibTeX gốc khi dùng fallback.
+    "source",
 )
 
-# Hai giá trị hợp lệ của khóa "source".
+
 _SOURCE_API = "semantic_scholar"
 _SOURCE_BIB = "bib_fallback"
 
 
-# =================================================================================================
-# Ngoại lệ đặc tả cho scraper trích dẫn
-# =================================================================================================
-
-
+# Lỗi truy vấn references.
 class ReferenceScrapeError(CrawlerError):
-    """Lỗi khi lấy trích dẫn của một bài: mạng hỏng, máy chủ lỗi, hết lượt thử lại, dữ liệu trả về hỏng."""
+    """Lỗi mạng, API hoặc dữ liệu trích dẫn."""
 
 
 class PaperNotFoundError(ReferenceScrapeError):
-    """Semantic Scholar trả 404 và không có file .bib/.bbl nào đọc được để dự phòng."""
+    """S2 trả 404; caller có thể thử nguồn BibTeX local."""
 
 
 class ReferencesUnavailableError(ReferenceScrapeError):
-    """S2 có bài và báo có trích dẫn (referenceCount > 0) nhưng không đưa mục nào."""
+    """S2 báo có references nhưng trả danh sách rỗng."""
+
+
+class BatchRequestSizeError(ReferenceScrapeError):
+    """Batch response exceeds the API size limit."""
 
 
 class SemanticScholarRateLimitError(RateLimitError, ReferenceScrapeError):
@@ -84,23 +76,13 @@ class SemanticScholarConnectionError(NetworkTimeoutError, ReferenceScrapeError):
     """Hết lượt thử lại khi gặp lỗi mạng/timeout tới S2."""
 
 
-# =================================================================================================
-# Cấu trúc kết quả trích dẫn: ReferenceResult
-# =================================================================================================
-
-
+# Kết quả và trạng thái truy vấn.
 class ReferenceResult(list):
-    """Danh sách kết quả trích dẫn kế thừa list để tương thích 100% với list[dict],
-    đồng thời mang metadata trạng thái: status, source, expected_count, received_count, request_stats.
+    """Danh sách references kèm trạng thái và số đo request.
 
-    Các trạng thái:
-      - "success": Lấy thành công đầy đủ trích dẫn từ S2.
-      - "empty": S2 xác nhận bài không có trích dẫn (referenceCount = 0).
-      - "partial": S2 trả về một phần trích dẫn (ít hơn referenceCount công bố).
-      - "bib_fallback": Không có trên S2 (404), đã trích xuất từ .bib được .tex trích dẫn.
-      - "not_indexed": S2 trả 404 và không có .bib dự phòng.
-      - "unavailable": S2 báo có trích dẫn nhưng trả về rỗng.
-      - "api_error": Lỗi mạng/API hoặc 429 quá số lần thử lại.
+    success/empty/partial: kết quả S2 đầy đủ, rỗng hoặc thiếu.
+    bib_fallback/not_indexed: S2 trả 404, có hoặc thiếu BibTeX dự phòng.
+    unavailable/api_error: S2 trả rỗng bất thường hoặc truy vấn thất bại.
     """
 
     def __init__(
@@ -112,6 +94,9 @@ class ReferenceResult(list):
         received_count: int | None = None,
         request_stats: dict | None = None,
         error_message: str | None = None,
+        request_metrics: dict | None = None,
+        request_group: str | None = None,
+        request_group_size: int = 1,
     ) -> None:
         super().__init__(records or [])
         self.status = status
@@ -120,6 +105,9 @@ class ReferenceResult(list):
         self.received_count = len(self) if received_count is None else received_count
         self.request_stats = dict(request_stats or {})
         self.error_message = error_message
+        self.request_metrics = request_metrics
+        self.request_group = request_group
+        self.request_group_size = request_group_size
 
     def __repr__(self) -> str:
         return (
@@ -128,35 +116,53 @@ class ReferenceResult(list):
         )
 
 
-# --- Cấu hình gọi Semantic Scholar -----------------------------------------------------------------
+# Cấu hình gọi Semantic Scholar
 _API_BASE = "https://api.semanticscholar.org/graph/v1/paper"
-# Trường của một trích dẫn. Phải là trường phẳng theo đặc tả S2 Graph API.
+# Các trường phẳng của S2 Graph API.
 _REF_FIELDS = ("paperId", "title", "authors", "year", "publicationDate", "venue", "externalIds")
 _PAGE_FIELDS = ",".join(_REF_FIELDS)
-_PAPER_FIELDS = "referenceCount," + ",".join(f"references.{name}" for name in _REF_FIELDS)
+_PAPER_FIELDS = "externalIds,referenceCount," + ",".join(f"references.{name}" for name in _REF_FIELDS)
 _PAGE_LIMIT = 1000
 _TIMEOUT = (10, 60)
 
-# Thử lại khi lỗi tạm thời (429, 5xx, timeout, ngắt kết nối)
+# Lỗi có thể retry.
 _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _TRANSIENT_ERRORS = (
     requests.exceptions.ConnectionError,
     requests.exceptions.Timeout,
     requests.exceptions.ChunkedEncodingError,
 )
-_MAX_ATTEMPTS = 6
+_MAX_ATTEMPTS = 3
 _BACKOFF_BASE_SEC = 5.0
 _MAX_WAIT_SEC = 120.0
 _JITTER_FRACTION = 0.25
 
 _session: requests.Session | None = None
+_cooldown_sec = 60.0
+_cooldown_until = 0.0
+
+
+def configure_request_policy(max_attempts: int = 3, cooldown_sec: float = 60.0) -> None:
+    """Set bounded retries and reset pacing for a new run."""
+    global _MAX_ATTEMPTS, _cooldown_sec, _cooldown_until
+    if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
+        raise ValueError("S2 max_attempts must be a positive integer")
+    if not math.isfinite(cooldown_sec) or cooldown_sec < 0:
+        raise ValueError("S2 cooldown_sec must be finite and nonnegative")
+    _MAX_ATTEMPTS, _cooldown_sec = max_attempts, cooldown_sec
+    _cooldown_until = 0.0
+    if rate_limiter.policy.directory is None:
+        for key in list(rate_limiter.policy.memory):
+            if key.startswith("semantic_scholar"):
+                del rate_limiter.policy.memory[key]
 
 
 def _new_request_stats() -> dict:
-    """Bộ đếm thống kê cho báo cáo Chương 03 và kiểm toán dữ liệu."""
+    """Tạo bộ đếm request."""
     return {
         "requests": 0,
         "by_status": {},
+        "by_method": {},
         "retries": 0,
         "backoff_sec": 0.0,
         "rate_limit_wait_sec": 0.0,
@@ -164,35 +170,34 @@ def _new_request_stats() -> dict:
         "partials": 0,
         "bib_fallbacks": 0,
         "empty_refs": 0,
+        "deferred_queries": 0,
     }
 
 
 _request_stats: dict = _new_request_stats()
 
 
-def _count_request(key: str) -> None:
+def _count_request(key: str, method: str = "GET") -> None:
     _request_stats["requests"] += 1
     _request_stats["by_status"][key] = _request_stats["by_status"].get(key, 0) + 1
+    _request_stats["by_method"][method] = _request_stats["by_method"].get(method, 0) + 1
 
 
 def reset_request_stats() -> None:
-    """Đặt bộ đếm về 0 khi bắt đầu chạy một phân vùng mới hoặc trong test."""
+    """Đặt lại bộ đếm request."""
     global _request_stats
     _request_stats = _new_request_stats()
 
 
 def get_request_stats() -> dict:
-    """Bản sao snapshot của bộ đếm hiện tại."""
+    """Lấy bản sao bộ đếm request."""
     stats = dict(_request_stats)
     stats["by_status"] = dict(_request_stats["by_status"])
+    stats["by_method"] = dict(_request_stats["by_method"])
     return stats
 
 
-# =================================================================================================
-# Hàm giao diện chính
-# =================================================================================================
-
-
+# API công khai.
 def scrape_references_for_paper(
     arxiv_id: str,
     unzipped_paper_dir: str | None = None,
@@ -200,20 +205,10 @@ def scrape_references_for_paper(
     raise_on_error: bool = False,
     raise_on_not_found: bool | None = None,
 ) -> ReferenceResult:
-    """Lấy references qua Semantic Scholar, dự phòng bằng .bib trong thư mục nguồn đã giải nén.
+    """Lấy references từ S2; thử BibTeX local khi S2 trả 404.
 
-    Tham số:
-      arxiv_id: ID bài nguồn (nhận cả dạng '2407.12839', 'arXiv:2407.12839v2', URL...).
-      unzipped_paper_dir: thư mục nguồn đã giải nén của bài (chỉ dùng đọc .bib khi S2 trả 404).
-      rate_limit_sec: khoảng cách tối thiểu (giây) giữa 2 request S2 (mặc định 3.1s cho hạn mức public).
-      raise_on_error: nếu True, ném ngoại lệ khi gặp lỗi mạng/404/không có trích dẫn.
-                      nếu False (mặc định cho pipeline), trả ReferenceResult với status tương ứng để
-                      pipeline KHÔNG bao giờ làm rơi bài báo khỏi publications.parquet.
-      raise_on_not_found: bí danh tương thích cho raise_on_error khi xử lý 404.
-
-    Trả về:
-      ReferenceResult (kế thừa list[dict]): danh sách các cạnh trích dẫn theo REFERENCE_KEYS,
-      kèm các thuộc tính: status, source, expected_count, received_count, request_stats.
+    raise_on_error=True ném lỗi; mặc định trả ReferenceResult kèm status.
+    raise_on_not_found là bí danh tương thích của raise_on_error.
     """
     if raise_on_not_found is not None:
         raise_on_error = raise_on_not_found
@@ -251,7 +246,7 @@ def scrape_references_for_paper(
             [],
             status="not_indexed",
             source="none",
-            expected_count=0,
+            expected_count=None,
             received_count=0,
             request_stats=get_request_stats(),
             error_message=str(not_found),
@@ -283,9 +278,8 @@ def scrape_references_for_paper(
         )
 
 
-# =================================================================================================
-# 1. Chuẩn hóa ID arXiv và DOI
-# =================================================================================================
+# Chuẩn hóa ID arXiv và DOI
+
 
 _ARXIV_ID_PATTERN = r"[0-9]{4}\.[0-9]{4,5}|[a-z]+(?:-[a-z]+)*(?:\.[A-Za-z]{2})?/[0-9]{7}"
 
@@ -305,7 +299,7 @@ _DOI_IN_TEXT_RE = re.compile(r"(?<![A-Za-z0-9])10\.[0-9]{4,9}/[^\s{}<>\"',;]+")
 
 
 def _normalize_arxiv_id(value: object) -> str | None:
-    """Đưa ID arXiv về dạng chuẩn (không URL, không tiền tố, không đuôi vN); không phải ID thì None."""
+    """Bỏ URL, tiền tố và version; trả None nếu ID không hợp lệ."""
     if not isinstance(value, str):
         return None
     match = _ARXIV_ID_RE.fullmatch(value.strip())
@@ -313,7 +307,7 @@ def _normalize_arxiv_id(value: object) -> str | None:
 
 
 def _normalize_doi(value: object) -> str | None:
-    """Bỏ tiền tố URL hoặc 'doi:' khỏi DOI; không phải DOI thì None."""
+    """Chuẩn hóa DOI; trả None nếu không hợp lệ."""
     if not isinstance(value, str):
         return None
     match = _DOI_RE.fullmatch(value.strip())
@@ -348,9 +342,7 @@ def _validate_source_id(arxiv_id: object) -> str:
     return normalized
 
 
-# =================================================================================================
-# 2. Gọi HTTP: Session, rate limit, exponential backoff + jitter
-# =================================================================================================
+# HTTP session, rate limit và retry.
 
 
 def _get_session() -> requests.Session:
@@ -361,12 +353,16 @@ def _get_session() -> requests.Session:
 
 
 def _api_headers() -> dict[str, str]:
-    key = os.environ.get("S2_API_KEY", "").strip()
+    key = os.environ.get("S2_API_KEY")
+    if key is None:
+        env_path = Path(__file__).resolve().parents[2] / ".env"
+        key = dotenv_values(env_path, interpolate=False, encoding="utf-8-sig").get("S2_API_KEY")
+    key = (key or "").strip()
     return {"x-api-key": key} if key else {}
 
 
 def _wait_for_rate_limit(rate_limit_sec: float) -> None:
-    """Giới hạn tốc độ sử dụng DomainRateLimiter cho domain 'semantic_scholar'."""
+    """Chờ theo rate limit của Semantic Scholar."""
     t0 = time.monotonic()
     rate_limiter.wait("semantic_scholar", interval=rate_limit_sec)
     waited = time.monotonic() - t0
@@ -378,32 +374,56 @@ def _parse_retry_after(value: str | None) -> float | None:
     try:
         seconds = float(value)
     except (TypeError, ValueError):
-        return None
+        try:
+            date = parsedate_to_datetime(value)
+            if date.tzinfo is None:
+                date = date.replace(tzinfo=timezone.utc)
+            return max(0.0, (date - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError, OverflowError):
+            return None
     return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
 def _backoff_seconds(attempt: int, retry_after: float | None) -> float:
     if retry_after is not None:
-        return min(retry_after, _MAX_WAIT_SEC)
+        return retry_after
     delay = _BACKOFF_BASE_SEC * (2 ** (attempt - 1))
     delay += random.uniform(0, delay * _JITTER_FRACTION)
     return min(delay, _MAX_WAIT_SEC)
 
 
-def _get_json(url: str, params: dict, source_id: str, rate_limit_sec: float) -> object:
+def _get_json(url: str, params: dict, source_id: str, rate_limit_sec: float,
+              method: str = "GET", json_body: dict | None = None) -> object:
+    global _cooldown_until
+    remaining = _cooldown_until - time.monotonic()
+    if _MAX_ATTEMPTS == 1:
+        remaining = max(remaining, rate_limiter.policy.snapshot("semantic_scholar")["remaining_sec"])
+    if remaining > 0:
+        _request_stats["deferred_queries"] += 1
+        raise SemanticScholarRateLimitError(
+            f"S2 đang nghỉ sau HTTP 429; bài {source_id} cần thử lại, còn {remaining:.0f} giây",
+            status_code=429, retry_after=remaining, failed_ids=[source_id],
+        )
     session = _get_session()
     headers = _api_headers()
     for attempt in range(1, _MAX_ATTEMPTS + 1):
-        _wait_for_rate_limit(rate_limit_sec)
+        try:
+            _wait_for_rate_limit(rate_limit_sec)
+        except CooldownDeferred as error:
+            _request_stats["deferred_queries"] += 1
+            raise SemanticScholarRateLimitError(str(error), retry_after=error.retry_after, failed_ids=[source_id]) from error
         retry_after = None
         cause = None
         try:
-            response = session.get(url, params=params, headers=headers, timeout=_TIMEOUT)
+            if method == "POST":
+                response = session.post(url, params=params, json=json_body, headers=headers, timeout=_TIMEOUT)
+            else:
+                response = session.get(url, params=params, headers=headers, timeout=_TIMEOUT)
         except _TRANSIENT_ERRORS as exc:
-            _count_request("network")
+            _count_request("network", method)
             problem, cause = f"lỗi mạng {type(exc).__name__}", exc
         except requests.exceptions.RequestException as exc:
-            _count_request("network")
+            _count_request("network", method)
             raise SemanticScholarConnectionError(
                 f"Request tới S2 cho bài {source_id} thất bại: {type(exc).__name__}",
                 timeout=_TIMEOUT[1],
@@ -412,16 +432,33 @@ def _get_json(url: str, params: dict, source_id: str, rate_limit_sec: float) -> 
             ) from exc
         else:
             status = response.status_code
-            _count_request(str(status))
+            _count_request(str(status), method)
             if status == 200:
+                rate_limiter.policy.succeeded("semantic_scholar")
                 return _decode_json(response, source_id)
             if status == 404:
                 _request_stats["s2_404"] = _request_stats.get("s2_404", 0) + 1
                 raise PaperNotFoundError(f"S2 không có bài {source_id} (HTTP 404)")
+            if method == "POST" and status in (400, 413, 422):
+                try:
+                    message = str(response.json()).lower()
+                except ValueError:
+                    message = ""
+                if status == 413 or any(word in message for word in ("too large", "10 mb", "10mb", "size limit", "response size")):
+                    raise BatchRequestSizeError(f"S2 batch vượt giới hạn kích thước (HTTP {status})")
             if status not in _RETRY_STATUSES:
                 raise ReferenceScrapeError(f"S2 trả HTTP {status} cho bài {source_id}")
             problem = f"HTTP {status}"
             retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+            if status == 429:
+                retry_after = rate_limiter.policy.limited("semantic_scholar", response,
+                                                         floor=_cooldown_sec, secrets=tuple(headers.values()))
+                if retry_after > rate_limiter.policy.max_wait_sec:
+                    _cooldown_until = time.monotonic() + retry_after
+                    raise SemanticScholarRateLimitError(
+                        f"S2 yêu cầu nghỉ {retry_after:.0f} giây; bài {source_id} cần thử lại",
+                        status_code=429, retry_after=retry_after, failed_ids=[source_id],
+                    )
 
         if attempt == _MAX_ATTEMPTS:
             if cause is not None:
@@ -432,6 +469,7 @@ def _get_json(url: str, params: dict, source_id: str, rate_limit_sec: float) -> 
                     failed_ids=[source_id],
                 ) from cause
             if "429" in problem:
+                _cooldown_until = time.monotonic() + max(_cooldown_sec, retry_after or 0.0)
                 raise SemanticScholarRateLimitError(
                     f"S2 rate limit sau {_MAX_ATTEMPTS} lần thử cho bài {source_id}",
                     status_code=429,
@@ -442,7 +480,7 @@ def _get_json(url: str, params: dict, source_id: str, rate_limit_sec: float) -> 
                 f"S2 vẫn lỗi sau {_MAX_ATTEMPTS} lần thử cho bài {source_id} (lần cuối: {problem})"
             ) from cause
 
-        wait = _backoff_seconds(attempt, retry_after)
+        wait = retry_after if "429" in problem and retry_after is not None else _backoff_seconds(attempt, retry_after)
         _request_stats["retries"] += 1
         _request_stats["backoff_sec"] += wait
         logger.warning(
@@ -460,25 +498,25 @@ def _decode_json(response: requests.Response, source_id: str) -> object:
         raise ReferenceScrapeError(f"S2 trả nội dung không phải JSON cho bài {source_id}") from exc
 
 
-# =================================================================================================
-# 3. Lấy trích dẫn từ Semantic Scholar (hỗ trợ phân trang và phát hiện cắt bớt)
-# =================================================================================================
+# Truy vấn và phân trang S2.
 
 
 def _fetch_s2_references(source_id: str, rate_limit_sec: float) -> tuple[list[dict], str, int | None]:
-    """Toàn bộ trích dẫn thô từ Semantic Scholar.
-
-    Trả về tuple: (danh_sách_refs, status, expected_count).
-    Status có thể là: 'success', 'empty', 'partial'.
-    """
+    """Trả về (references, status, expected_count) từ S2."""
     paper_url = f"{_API_BASE}/arXiv:{quote(source_id, safe='')}"
     body = _get_json(paper_url, {"fields": _PAPER_FIELDS}, source_id, rate_limit_sec)
+    external = body.get("externalIds") if isinstance(body, dict) else None
+    returned_id = external.get("ArXiv") if isinstance(external, dict) else None
+    if returned_id is not None and _normalize_arxiv_id(returned_id) != source_id:
+        raise ReferenceScrapeError(f"S2 trả ID bài nguồn khác yêu cầu {source_id}")
     refs = body.get("references") if isinstance(body, dict) else None
     if not isinstance(refs, list):
         raise ReferenceScrapeError(f"S2 trả dữ liệu sai hình dạng cho bài {source_id}: thiếu danh sách references")
 
     total = body.get("referenceCount")
     known_total = isinstance(total, int) and not isinstance(total, bool)
+    if known_total and (total < 0 or (total == 0 and refs)):
+        raise ReferenceScrapeError(f"S2 trả referenceCount mâu thuẫn với references của bài {source_id}")
 
     if known_total and total == 0:
         _request_stats["empty_refs"] = _request_stats.get("empty_refs", 0) + 1
@@ -487,7 +525,7 @@ def _fetch_s2_references(source_id: str, rate_limit_sec: float) -> tuple[list[di
     if known_total and len(refs) >= total:
         return refs, "success", total
 
-    # Nếu S2 cắt bớt trong request đầu, gọi tiếp endpoint /references phân trang
+    # Lấy đủ trang nếu kết quả đầu bị cắt bớt.
     paged = _fetch_s2_pages(f"{paper_url}/references", source_id, rate_limit_sec)
     if len(paged) < len(refs):
         paged = refs
@@ -505,7 +543,7 @@ def _fetch_s2_references(source_id: str, rate_limit_sec: float) -> tuple[list[di
 
 
 def _fetch_s2_pages(url: str, source_id: str, rate_limit_sec: float) -> list[dict]:
-    """Duyệt hết các trang phân trang của S2 qua cursor next."""
+    """Đọc references theo cursor next."""
     refs: list[dict] = []
     offset = 0
     while True:
@@ -536,9 +574,7 @@ def _fetch_s2_pages(url: str, source_id: str, rate_limit_sec: float) -> list[dic
         offset = next_offset
 
 
-# =================================================================================================
-# 4. Đổi dữ liệu thô thành bản ghi chuẩn
-# =================================================================================================
+# Đổi dữ liệu thô thành bản ghi chuẩn
 
 
 def _make_record(
@@ -555,7 +591,7 @@ def _make_record(
     ref_venue: str | None = None,
     raw_citation: str | None = None,
 ) -> dict:
-    """Dựng MỘT bản ghi đúng 11 khóa của REFERENCE_KEYS."""
+    """Chuẩn hóa một reference theo REFERENCE_KEYS."""
     return {
         "arxiv_id": arxiv_id,
         "ref_arxiv_id": ref_arxiv_id,
@@ -602,9 +638,7 @@ def _record_from_s2(source_id: str, ref: object) -> dict:
     )
 
 
-# =================================================================================================
-# 5. Khử trùng cạnh trích dẫn
-# =================================================================================================
+# Khử trùng cạnh trích dẫn
 
 
 def _normalize_title(title: str | None) -> str:
@@ -636,9 +670,8 @@ def _dedupe(records: list[dict]) -> list[dict]:
     return unique
 
 
-# =================================================================================================
-# 6. Dự phòng: Đọc .bib trong thư mục nguồn khi S2 trả 404
-# =================================================================================================
+# BibTeX fallback khi S2 trả 404.
+
 
 _BRACE_RE = re.compile(r"[{}]")
 _QUOTE_SCAN_RE = re.compile(r'[{}"]')
@@ -659,7 +692,7 @@ _TEX_CITE_RE = re.compile(r"\\([A-Za-z]+)\*?\s*(?:\[[^\[\]{}]{0,500}\]\s*){0,2}\
 
 
 def _cited_keys(tex_texts: list[str]) -> set[str]:
-    """Tìm các khóa BibTeX mà các file .tex trích dẫn; '*' nghĩa là \\nocite{*}."""
+    """Lấy citation keys trong TeX; '*' tương ứng với \\nocite{*}."""
     keys: set[str] = set()
     for text in tex_texts:
         for match in _TEX_CITE_RE.finditer(_TEX_COMMENT_RE.sub("", text)):
@@ -669,7 +702,7 @@ def _cited_keys(tex_texts: list[str]) -> set[str]:
 
 
 def _read_local_references(source_id: str, unzipped_paper_dir: str | None) -> list[dict]:
-    """Đọc bản ghi trích dẫn từ .bib trong thư mục đã giải nén (chỉ lấy mục mà .tex trích dẫn)."""
+    """Đọc các mục BibTeX được TeX trích dẫn."""
     if unzipped_paper_dir is None:
         return []
     root = Path(unzipped_paper_dir)
@@ -875,9 +908,9 @@ def _bbl_records(source_id: str, text: str) -> list[dict]:
 
 
 if __name__ == "__main__":
-    print("=== TEST REFERENCE SCRAPER ===")
+    print("Reference scraper tests")
 
-    # 1. Test ReferenceResult dataclass / list interface
+    # Kiểm tra giao diện list của ReferenceResult.
     print("\n1. Test ReferenceResult class:")
     sample_records = [
         _make_record("2412.18848", _SOURCE_API, ref_arxiv_id="1706.03762", ref_title="Attention Is All You Need"),
@@ -888,10 +921,10 @@ if __name__ == "__main__":
     assert len(res) == 2, f"Expected length 2, got {len(res)}"
     assert res.status == "success"
     assert res[0]["ref_title"] == "Attention Is All You Need"
-    print(f"  [+] ReferenceResult repr: {res}")
-    print(f"  [+] List iteration and indexing working properly.")
+    print(f"  ReferenceResult repr: {res}")
+    print(f"  List interface verified.")
 
-    # 2. Test BibTeX extraction and cite filtering
+    # Kiểm tra lọc citation keys trong BibTeX.
     print("\n2. Test BibTeX cite matching:")
     bib_sample = """
     @article{vaswani2017,
@@ -918,20 +951,20 @@ if __name__ == "__main__":
     assert len(filtered) == 1
     assert filtered[0]["ref_arxiv_id"] == "1706.03762"
     assert filtered[0]["ref_year"] == 2017
-    print(f"  [+] Correctly extracted and filtered 1 cited entry out of {len(entries)}.")
+    print(f"  Correctly extracted and filtered 1 cited entry out of {len(entries)}.")
 
-    # 3. Test Live Query or Safe Error Handling
+    # Kiểm tra truy vấn S2.
     print("\n3. Test scrape_references_for_paper on real arXiv ID (2412.18848):")
     try:
         t0 = time.time()
         result = scrape_references_for_paper("2412.18848", rate_limit_sec=1.0)
         dt = time.time() - t0
-        print(f"  [+] Scraped in {dt:.2f}s: status={result.status}, source={result.source}, count={len(result)}")
+        print(f"  Scraped in {dt:.2f}s: status={result.status}, source={result.source}, count={len(result)}")
         if result:
-            print(f"  [+] Sample ref 1: title='{result[0].get('ref_title')}', arxiv='{result[0].get('ref_arxiv_id')}'")
+            print(f"  Sample ref 1: title='{result[0].get('ref_title')}', arxiv='{result[0].get('ref_arxiv_id')}'")
         stats = get_request_stats()
-        print(f"  [+] Request stats: {stats}")
+        print(f"  Request stats: {stats}")
     except Exception as exc:
         print(f"  [-] Network or S2 error in live test: {exc}")
 
-    print("\n[+] Reference scraper testing completed successfully.")
+    print("\nReference scraper tests completed.")

@@ -14,6 +14,7 @@ CRAWL_STATUS_SCHEMA = pa.schema([
     pa.field("backoff_sec", pa.float64()), pa.field("rate_limit_wait_sec", pa.float64()),
     pa.field("http_status_counts", pa.string()), pa.field("error_message", pa.string()),
     pa.field("updated_at", pa.string()), pa.field("reference_update", pa.string()),
+    pa.field("request_group", pa.string()), pa.field("request_group_size", pa.int64()),
 ])
 
 
@@ -33,4 +34,16 @@ def request_delta(before: dict, after: dict) -> dict:
               for name in ("requests", "retries", "backoff_sec", "rate_limit_wait_sec")}
     result["http_status_counts"] = json.dumps({key: max(0, value - before.get("by_status", {}).get(key, 0))
                                                for key, value in after.get("by_status", {}).items()}, sort_keys=True)
+    return result
+
+
+def combine_request_metrics(*values: dict) -> dict:
+    result = request_delta({}, {})
+    statuses = {}
+    for value in values:
+        for key in ("requests", "retries", "backoff_sec", "rate_limit_wait_sec"):
+            result[key] += value.get(key, 0)
+        for key, count in json.loads(value.get("http_status_counts") or "{}").items():
+            statuses[key] = statuses.get(key, 0) + count
+    result["http_status_counts"] = json.dumps(statuses, sort_keys=True)
     return result
