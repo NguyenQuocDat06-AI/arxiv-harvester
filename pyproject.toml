@@ -4,25 +4,35 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arxiv-harvester"
-version = "0.1.0"
-description = "arXiv Data Crawling Pipeline - Intro to Data Science Milestone 1"
+version = "0.2.0"
+description = "arXiv crawling and hierarchical parsing - Milestones 1 and 2"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "arxiv",
     "sickle",
     "requests",
+    "python-dotenv>=1.0",
     "pandas",
     "pyarrow",
     "psutil",
     "tqdm",
     "matplotlib",
     "seaborn",
-    "jupyter-book",
 ]
+
+[project.optional-dependencies]
+dev = ["nbformat>=5"]
+report = ["jupyter-book>=1,<2", "nbformat>=5", "nbclient>=0.8"]
 
 [project.scripts]
 arxiv-harvester = "crawler.main:main"
+arxiv-parser = "parser.main:main"
+arxiv-validate-project = "parser.validation:main"
+arxiv-audit-sources = "crawler.validate_sources:main"
+arxiv-retry-sources = "crawler.retry_sources:main"
+arxiv-reconcile-dates = "crawler.version_history:main"
+arxiv-enrich-references = "crawler.enrich_references:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

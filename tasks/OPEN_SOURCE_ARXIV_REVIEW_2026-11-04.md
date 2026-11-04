@@ -1,0 +1,37 @@
+# Đối chiếu các repository arXiv — 04/11/2026
+
+Kiểm tra README, mã nguồn và báo cáo công khai của ba repo làm bài toán tương tự; không chạy code của họ và không gửi request thử tới arXiv/Semantic Scholar. Các nhận xét gắn với commit được nêu, không bảo đảm đúng với phiên bản sau này. Bài làm cũ có thể theo đề và môi trường khác; chuẩn đối chiếu là [đề M1](https://hcmus-cs-ta.github.io/lab-book/intro-ds/statement/crawling/) và [đề M2](https://hcmus-cs-ta.github.io/lab-book/intro-ds/statement/parsing/) hiện tại.
+
+## 1. LeMinhNhat2901/arxiv_scraping
+
+- [Repo công khai](https://github.com/LeMinhNhat2901/arxiv_scraping/tree/429559505bd0d65e036ef3eea54765ead1f2fe45), commit `429559505bd0d65e036ef3eea54765ead1f2fe45`. GitHub không nhận diện được license và cây file không có `LICENSE`; có thể đọc tham khảo, chưa có bằng chứng được phép sao chép code. Xem [hướng dẫn license của GitHub](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository).
+- [Mã crawler](https://github.com/LeMinhNhat2901/arxiv_scraping/blob/429559505bd0d65e036ef3eea54765ead1f2fe45/src/scraping_arxiv.py) dùng `requests.Session`, cache và gộp thông tin venue/references trong một lần gọi S2. Có log 429 và retry tải source; đây là ý tưởng có thể đối chiếu với code nhóm.
+- README mô tả cấu hình nhiều luồng, nhưng [code tại commit được đọc](https://github.com/LeMinhNhat2901/arxiv_scraping/blob/429559505bd0d65e036ef3eea54765ead1f2fe45/src/scraping_arxiv.py#L28-L49) có các giá trị mặc định khác. Code dùng `arxiv.org/e-print`, dò HEAD và giới hạn tối đa 8 version. Không lấy các giá trị worker/delay từ README làm bằng chứng cấu hình của code hiện tại hoặc mặc định phù hợp giới hạn dịch vụ.
+- Khi không lấy đủ ngày revision, code [điền ngày submission vào chỗ thiếu](https://github.com/LeMinhNhat2901/arxiv_scraping/blob/429559505bd0d65e036ef3eea54765ead1f2fe45/src/scraping_arxiv.py#L444-L452). Cách này không xác minh được ngày revision thực và không nên áp dụng.
+- [Báo cáo benchmark của repo](https://github.com/LeMinhNhat2901/arxiv_scraping/blob/429559505bd0d65e036ef3eea54765ead1f2fe45/src/performance_report_23120067.json) ghi 1.055/1.055 paper thành công và 1.343/1.618 version được tải. Các trạng thái version còn lại cần kiểm tra trước khi kết luận; tỷ lệ paper không chứng minh đủ mọi version. Report chỉ ghi môi trường *dự định* là Colab CPU-only, chưa đủ bằng chứng lượt đó thực sự chạy trên Colab. Tổng thời gian discovery được ghi 16.580 giây trong khi wall time tổng ghi 2.488 giây; có thể đây là tổng thời gian các tác vụ song song, không nên coi là wall time.
+
+## 2. minhtri411/arxiv-data-science-pipeline
+
+- [Repo MIT](https://github.com/minhtri411/arxiv-data-science-pipeline/tree/0de855f6bb0fba529b5e7ca6f6699eea490a1506), commit `0de855f6bb0fba529b5e7ca6f6699eea490a1506`; chia crawler, parser, matching và dữ liệu thành các tầng.
+- [Downloader](https://github.com/minhtri411/arxiv-data-science-pipeline/blob/0de855f6bb0fba529b5e7ca6f6699eea490a1506/src/arxiv_pipeline/scraper/downloader.py#L17-L38) dùng `arxiv.org/e-print`; khi 429 thì chờ 60 giây rồi trả trạng thái thất bại cho lần gọi đó. [Vòng dò](https://github.com/minhtri411/arxiv-data-science-pipeline/blob/0de855f6bb0fba529b5e7ca6f6699eea490a1506/src/arxiv_pipeline/scraper/downloader.py#L98-L107) chỉ thử v1–v20. Không mặc định giải quyết được 429 hoặc tìm đủ version; đề hiện tại hướng dẫn `export.arxiv.org`.
+- [Parser](https://github.com/minhtri411/arxiv-data-science-pipeline/blob/0de855f6bb0fba529b5e7ca6f6699eea490a1506/src/arxiv_pipeline/parser/core.py#L69-L84) tìm tệp có `documentclass`/`begin{document}`, ưu tiên tên `main.tex`, rồi [duyệt `input`/`include`](https://github.com/minhtri411/arxiv-data-science-pipeline/blob/0de855f6bb0fba529b5e7ca6f6699eea490a1506/src/arxiv_pipeline/parser/core.py#L170-L220). Đây là cách tham khảo xử lý multi-file; chọn root theo tên vẫn cần kiểm tra khi có nhiều ứng viên. Chưa kiểm thử repo này với corpus nhóm.
+
+## 3. ThanhChuong12/scientific-paper-etl-resolver
+
+- [Repo MIT](https://github.com/ThanhChuong12/scientific-paper-etl-resolver/tree/446beef36a4819dfe53ed168798040d043cffb9a), commit `446beef36a4819dfe53ed168798040d043cffb9a`; có crawler, parser và báo cáo 5.000 paper.
+- [Report gốc](https://github.com/ThanhChuong12/scientific-paper-etl-resolver/blob/446beef36a4819dfe53ed168798040d043cffb9a/data/raw/performance_report.json) ghi 5.000 paper, 4.566 `success`, 423 `no_tex`, 11 `failed`, tổng 11.646,37 giây. Report không chứng minh benchmark này chạy Colab CPU-only; không coi các nhãn của họ là xác nhận độc lập đủ source/version.
+- Trong 5.000 dòng báo cáo có **1.423 ID** trùng đoạn `2412.18848`–`2412.20270` của Đạt. Đã duyệt cây GitHub không bị cắt (`truncated=false`): không thấy file dưới `data/raw/` cho các ID trùng. Report không thay thế source hay benchmark của nhóm.
+- [Mã crawler](https://github.com/ThanhChuong12/scientific-paper-etl-resolver/blob/446beef36a4819dfe53ed168798040d043cffb9a/src/scraper/workflow.py#L55-L71) thử source không kèm version khi tải version cụ thể thất bại và ghi trong thư mục của version đó; có nguy cơ gán sai revision. [Mã discovery](https://github.com/ThanhChuong12/scientific-paper-etl-resolver/blob/446beef36a4819dfe53ed168798040d043cffb9a/src/scraper/data_fetchers.py#L15-L32) mặc định `v1` khi không lấy được lịch sử. Không dùng các fallback này làm bằng chứng version.
+- [HTTP client](https://github.com/ThanhChuong12/scientific-paper-etl-resolver/blob/446beef36a4819dfe53ed168798040d043cffb9a/src/scraper/http_client.py#L8-L40) dùng session, lock theo tiến trình và retry. Lock trong một máy không chứng minh điều phối được nhiều runtime. Repo có `tar.extractall` không chỉ rõ filter an toàn trong [file processor](https://github.com/ThanhChuong12/scientific-paper-etl-resolver/blob/446beef36a4819dfe53ed168798040d043cffb9a/src/scraper/file_processor.py#L75-L76); kiểm tra an toàn archive trước khi tham khảo cách giải nén.
+
+## 4. Thư viện arxiv.py
+
+[arxiv.py](https://github.com/lukasschwab/arxiv.py) cung cấp client cho metadata, cấu hình phân trang/delay/retry và ví dụ `source_url()`; cần ghim phiên bản API của thư viện. Đây không phải pipeline hoàn chỉnh cho đề và không bảo đảm hết 429, đủ references hay đủ mọi version.
+
+## Áp dụng cho repo hiện tại
+
+1. Session, S2 batch và fallback cho lô chưa đủ đã có trong `src/crawler/source_downloader.py` và `src/crawler/reference_batch.py`; đối chiếu hành vi trên log, không thay bằng thư viện khác chỉ vì repo khác nhanh hơn.
+2. Giữ version/status và checkpoint theo dữ liệu thật; không gán ngày revision, `v1` hoặc bản source không version khi không xác minh được. Với 429 giữ `api_error` để retry, không tính là empty thành công.
+3. Có thể đo thử cấu hình checkpoint/backup theo lô trong một lượt riêng để giảm I/O; đánh giá cả thời gian, checksum và resume sau gián đoạn trước khi thay cấu hình. Không sửa workload đang chạy.
+4. Parser hiện có `gather` và manifest riêng; ưu tiên điều tra 4 `error`/5 `partial` trong mẫu 20 version ở `build/drive_audit_live_20261104/parsed/manifest.json`, nhất là `Unclosed TeX group`, include động và bibliography. Chưa có bằng chứng parser của các repo trên sửa được các ca đó.
+5. Không sao chép số benchmark của repo khác. Đo Colab CPU-only, ghi riêng input/range, code, cấu hình, số bài dùng lại, số nguồn lỗi và wall time của lượt thật. Giới hạn và endpoint làm theo [arXiv](https://info.arxiv.org/help/api/tou.html) và đề hiện tại.

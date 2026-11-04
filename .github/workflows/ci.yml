@@ -1,4 +1,4 @@
-name: Check project skeleton
+name: Check crawler and parser
 
 on:
   push:
@@ -25,10 +25,17 @@ jobs:
           python - <<'PY'
           import json
           from pathlib import Path
-          for path in Path("docs").glob("*.ipynb"):
+          for path in [*Path("docs").glob("*.ipynb"), Path("colab_crawler.ipynb")]:
               book = json.loads(path.read_text(encoding="utf-8"))
               assert book["nbformat"] == 4, path
               assert isinstance(book["cells"], list), path
           PY
       - name: Check package installation
-        run: python -m pip install --no-deps .
+        run: python -m pip install -e .
+      - name: Check installed commands outside repository
+        working-directory: /tmp
+        run: |
+          arxiv-harvester --help
+          arxiv-parser --help
+          arxiv-audit-sources --help
+          arxiv-validate-project --help
