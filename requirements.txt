@@ -3,10 +3,10 @@
 arxiv
 sickle
 requests
+python-dotenv>=1.0
 pandas
 pyarrow
 psutil
 tqdm
 matplotlib
 seaborn
-jupyter-book

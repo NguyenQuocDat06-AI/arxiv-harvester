@@ -15,6 +15,7 @@ __pycache__/
 _build/
 build/
 dist/
+/tests/
 
 # Giữ cấu trúc thư mục, không đưa dữ liệu thô lên Git.
 data/raw/*
@@ -29,4 +30,19 @@ data/shards/*/*.parquet
 data/shards/*/_checkpoint/
 data/mock/
 data/**/stats.json
-/tests/
+data/test_single/
+data/parsed*/
+data/audits/
+data/cache/
+data/repaired*/
+data/enriched*/
+data/report_inputs/
+.venv-report/
+/scratch/
+/crawling_content.txt
+*.log
+
+# Corpus/measurements stay out of the code repository; retain directory placeholders.
+data/**
+!data/**/
+!data/**/.gitkeep
