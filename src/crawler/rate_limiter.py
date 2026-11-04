@@ -1,6 +1,7 @@
 import time
 import threading
 import math
+from .request_policy import RequestPolicy, CooldownDeferred
 
 class DomainRateLimiter:
     """Track request intervals per domain."""
@@ -8,7 +9,17 @@ class DomainRateLimiter:
         self.default_interval = default_interval
         # Last request time per domain.
         self._last_called: dict[str,float] = {}
+        self._not_before: dict[str, float] = {}
         self._lock = threading.Lock()
+        self.policy = RequestPolicy()
+
+    def defer(self, domain: str, seconds: float) -> None:
+        """Apply a server cooldown to subsequent requests."""
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("Cooldown must be finite and nonnegative")
+        with self._lock:
+            self._not_before[domain] = max(self._not_before.get(domain, 0), time.monotonic() + seconds)
+            self.policy.defer(domain, seconds)
 
     def wait(self, domain: str = "arxiv", interval: float | None = None) -> None:
         """ Wait until the next request is allowed."""
@@ -16,9 +27,16 @@ class DomainRateLimiter:
         if not math.isfinite(wait_time) or wait_time < 0:
             raise ValueError("Rate limit interval must be finite and nonnegative")
         with self._lock:
-            now = time.monotonic()
-            remaining = wait_time - (now - self._last_called.get(domain, float("-inf")))
-            if remaining > 0:
+            while True:
+                now = time.monotonic()
+                remaining = max(wait_time - (now - self._last_called.get(domain, float("-inf"))),
+                                self._not_before.get(domain, 0) - now)
+                if remaining <= 0:
+                    remaining = self.policy.reserve(domain, wait_time)
+                if remaining <= 0:
+                    break
+                if remaining > self.policy.max_wait_sec:
+                    raise CooldownDeferred(domain, remaining)
                 time.sleep(remaining)
             self._last_called[domain] = time.monotonic()
 
