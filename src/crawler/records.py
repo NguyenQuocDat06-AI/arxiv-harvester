@@ -9,7 +9,8 @@ from typing import Any, Iterable
 from .storage import resolve_paper_source_status
 
 SOURCE_TERMINAL = frozenset({"success", "pdf_only", "no_latex"})
-REFERENCE_TERMINAL = frozenset({"success", "empty"})
+REFERENCE_TERMINAL = frozenset({"success", "empty", "not_indexed", "bib_fallback"})
+REFERENCE_REPLACE = frozenset({"success", "empty"})
 
 
 def base_id(record: dict) -> str:
@@ -30,7 +31,9 @@ def merge_publications(old: dict | None, new: dict) -> dict:
     versions: dict[str, dict] = {}
     for record in (old or {}, new):
         for version in record.get("versions") or []:
-            tag = str(version.get("version") or "v1")
+            tag = str(version.get("version") or "")
+            if not re.fullmatch(r"v[1-9]\d*", tag):
+                continue
             merged = versions.setdefault(tag, {"version": tag})
             merged.update({k: deepcopy(v) for k, v in version.items() if v is not None})
     if versions:

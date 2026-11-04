@@ -1,4 +1,4 @@
-"""Khung sinh dữ liệu mẫu. Phụ trách: Dương Phan Minh Trí (24120470)."""
+"""Sinh dữ liệu mẫu cho kiểm thử. Phụ trách: Dương Phan Minh Trí (24120470)."""
 
 from __future__ import annotations
 
@@ -204,14 +204,14 @@ def generate_single_shard_mock_data(
             sb = 27000 if has_multi_ver else 8000
             sa = 9500 if has_multi_ver else 3000
 
-        # Ca biên kiểm thử theo yêu cầu:
-        # 1. Ca thiếu title / authors / abstract (bài idx == 2 của phân vùng 24120470)
+        # Ca biên: metadata thiếu và versions rỗng.
+        # Ca thiếu title / authors / abstract (bài idx == 2 của phân vùng 24120470)
         is_missing_metadata = (member_id == "24120470" and idx == 2)
         title_val = None if is_missing_metadata else f"Mock Paper Title for {paper_id}"
         abstract_val = None if is_missing_metadata else f"Abstract of simulated paper {paper_id} for data analysis test."
         authors_val = [] if is_missing_metadata else [f"Author {chr(65 + idx)}", f"CoAuthor {chr(66 + idx)}"]
 
-        # 2. Ca versions rỗng (bài idx == 3 của phân vùng 24120470)
+        # Ca versions rỗng (bài idx == 3 của phân vùng 24120470)
         is_empty_versions = (member_id == "24120470" and idx == 3)
         if is_empty_versions:
             versions = []
@@ -277,7 +277,7 @@ def generate_single_shard_mock_data(
     shard_synthesized = get_synthesized_v1_count() - c_before
     save_references_parquet(refs, ref_path)
 
-    # Sinh stats.json đúng chuẩn ResourceProfiler của Triết
+    # Stats fixture theo schema ResourceProfiler.
     stats_data = {
         "member_id": member_id,
         "id_range": cfg["id_range"],
@@ -346,17 +346,17 @@ def generate_all_mock_data(
     force: bool = False,
     seed: int = 42,
 ) -> None:
-    """Sinh toàn bộ mock data cho cả 5 thành viên."""
+    """Sinh dữ liệu mẫu cho 5 thành viên."""
     rng = random.Random(seed)
     success_count = 0
     for cfg in MEMBERS_CONFIG:
         if generate_single_shard_mock_data(cfg, shards_dir, force=force, rng=rng):
             success_count += 1
-    print(f"[+] Hoàn tất sinh dữ liệu mẫu: {success_count}/{len(MEMBERS_CONFIG)} shards sẵn sàng tại '{shards_dir}'.")
+    print(f"Hoàn tất sinh dữ liệu mẫu: {success_count}/{len(MEMBERS_CONFIG)} shards sẵn sàng tại '{shards_dir}'.")
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Giao diện dòng lệnh CLI cho generate_mock_data."""
+    """CLI sinh dữ liệu mẫu."""
     parser = argparse.ArgumentParser(
         prog="python -m src.crawler.generate_mock_data",
         description="Sinh dữ liệu giả lập (mock data) chuẩn schema cho 5 phân vùng thành viên.",
