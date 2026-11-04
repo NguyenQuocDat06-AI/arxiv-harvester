@@ -1,5 +1,6 @@
 from .rate_limiter import rate_limiter
 from .exceptions import arXivConnectionError, arXivMalformedXMLError, arXivRateLimitError
+from .request_policy import CooldownDeferred, retry_after
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -50,10 +51,12 @@ def _parse_entry(entry: ET.Element) -> dict | None:
         return None
 
     base_id = match.group(1)
-    max_ver = int(match.group(2) or 1)
+    if not match.group(2) or int(match.group(2)) < 1:
+        raise ValueError(f"arXiv entry has no valid version: {raw_url}")
+    max_ver = int(match.group(2))
 
     published_date = _get_text(entry.find("atom:published", NS)) or None
-    update_date = _get_text(entry.find("atom:updated", NS)) or published_date
+    update_date = _get_text(entry.find("atom:updated", NS)) or None
 
     versions: list[dict] = []
     for v in range(1, max_ver + 1):
@@ -118,19 +121,21 @@ def discover_metadata_batch(
         last_exc: Exception | None = None
 
         for attempt in range(max_retries):
-            rate_limiter.wait("arxiv", interval=max(3.0, rate_limit_sec))
+            try:
+                rate_limiter.wait("arxiv", interval=max(3.0, rate_limit_sec))
+            except CooldownDeferred as error:
+                raise arXivRateLimitError(str(error), retry_after=error.retry_after, failed_ids=chunk) from error
             try:
                 resp = requests.get(
                     API_URL, params=params, headers=headers, timeout=20.0
                 )
 
-                if resp.status_code in (429, 503):
-                    retry_after = resp.headers.get("Retry-After")
-                    sleep_time = (
-                        float(retry_after.strip())
-                        if (retry_after and retry_after.strip().isdigit())
-                        else (attempt + 1) * 5.0
-                    )
+                if resp.status_code == 429:
+                    delay = rate_limiter.policy.limited("arxiv", resp)
+                    raise arXivRateLimitError("arXiv HTTP 429; checkpoint được giữ", retry_after=delay, failed_ids=chunk)
+                if resp.status_code == 503:
+                    sleep_time = retry_after(resp) or (attempt + 1) * 5.0
+                    rate_limiter.defer("arxiv", sleep_time)
                     if attempt == max_retries - 1:
                         last_exc = arXivRateLimitError(
                             f"HTTP {resp.status_code} after {attempt + 1} attempts for {chunk[0]}..{chunk[-1]}. Retry after {sleep_time}s",
@@ -144,9 +149,12 @@ def discover_metadata_batch(
                     continue
 
                 resp.raise_for_status()
+                rate_limiter.policy.succeeded("arxiv")
                 resp_text = resp.text
                 break
 
+            except arXivRateLimitError:
+                raise
             except Exception as exc:
                 last_exc = exc
                 if attempt < max_retries - 1:
@@ -194,7 +202,7 @@ def discover_metadata_batch(
 
         for cid in chunk:
             if cid not in chunk_found:
-                missing_confirmed.add(cid)
+                failed_ids[cid] = "ID absent from feed; existence not confirmed"
 
     return DiscoveryBatchResult(all_records, missing_confirmed, failed_ids)
 
