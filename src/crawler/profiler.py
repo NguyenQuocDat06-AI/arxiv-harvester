@@ -92,10 +92,15 @@ class ResourceProfiler:
         self,
         sample_interval_sec: float = 0.5,
         watch_dirs: dict[str, str] | None = None,
+        disk_interval_sec: float = 5.0,
     ) -> None:
         if not math.isfinite(sample_interval_sec) or sample_interval_sec <= 0:
             raise ValueError("sample_interval_sec phải lớn hơn 0")
+        if not math.isfinite(disk_interval_sec) or disk_interval_sec <= 0:
+            raise ValueError("disk_interval_sec phải lớn hơn 0")
         self.sample_interval_sec = sample_interval_sec
+        self.disk_interval_sec = disk_interval_sec
+        self._last_disk_sample = None
         self.watch_dirs = dict(watch_dirs or {})
         self._process = psutil.Process()
         self._samples: list[int] = []
@@ -152,6 +157,8 @@ class ResourceProfiler:
                 pass
         timestamp = time.perf_counter()
         sizes = {label: dir_size_bytes(path) for label, path in self.watch_dirs.items()} if disk else {}
+        if disk:
+            self._last_disk_sample = timestamp
         roots = []
         for label, path in sorted(self.watch_dirs.items(), key=lambda item: len(os.path.abspath(item[1]))):
             absolute = os.path.realpath(path)
@@ -175,7 +182,8 @@ class ResourceProfiler:
 
     def _sampling_loop(self) -> None:
         while not self._stop_event.wait(self.sample_interval_sec):
-            self._sample()
+            disk = self._last_disk_sample is None or time.perf_counter() - self._last_disk_sample >= self.disk_interval_sec
+            self._sample(disk=disk)
 
     @contextmanager
     def phase(self, name: str) -> Iterator[None]:
@@ -188,7 +196,7 @@ class ResourceProfiler:
             elapsed = time.perf_counter() - begin
             self._phase_sec[name] = self._phase_sec.get(name, 0.0) + elapsed
             self._phase_calls[name] = self._phase_calls.get(name, 0) + 1
-            self.capture()
+            self.capture(disk=False)
             _ACTIVE_PROFILER.reset(token)
 
     def _stop(self) -> None:
@@ -245,6 +253,7 @@ class ResourceProfiler:
                     "peak_bytes": max((s["total_bytes"] for s in disk_samples), default=0),
                     "final_bytes": disk_samples[-1]["total_bytes"] if disk_samples else 0,
                     "method": "periodic samples and operation checkpoints; nested directories counted once",
+                    "sample_interval_sec": self.disk_interval_sec,
                     "dirs": {
                         label: {
                             "path": path,
