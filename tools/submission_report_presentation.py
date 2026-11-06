@@ -290,7 +290,7 @@ def present(output: Path, summary: dict):
     scope = summary['scope']
     (output / 'index.md').write_text(f'''# arXiv Harvester — Thu thập và xử lý dữ liệu bài báo
 
-Báo cáo đồ án **Nhập môn Khoa học dữ liệu**, Milestone 1 và 2. Cập nhật ngày {summary['report_date']}.
+Báo cáo đồ án **Nhập môn Khoa học dữ liệu — chương trình Chuẩn**, Milestone 1 và 2. Cập nhật ngày {summary['report_date']}.
 
 ## Tóm tắt
 
@@ -353,23 +353,26 @@ parts:
   - caption: Milestone 1 — Thu thập dữ liệu
     chapters:
       - file: chapters/00_m1_overview
-      - file: chapters/01_discovery_and_versions
-      - file: chapters/02_source_download_and_cleaning
-      - file: chapters/03_reference_extraction
-      - file: chapters/04_schema_and_data_quality
-      - file: chapters/05_performance_benchmark
+        sections:
+          - file: chapters/01_discovery_and_versions
+          - file: chapters/02_source_download_and_cleaning
+          - file: chapters/03_reference_extraction
+          - file: chapters/04_schema_and_data_quality
+          - file: chapters/05_performance_benchmark
   - caption: Milestone 2 — Phân tích cấu trúc và chuẩn hóa
     chapters:
       - file: chapters/00_m2_overview
-      - file: chapters/06_parsing_and_hierarchy
-      - file: chapters/07_standardization_and_deduplication
-      - file: chapters/08_parser_benchmark
+        sections:
+          - file: chapters/06_parsing_and_hierarchy
+          - file: chapters/07_standardization_and_deduplication
+          - file: chapters/08_parser_benchmark
   - caption: Thảo luận và phụ lục
     chapters:
       - file: chapters/12_discussion_and_conclusion
       - file: chapters/09_reproducibility
       - file: chapters/10_requirements_and_limitations
       - file: chapters/11_references
+      - file: chapters/13_teacher_qa
 ''', encoding='utf-8')
     (output / '_config.yml').write_text(f'''title: arXiv Harvester — Milestone 1 và 2
 author: Nhóm arXiv Harvester
@@ -400,6 +403,8 @@ sphinx:
 .dataframe th, .dataframe td { padding: .55rem .7rem; }
 .cell_output { margin: .8rem 0 1.6rem; }
 ''', encoding='utf-8')
+    from tools.submission_report_qa import apply_qa
+    apply_qa(output)
 
 
 def _write_resource_chapter(output):
