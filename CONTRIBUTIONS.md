@@ -1,6 +1,6 @@
 # Đóng góp thành viên và lịch sử source
 
-Repository source của nhóm là [arxiv-harvester](https://github.com/NguyenQuocDat06-AI/arxiv-harvester), nhánh mặc định `develop`. Đây là nơi đối chiếu code, tác giả và lịch sử thay đổi của thành viên.
+Repository source của nhóm là [arxiv-harvester](https://github.com/NguyenQuocDat06-AI/arxiv-harvester), nhánh chính và mặc định `main`. Nhánh `develop` dùng để tích hợp thay đổi. Đây là nơi đối chiếu code, tác giả và lịch sử thay đổi của thành viên.
 
 [arxiv-harvester-book](https://github.com/NguyenQuocDat06-AI/arxiv-harvester-book) chứa báo cáo được dựng từ source và số liệu tổng hợp. Lịch sử xuất bản Book không thay thế lịch sử đóng góp ở repository source. URL nộp Book giữ nguyên: https://nguyenquocdat06-ai.github.io/arxiv-harvester-book/.
 
@@ -33,17 +33,19 @@ Commit [6d1c614](https://github.com/NguyenQuocDat06-AI/arxiv-harvester/commit/6d
 
 Chi tiết kiểm tra: [biên bản khôi phục](tasks/HISTORY_RECOVERY_2026-11-06.md).
 
+Theo yêu cầu tiếp theo của nhóm, `main` được fast-forward từ `develop` sau khi khôi phục, rồi đặt lại làm nhánh mặc định. Vì giữ nguyên lịch sử Git, toàn bộ commit gốc của các thành viên cũng nằm trên `main`.
+
 ## Cách xem và tiếp tục đóng góp
 
-Xem [lịch sử develop](https://github.com/NguyenQuocDat06-AI/arxiv-harvester/commits/develop/) hoặc chạy:
+Xem [lịch sử main](https://github.com/NguyenQuocDat06-AI/arxiv-harvester/commits/main/) hoặc chạy:
 
 ```bash
 git fetch origin
-git log origin/develop --graph --decorate --oneline
-git shortlog -sne origin/develop
-git log origin/develop --author="nguyentan10052006@gmail.com" --stat
+git log origin/main --graph --decorate --oneline
+git shortlog -sne origin/main
+git log origin/main --author="nguyentan10052006@gmail.com" --stat
 ```
 
 `shortlog` đếm Git commit, gồm cả merge và bản gộp còn giữ trong lịch sử; số này không đo khối lượng hay chất lượng công việc.
 
-Từ mốc `develop` mới nhất, mỗi thành viên tạo nhánh cho phần mình thực hiện, commit bằng danh tính của mình và mở PR. Khi cần giữ từng commit gốc, dùng merge commit thay vì squash. Giữ các nhánh gốc tới hết đợt chấm; hạn chế viết lại lịch sử đã chia sẻ. Việc sửa tiếp Book vẫn dùng repository báo cáo hiện có để giữ nguyên URL nộp.
+Từ mốc `develop` mới nhất, mỗi thành viên tạo nhánh cho phần mình thực hiện, commit bằng danh tính của mình và mở PR về `develop`. Sau khi kiểm tra phần tích hợp, cập nhật `main` bằng fast-forward hoặc merge giữ lịch sử. Khi cần giữ từng commit gốc, dùng merge commit thay vì squash. Giữ các nhánh gốc tới hết đợt chấm; hạn chế viết lại lịch sử đã chia sẻ. Việc sửa tiếp Book vẫn dùng repository báo cáo hiện có để giữ nguyên URL nộp.
