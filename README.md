@@ -31,7 +31,7 @@ arxiv-parser --help
 
 Trên Windows khi redirect log, dùng `python -X utf8 -m ...` hoặc đặt `PYTHONUTF8=1` để giữ tiếng Việt trong output.
 
-Notebook Colab có ba chế độ: `smoke` chạy 5 bài trong thư mục riêng, `repair` bổ sung nguồn/references của checkpoint cũ, `full` tiếp tục toàn dải và xử lý lại phần thiếu. Mặc định lấy source GitHub nhánh `develop` và cập nhật bằng fast-forward; source cũ thiếu runtime mới sẽ bị từ chối. Nếu cần dùng ZIP, tạo bằng `python tools/prepare_colab_bundle.py`, chọn `SOURCE_MODE="bundle"` và dùng notebook đã ghim cùng SHA-256; không đưa `.env` hoặc corpus vào gói.
+Notebook Colab có ba chế độ: `smoke` chạy 5 bài trong thư mục riêng, `repair` bổ sung nguồn/references của checkpoint cũ, `full` tiếp tục toàn dải và xử lý lại phần thiếu. Mặc định dùng `main` với commit và checksum runtime cố định trong notebook; không tự chuyển sang code mới trong lúc resume. Nếu cần dùng ZIP, tạo bằng `python tools/prepare_colab_bundle.py`, chọn `SOURCE_MODE="bundle"` và dùng notebook đã ghim cùng SHA-256; không đưa `.env` hoặc corpus vào gói.
 
 CLI hỗ trợ `--resume --existing-only` để sửa các bài đã có mà không khám phá ID mới. Checkpoint legacy được sao lưu trước khi ghi tiếp; source tốt được giữ lại. Trạng thái `not_indexed`/`bib_fallback` được lưu rõ để báo cáo độ phủ, không đổi thành lỗi API hoặc tự nhận là kết quả S2 đầy đủ.
 
@@ -55,7 +55,7 @@ Tải nguồn có `--source-download-attempts 3`, `--source-read-timeout-sec 90`
 
 Colab mặc định `USE_LOCAL_WORKSPACE=True`: raw, giải nén, shard và log chạy trên `/content`; `network_state` tiếp tục lưu trên Drive. `BACKUP_EVERY_PAPERS=10` tương ứng CLI `--backup-dir <Drive>/backups/<MSSV> --backup-every-papers 10`. Mỗi lô đóng gói các nguồn thay đổi và part mới, kiểm tra archive/checksum ở Drive rồi công bố `HEAD.json` sau cùng. Sao lưu lỗi làm crawler dừng; checkpoint Drive đã xác minh trước đó vẫn dùng được. Không có thao tác xóa corpus cũ trên Drive.
 
-Notebook mặc định `RUN_MODE="full"`. Khi có checkpoint, full tự thêm `--resume`, kiểm tra lại phần thiếu rồi tiếp tục ID mới trên toàn dải. Smoke chưa đạt với code hiện tại hoặc dữ liệu cũ còn thiếu được thông báo trong preflight, không bắt buộc chạy riêng smoke/repair trước full. `repair` chỉ sửa paper đã có; `smoke` là lựa chọn kiểm tra nhỏ. Kiểm tra đúng MSSV/dải ID, file checkpoint và validation cuối vẫn áp dụng; chỉ validation đạt mới cập nhật course export hoặc upload bảng cuối.
+Notebook mặc định `RUN_MODE="smoke"`. Mỗi thành viên chọn đúng `CURRENT_MEMBER`, chạy 5 bài đến hết validation rồi đổi sang `full` và chạy lại từ cell cấu hình. Khi có checkpoint, full tự thêm `--resume`, sửa phần thiếu rồi tiếp tục ID mới trên toàn dải; không bắt buộc repair riêng trước full. Full validation đối chiếu MSSV, dải ID, đủ 5.000 ID gồm bài lưu và ID đã xác nhận không tồn tại, ranh giới và các lỗ hổng. `repair` đạt chỉ xác nhận các bài hiện có, chưa xác nhận hoàn tất toàn dải. Chỉ validation đạt mới cập nhật course export hoặc upload bảng cuối.
 
 Full mặc định `AUTO_RESUME_ARXIV=True`, truyền `--auto-resume-rate-limit` xuống CLI. Khi arXiv trả 429, crawler ghi checkpoint/backup rồi chờ đúng deadline, báo tiến độ mỗi 15 giây và tự tiếp tục trong cùng tiến trình. Paper vừa bị giới hạn được đưa cuối hàng đợi sau cooldown. Có thể bấm Stop khi đang chờ; không reset cooldown hoặc tăng kết nối. CLI không có flag này vẫn kết thúc với `paused_rate_limit` như trước.
 
@@ -63,7 +63,9 @@ Stats có `auto_rate_limit_resumes`, `auto_rate_limit_wait_sec` và `pipeline_pa
 
 Sau khi VM bị xóa, cell kiểm tra checkpoint tự khôi phục archive đã commit vào workspace trống. Khi chưa có backup, cell này sao chép và đối chiếu dữ liệu ở `raw/<MSSV>` và `shards/<MSSV>` cũ sang ổ cục bộ. Phần chưa commit sau lô gần nhất cần xử lý lại nếu mất VM. Giữ cả chuỗi archive, các file commit, `HEAD.json` và `network_state`; chỉ một runtime ghi vào một backup. Không sửa thủ công thư mục Drive cũ rồi mong bản backup tự cập nhật.
 
-Log/run metadata được sao lưu vào `logs/<MSSV>/<run_id>` sau khi dừng và sau validation. Hai bảng course export chỉ cập nhật khi validation đạt. Dữ liệu mới nằm trong archive ở `backups/<MSSV>`, thư mục raw/shard Drive cũ giữ làm đầu vào lịch sử. Profiler ghi thời gian sao lưu dữ liệu trong pha `drive_backup`; `child_wall_sec` của notebook bao gồm cả bước lưu stats/đầu ra cuối. Chưa có benchmark tốc độ Colab cho thay đổi này. [Nhật ký sửa và kiểm chứng](tasks/DOWNLOAD_SPEED_PROGRESS_2026-11-04.md).
+Log/run metadata, HTTP diagnostics và mẫu tài nguyên được sao lưu vào `logs/<MSSV>/<run_id>` mỗi 60 giây, sau khi dừng và sau validation. Profiler ghi mẫu ngay trong lúc chạy; archive dữ liệu chỉ đóng gói file mẫu sau khi profiler kết thúc để tránh hash sai vì file còn tăng. Drive ghi lỗi hoặc SSD dưới ngưỡng 2 GiB làm notebook dừng crawler, giữ bản backup đã xác minh gần nhất. Hai bảng course export chỉ cập nhật khi validation đạt và bản sao có checksum đúng.
+
+Dữ liệu mới nằm trong archive ở `backups/<MSSV>`, thư mục raw/shard Drive cũ giữ làm đầu vào lịch sử. Giữ `HEAD.json` và toàn bộ archive/record của chuỗi, khôi phục bằng `prepare_local_workspace` trước khi đưa `raw/unzipped` vào M2. Gói Download của notebook không chứa corpus nguồn. Profiler ghi thời gian sao lưu dữ liệu trong pha `drive_backup`; `child_wall_sec` bao gồm cả lưu stats/đầu ra cuối. [Nhật ký kiểm tra notebook](tasks/COLAB_HANDOFF_AUDIT_2026-11-07.md).
 
 | MSSV | Thành viên | Dải ID |
 |---|---|---|
@@ -153,7 +155,7 @@ Stats của smoke/resume chỉ xử lý một phần shard được giữ trong 
 
 ## 4. Chạy trên Google Colab
 
-Mở [colab_crawler.ipynb](colab_crawler.ipynb), chọn CPU và `CURRENT_MEMBER`; chạy tuần tự các cell. Mặc định dữ liệu nguồn và checkpoint cùng nằm trên Google Drive. Smoke test dùng thư mục riêng. Nhập `S2_API_KEY` trực tiếp ở mục 2; `HF_KEY` chỉ đọc qua Secrets khi bật restore/upload Hub.
+Mở [colab_crawler.ipynb](colab_crawler.ipynb), chọn CPU và `CURRENT_MEMBER`; chạy tuần tự các cell. Mặc định nguồn/checkpoint làm việc trên SSD và được sao lưu theo lô vào Drive. Smoke dùng thư mục riêng. Nhập `S2_API_KEY` trực tiếp ở mục 2; `HF_KEY` chỉ đọc qua Secrets khi bật restore/upload Hub. Mỗi MSSV chạy một runtime; nhiều runtime dùng chung S2 key vẫn chịu chung quota, nên dùng key được cấp riêng hoặc chạy lần lượt các lượt dùng chung key.
 
 Nếu smoke kết thúc `completed_with_errors`, giữ `RUN_MODE="smoke"` và chạy lại cùng thư mục để bổ sung đúng phần thiếu; không tăng số bài hoặc xóa checkpoint. Chạy cell validation sau khi crawler kết thúc. Full/repair dùng lô 25, smoke gộp các bài trong mẫu; mặc định checkpoint vẫn ghi sau từng paper. Sau khi đổi chế độ/thành viên, chạy lại các cell cấu hình và Drive/đường dẫn; notebook chặn dùng đường dẫn của cấu hình cũ.
 
