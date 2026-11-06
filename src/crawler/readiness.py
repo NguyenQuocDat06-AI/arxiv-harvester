@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import re
 
 import pyarrow.parquet as pq
 
@@ -27,7 +28,8 @@ def runtime_info() -> dict:
             "features": ["version_resume", "source_evidence", "reference_status", "existing_only", "shared_run_id",
                          "adaptive_s2", "source_retry_diagnostics", "s2_batch", "per_paper_checkpoint",
                          "persistent_cooldown", "http_diagnostics", "segmented_resume",
-                         "source_pacing", "adaptive_ranges", "drive_batch_backup", "auto_rate_resume"]}
+                         "source_pacing", "adaptive_ranges", "drive_batch_backup", "auto_rate_resume",
+                         "durable_run_artifacts", "assignment_validation"]}
 
 
 def checkpoint_plan(shard_dir: str | Path, raw_dir: str | Path, member_id: str, id_range: dict) -> dict:
@@ -59,8 +61,61 @@ def checkpoint_plan(shard_dir: str | Path, raw_dir: str | Path, member_id: str, 
             "versions_reusable": reusable, "references_needing_check": sorted(refs)}
 
 
+def _assignment_coverage(shard, stats, ids, member_id, mode, expected_range, expected_papers, errors):
+    if expected_range is None:
+        return None
+    from .id_range import normalize_yymm, _get_month_sequence
+
+    if stats.get("id_range") != expected_range:
+        errors.append("Stats ID range differs from the configured assignment")
+    state_path = shard / "_checkpoint/state.json"
+    if not state_path.is_file():
+        errors.append("Assignment validation requires its checkpoint")
+        return None
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if state.get("member_id") != member_id or state.get("id_range") != expected_range:
+        errors.append("Checkpoint belongs to another assignment")
+    missing = state.get("confirmed_missing", [])
+    if (not isinstance(missing, list) or any(not isinstance(value, str) for value in missing)
+            or len(set(missing)) != len(missing)):
+        errors.append("Invalid confirmed-missing IDs in checkpoint")
+        return None
+    covered = set(ids) | set(missing)
+    if set(ids) & set(missing):
+        errors.append("A paper is both stored and marked missing")
+    first_month = normalize_yymm(expected_range["start_month"])
+    last_month = normalize_yymm(expected_range["end_month"])
+    lower = f"{first_month}.{expected_range['start_id']:05d}"
+    upper = f"{last_month}.{expected_range['end_id']:05d}"
+    if any(not re.fullmatch(r"\d{4}\.\d{5}", value) or not lower <= value <= upper for value in covered):
+        errors.append("Stored or confirmed-missing IDs fall outside the assignment")
+    counts = stats.get("results") or {}
+    if expected_papers is not None:
+        if counts.get("total_ids") != expected_papers or len(covered) != expected_papers:
+            errors.append(f"Assignment coverage is {len(covered)} IDs; expected {expected_papers}")
+        if counts.get("pending_after_run") != 0:
+            errors.append("Assigned IDs still require processing")
+    if mode == "full":
+        run_args = stats.get("run_args") or {}
+        if run_args.get("max_papers") not in (None, 0) or run_args.get("existing_only"):
+            errors.append("Full run was restricted to a subset of the assignment")
+        expected = set()
+        for month in _get_month_sequence(first_month, last_month):
+            start = expected_range["start_id"] if month == first_month else 1
+            end = (expected_range["end_id"] if month == last_month else
+                   max((int(value.split(".")[1]) for value in covered
+                        if value.startswith(month + ".") and re.fullmatch(r"\d{4}\.\d{5}", value)), default=0))
+            expected.update(f"{month}.{sequence:05d}" for sequence in range(start, end + 1))
+        if not {lower, upper} <= covered or covered != expected:
+            errors.append("Full assignment has missing boundaries or internal ID gaps")
+    return {"stored_papers": len(ids), "confirmed_missing": len(missing),
+            "covered_ids": len(covered), "expected_ids": expected_papers,
+            "reported_total_ids": counts.get("total_ids")}
+
+
 def validate_run(shard_dir: str | Path, raw_dir: str | Path, export_dir: str | Path,
-                 output_dir: str | Path, member_id: str, run_id: str, mode: str) -> dict:
+                 output_dir: str | Path, member_id: str, run_id: str, mode: str,
+                 expected_range: dict | None = None, expected_papers: int | None = None) -> dict:
     shard, raw, course, output = map(Path, (shard_dir, raw_dir, export_dir, output_dir))
     output.mkdir(parents=True, exist_ok=True)
     errors, warnings = [], []
@@ -98,6 +153,7 @@ def validate_run(shard_dir: str | Path, raw_dir: str | Path, export_dir: str | P
         errors.append("Crawl did not complete successfully on real inputs")
     if (stats.get("results") or {}).get("failed", 0):
         errors.append("Crawl has pending failures")
+    coverage = _assignment_coverage(shard, stats, ids, member_id, mode, expected_range, expected_papers, errors)
     if any(not p.get("versions") for p in pubs):
         errors.append("Paper is missing version metadata")
     source_audit = audit_sources(str(required[0]), str(raw), str(output / "source_audit.parquet"))
@@ -131,6 +187,7 @@ def validate_run(shard_dir: str | Path, raw_dir: str | Path, export_dir: str | P
     result.update(ready_for_full=not errors, papers=len(pubs), working_references=len(refs),
                   course_export=course_check, source_audit=source_audit,
                   reference_statuses=dict(statuses), missing_version_dates=dates_missing,
+                  assignment_coverage=coverage,
                   input_hashes={str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest() for p in required})
     _write_json_atomic(str(output / "validation.json"), result)
     return result

@@ -763,7 +763,8 @@ def _execute_main(args, policy):
     profiler = ResourceProfiler(sample_interval_sec=args.profile_interval_sec,
                                  watch_dirs={"raw_sources": os.path.join(args.raw_dir, "sources"),
                                              "raw_unzipped": os.path.join(args.raw_dir, "unzipped"), "shard": args.output_dir,
-                                             "network_state": str(policy.directory)})
+                                             "network_state": str(policy.directory)},
+                                 samples_path=Path(args._run_dir) / "resource_samples.jsonl")
     extra = {"run_id": args._run_id, "member_id": args.member_id, "id_range": _id_range(args),
              "is_mock": args.dry_run, "dry_run": args.dry_run, "resumed": args.resume,
              "run_args": {k: getattr(args, k) for k in ("batch_size", "rate_limit_sec", "raw_dir", "output_dir", "max_papers", "dry_run",
