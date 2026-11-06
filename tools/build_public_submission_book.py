@@ -72,6 +72,7 @@ def aggregate(snapshot: Path, parsed: Path, colab_run: Path):
     for name in ('papers','references'):
         schema=pq.ParquetFile(snapshot/'course'/f'{name}.parquet').schema_arrow
         schemas[name]=[{'column':f.name,'type':str(f.type),'nullable':f.nullable} for f in schema]
+    complete_sources={p['id'] for p in papers if p['versions'] and all(verified.get((p['id'],v['version']),False) for v in p['versions'])}
     summary={'report_date':'2026-11-06','scope':{'papers':len(papers),'versions':len(versions),'group_assigned':25000,
               'member_assigned':5000,'checkpoint_reported_ids':scope['latest_checkpoint_ids'],
               'archives_used':len(scope['archives']),'selection':'Các lô mới nhất dưới 8 MiB; không chọn theo parser success và không khôi phục toàn chuỗi.'},
@@ -87,13 +88,23 @@ def aggregate(snapshot: Path, parsed: Path, colab_run: Path):
                     'mean_before_bytes':sum(sizes['size_before_bytes'])/len(eligible) if eligible else None,
                     'mean_after_bytes':sum(sizes['size_after_bytes'])/len(eligible) if eligible else None,
                     'source_reduction':1-sum(sizes['size_after_bytes'])/sum(sizes['size_before_bytes']) if sum(sizes['size_before_bytes']) else None,
+                    'papers_with_all_sources_verified':len(complete_sources),
+                    'papers_with_sources_and_s2_verified':len(complete_sources & complete_refs),
+                    'missing_version_dates':sum(v.get('created') is None for v in versions),
                     'schemas':schemas},
               'm2':{'status_counts':stat['status_counts'],'deduplication':stat['deduplication'],
                     'unresolved_cites':stat['unresolved_cites'],'bibliography_conflicts':stat['bibliography_conflicts'],
                     'coverage':coverage,'diagnostic_categories':dict(diagnostics),'rows':quality['m2']['rows'],
+                    'versions_with_tex':stat.get('versions_with_tex'),
+                    'versions_with_unmeasured_counts':stat.get('versions_with_unmeasured_counts'),
                     'structural_valid':quality['structural_valid'],'processing_complete':quality['processing_complete']},
               'crawler_measurement':crawl,'parser_measurement':{**measurements(stat),'final_output_bytes':stat['final_output_bytes'],
                     'avg_sec_per_publication':stat['avg_sec_per_processed_publication']}}
+    baseline=parsed.parent/'parsed/stats.json'
+    if baseline.exists() and baseline.resolve()!=(parsed/'stats.json').resolve():
+        old=json.loads(baseline.read_text(encoding='utf-8'))
+        if old.get('publications_input')==stat.get('publications_input') and old.get('versions')==stat.get('versions'):
+            summary['m2']['before_fixes_status']=old.get('status_counts',{})
     return summary,mapping
 
 
@@ -306,6 +317,8 @@ jobs:
         id: deployment
         uses: actions/deploy-pages@v4
 ''',encoding='utf-8')
+    from tools.submission_report_content import enrich
+    enrich(output,summary)
     if build:
         executable=Path(sys.executable).with_name('jupyter-book.exe' if os.name=='nt' else 'jupyter-book')
         subprocess.run([str(executable),'build',str(output),'--all','-W'],check=True)
