@@ -7,7 +7,7 @@ import textwrap
 import nbformat
 
 
-CODE_COMMIT = 'e8d409200fa3483bc52eb5a914c602c552def133'
+CODE_COMMIT = '6cd8dac6d1491083286d538dd7fffacf66f4cc4c'
 CODE_URL = 'https://github.com/NguyenQuocDat06-AI/arxiv-harvester'
 BOOK_URL = 'https://nguyenquocdat06-ai.github.io/arxiv-harvester-book/'
 
@@ -42,7 +42,7 @@ def references(stage, files=()):
              '- [arXiv API: cấu trúc truy vấn và Atom](https://info.arxiv.org/help/api/user-manual.html).',
              '- [Quy định truy cập arXiv](https://info.arxiv.org/help/api/tou.html).',
              '- [Semantic Scholar Academic Graph API](https://api.semanticscholar.org/api-docs/graph).']
-    lines += [f'- Mã triển khai: [{name}]({CODE_URL}/blob/{CODE_COMMIT}/{name}).' for name in files]
+    lines += [f'- Mã triển khai: [{name}]({CODE_URL}/blob/{"main" if name.startswith("tools/") else CODE_COMMIT}/{name}).' for name in files]
     return md('## Tài liệu và mã tham chiếu\n\n' + '\n'.join(lines))
 
 
@@ -149,11 +149,15 @@ def chapter_two():
     ## 2.2 Nhận diện và giữ nội dung
 
     Phản hồi không phải lúc nào cũng là tar.gz. Chương trình kiểm tra dạng tar, gzip, TeX hoặc
-    PDF bằng nội dung. Corpus làm việc chỉ giữ file `.tex` và `.bib`, không chỉnh câu lệnh
+    PDF bằng nội dung. Corpus giữ `.tex`, `.bib` và `.bbl` bổ trợ theo QA, không chỉnh câu lệnh
     figure trong TeX. Vì vậy M2 vẫn nhận diện được vị trí figure/table dù binary ảnh đã bị loại.
 
     Việc giải nén đi qua staging, kiểm tra đường dẫn và symlink, rồi mới thay nguồn cũ sau khi
     kết quả mới hợp lệ. Nếu tải hoặc giải nén lỗi, trạng thái lỗi và phần có thể resume được giữ.
+
+    Giữ `.bbl` là điều chỉnh theo QA sau các lượt đo đang được trình bày. Parser dùng nó khi
+    bibliography gốc thiếu hoặc không đọc được và đường dẫn biên dịch xác định được file đó.
+    Snapshot lịch sử chưa được tải lại để phục hồi `.bbl` đã bị lọc; các số đo giữ nguyên.
 
     | Trạng thái version | Bằng chứng và cách dùng |
     |---|---|
@@ -245,8 +249,9 @@ def chapter_three():
 
     Cạnh trích dẫn và metadata của tài liệu được trích có provenance riêng. Việc bổ sung được
     S2 ID cho một reference fallback không chứng minh S2 đã trả cạnh citing → reference đó.
-    Ngày không được tạo từ trường year. Publication date của S2 cũng không tự động chứng minh
-    ngày submission trên arXiv.
+    Theo QA dòng 20–21, trường `ref_submission_date` được dùng `publicationDate` của S2 hoặc
+    ngày lấy qua arXiv ID. Pipeline ghi nguồn ngày, giữ ngày đã có và không suy ngày từ year.
+    Đây là quy ước của bảng references trong đồ án; nó không đổi nghĩa ngày submission của papers.
 
     ## 3.3 Retry và hạn mức
 

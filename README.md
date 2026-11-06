@@ -1,6 +1,6 @@
 # arXiv Harvester — Milestone 1 và 2
 
-Thu thập mọi version của paper trong dải ID được giao, giữ nguồn `.tex/.bib`, lấy references và parse thành dữ liệu phân cấp đã chuẩn hóa/khử trùng.
+Thu thập mọi version của paper trong dải ID được giao, giữ nguồn `.tex/.bib` và bibliography `.bbl` bổ trợ, lấy references và parse thành dữ liệu phân cấp đã chuẩn hóa/khử trùng.
 
 - Đặc tả: [M1 — Crawling](https://hcmus-cs-ta.github.io/lab-book/intro-ds/statement/crawling/), [M2 — Parsing](https://hcmus-cs-ta.github.io/lab-book/intro-ds/statement/parsing/).
 - Dataset đang dùng: [nquocdat06/arxiv-harvester-data](https://huggingface.co/datasets/nquocdat06/arxiv-harvester-data).
@@ -12,7 +12,9 @@ M1–M2 nộp link code và Jupyter Book. Dữ liệu làm việc giữ để x�
 
 Bản nộp tiến độ 06/11 dùng snapshot Drive 73 paper/119 version. Audit nguồn xác minh 118 version; parser có 81 success, 31 partial, 5 empty và 2 lỗi. Năm bảng hợp lệ về cấu trúc trên snapshot; chưa xử lý đủ toàn nhóm và chưa có benchmark M2 Colab CPU-only. [Link và hướng dẫn nộp](tasks/NOP_M1_M2_2026-11-06.md).
 
-Book có trang tổng quan riêng cho M1/M2, tám chương chi tiết, phần thảo luận và ba phụ lục. Các bảng chỉ tiêu có mẫu số; ví dụ parser chạy từ source ghim; biểu đồ tài nguyên parser lấy từ số đo thật. Nội dung được sinh từ `tools/submission_report_content.py` và `tools/submission_report_presentation.py`. Xem [các nguồn tham khảo và tiến trình chỉnh báo cáo](tasks/REPORT_REVIEW_2026-11-06.md).
+Book có hai chương chính M1/M2 với các mục kỹ thuật bên trong, phần thảo luận và các phụ lục. Các bảng chỉ tiêu có mẫu số; ví dụ parser chạy từ source ghim; biểu đồ tài nguyên parser lấy từ số đo thật. Nội dung được sinh từ các template trong `tools/submission_report_*`. Xem [tiến trình chỉnh báo cáo](tasks/REPORT_REVIEW_2026-11-06.md) và [điều chỉnh theo QA](tasks/QA_IMPLEMENTATION_2026-11-06.md).
+
+Theo QA của giảng viên, mốc nộp link Book là mốc tiến độ; nhóm được tiếp tục cập nhật đến hạn Poster nhưng giữ nguyên URL. Nhóm học chương trình Chuẩn và dùng tiếng Việt. M3 dùng chung pipeline; mỗi thành viên trích output theo dải ID của mình để host trên Hugging Face cá nhân và chuẩn bị ít nhất 5 publication gán nhãn.
 
 ## 1. Cài đặt và kiểm tra
 
@@ -86,7 +88,7 @@ Các đầu ra:
 ```text
 data/raw/
   sources/                         # archive tạm
-  unzipped/<arxiv_id>/<version>/    # chỉ .tex/.bib
+  unzipped/<arxiv_id>/<version>/    # .tex/.bib, .bbl bổ trợ theo QA
   manifests/<versioned_id>.json    # bằng chứng nguồn/PDF-only/no-TeX
 data/shards/<MSSV>/
   publications.parquet
@@ -159,6 +161,14 @@ Nếu smoke kết thúc `completed_with_errors`, giữ `RUN_MODE="smoke"` và ch
 
 Benchmark chính thức phải chạy trên Colab CPU-only. Số đo trên Windows/local và smoke test không được trình bày như benchmark toàn dải. `runs/` giữ từng lần thực thi, bao gồm phạm vi đã làm và phần dùng lại; không chia thời gian run cuối cho số paper cộng dồn.
 
+QA cho phép benchmark qua nhiều phiên Colab. Giữ stats/log từng phiên; runtime đã gồm retry và delay. Tổng hợp M1 và M2 riêng:
+
+```bash
+python -m src.crawler.benchmark_sessions --stats logs/run1/stats.json logs/run2/stats.json --final-output-dir data/processed --output build/benchmark_m1_sessions.json
+```
+
+File `run_metadata.json`, nếu có, nằm cạnh stats và phải trùng run ID để lấy child wall. Công cụ loại bản sao cùng run, giữ metric chưa biết là null, tổng hợp RAM theo thời lượng và đánh dấu phiên chồng nhau. Số lượt xử lý có thể lặp paper; kiểm tra độ phủ ID/version và chất lượng nguồn riêng trên output hợp nhất.
+
 ## 5. Milestone 2 — parser
 
 ```bash
@@ -178,6 +188,8 @@ arxiv-parser --publications data/processed/publications.parquet --raw-dir data/r
 ```
 
 Pipeline: compilation root/include → occurrence hierarchy → normalize/canonical cites → exact content dedup → Parquet. Có hỗ trợ BibTeX/bibitem, field union và mapping key theo version. Trường hợp thiếu nguồn, include động không resolve hoặc cú pháp chưa hỗ trợ được ghi lỗi/partial; parser không phải TeX engine đầy đủ.
+
+Theo QA, `.bbl` được giữ làm bibliography phụ trợ. Khi `.bib` thiếu/lỗi, parser chỉ dùng `.bbl` trùng compilation root hoặc tên bibliography được khai báo; chuyển bibitem đọc được thành bản ghi, giữ raw citation và bản gốc. Cú pháp chưa hỗ trợ hoặc nhiều ứng viên chưa phân giải được giữ diagnostic. Thay `.bbl` làm fingerprint thay đổi khi resume. Trường `ref_submission_date` được phép lấy `publicationDate` S2 hoặc ngày qua arXiv ID; bước enrich chỉ điền ngày thiếu và lưu provenance.
 
 Gathering dừng tại `\end{document}`/`\endinput`; font declarations không được che các `\bibitem`. Các macro zero-argument khai báo rõ `\begin`/`\end` của display math được nhận diện; citation keys được đổi cả trong inline/block math. Macro động có tham số vẫn cần kiểm tra diagnostics.
 

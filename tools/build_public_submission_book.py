@@ -61,6 +61,19 @@ def resource_profile(parsed: Path, stats: dict, window_sec=5.0):
             'disk_samples': counts['disk'], 'rows': rows}
 
 
+def public_sessions(paths):
+    from src.crawler.benchmark_sessions import summarize_sessions
+    result = summarize_sessions(paths)
+    fields = ('status', 'colab_cpu', 'processed_attempts', 'publications_reused', 'versions_reused',
+              'profiler_sec', 'child_wall_sec', 'peak_rss_mib', 'avg_rss_mib', 'peak_disk_bytes', 'final_disk_bytes')
+    totals = ('all_sessions_colab_cpu', 'sessions_overlap', 'total_profiler_sec', 'total_child_wall_sec',
+              'processed_attempts', 'unique_publications', 'max_session_peak_rss_mib',
+              'session_time_weighted_avg_rss_mib', 'max_session_peak_disk_bytes')
+    return {'sessions': [{'session': f'S{index}', **{key: row[key] for key in fields}}
+                         for index, row in enumerate(result['sessions'], 1)],
+            'totals': {key: result[key] for key in totals}}
+
+
 def aggregate(snapshot: Path, parsed: Path, colab_run: Path):
     scope=json.loads((snapshot/'snapshot.json').read_text(encoding='utf-8'))
     stat=json.loads((parsed/'stats.json').read_text(encoding='utf-8'))
@@ -134,7 +147,9 @@ def aggregate(snapshot: Path, parsed: Path, colab_run: Path):
                     'structural_valid':quality['structural_valid'],'processing_complete':quality['processing_complete']},
               'crawler_measurement':crawl,'parser_measurement':{**measurements(stat),'final_output_bytes':stat['final_output_bytes'],
                     'avg_sec_per_publication':stat['avg_sec_per_processed_publication'],
-                    'resource_profile':resource_profile(parsed,stat)}}
+                    'resource_profile':resource_profile(parsed,stat)},
+              'session_measurements':{'M1':public_sessions([colab_run/'stats.json']),
+                                      'M2':public_sessions([parsed/'stats.json'])}}
     baseline=parsed.parent/'parsed/stats.json'
     if baseline.exists() and baseline.resolve()!=(parsed/'stats.json').resolve():
         old=json.loads(baseline.read_text(encoding='utf-8'))
