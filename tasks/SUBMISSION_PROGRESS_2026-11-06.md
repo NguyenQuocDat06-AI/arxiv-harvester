@@ -29,3 +29,10 @@ Lần push bản chứa Parquet và metadata Drive bị automatic approval revie
 Link Book: https://nguyenquocdat06-ai.github.io/arxiv-harvester-book/
 
 Link code: https://github.com/NguyenQuocDat06-AI/arxiv-harvester/tree/develop
+
+## Mở rộng báo cáo chi tiết
+
+- `tools/submission_report_content.py`: viết lại tám chương với phương pháp, công thức/mẫu số, diễn giải kết quả và ví dụ TeX/BibTeX tổng hợp chạy từ source ghim.
+- Thêm hai phụ lục về tái lập, URL cố định, đối chiếu yêu cầu và phần dữ liệu/benchmark còn thiếu.
+- `tools/build_public_submission_book.py`: bổ sung số paper đủ nguồn, số paper đủ nguồn + S2, ngày version còn thiếu và so sánh trạng thái trước/sau sửa trên cùng input. Chỉ bổ sung số liệu tổng hợp, không công bố dữ liệu gốc.
+- Bản mở rộng có khoảng 5.320 từ Markdown và 33 code cell; số lượng paper/version và kết quả đo gốc không bị thay đổi.
