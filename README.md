@@ -5,6 +5,7 @@ Thu thập mọi version của paper trong dải ID được giao, giữ nguồn
 - Đặc tả: [M1 — Crawling](https://hcmus-cs-ta.github.io/lab-book/intro-ds/statement/crawling/), [M2 — Parsing](https://hcmus-cs-ta.github.io/lab-book/intro-ds/statement/parsing/).
 - Dataset đang dùng: [nquocdat06/arxiv-harvester-data](https://huggingface.co/datasets/nquocdat06/arxiv-harvester-data).
 - Báo cáo M1–M2: [Jupyter Book](https://nguyenquocdat06-ai.github.io/arxiv-harvester-book/) trong [repository báo cáo riêng](https://github.com/NguyenQuocDat06-AI/arxiv-harvester-book).
+- Đóng góp thành viên: [nhánh gốc, commit và cách đối chiếu](CONTRIBUTIONS.md). Nhánh mặc định của repository source là `develop`.
 - [Checklist và hướng dẫn sửa](tasks/HF_DATASET_AUDIT_2026-10-30.md), [nhật ký thực hiện và bằng chứng](tasks/IMPLEMENTATION_PROGRESS_2026-11-01.md).
 
 M1–M2 nộp link code và Jupyter Book. Dữ liệu làm việc giữ để xử lý tiếp; việc xuất bản/nộp dữ liệu cuối thuộc M3. Bản báo cáo dùng số liệu tổng hợp được chuẩn bị bằng `tools/build_public_submission_book.py`; bộ dựng Book từ working tables vẫn có trong `tools/build_report.py`.
