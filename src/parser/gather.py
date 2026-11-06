@@ -85,9 +85,13 @@ def gather(version_dir: str | Path, preferred_root: str | None = None) -> Gather
             if not command.args or "\\" in command.args[0] or "#" in command.args[0]:
                 diagnostics.append(f"dynamic/unsupported include in {relative}")
             else:
-                child = path.parent / command.args[0].strip()
-                if not child.suffix:
-                    child = child.with_suffix(".tex")
+                relative_child = Path(command.args[0].strip())
+                if not relative_child.suffix:
+                    relative_child = relative_child.with_suffix(".tex")
+                # TeX resolves ordinary input paths from the compilation directory.
+                child = root.parent / relative_child
+                if not child.is_file():
+                    child = path.parent / relative_child
                 append("\n", command.start)
                 pieces.append(expand(child, [*stack, path]))
                 append("\n", command.end)

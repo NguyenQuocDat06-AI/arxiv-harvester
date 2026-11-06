@@ -4,9 +4,12 @@ Thu thập mọi version của paper trong dải ID được giao, giữ nguồn
 
 - Đặc tả: [M1 — Crawling](https://hcmus-cs-ta.github.io/lab-book/intro-ds/statement/crawling/), [M2 — Parsing](https://hcmus-cs-ta.github.io/lab-book/intro-ds/statement/parsing/).
 - Dataset đang dùng: [nquocdat06/arxiv-harvester-data](https://huggingface.co/datasets/nquocdat06/arxiv-harvester-data).
+- Báo cáo M1–M2: [Jupyter Book](https://nguyenquocdat06-ai.github.io/arxiv-harvester-book/) trong [repository báo cáo riêng](https://github.com/NguyenQuocDat06-AI/arxiv-harvester-book).
 - [Checklist và hướng dẫn sửa](tasks/HF_DATASET_AUDIT_2026-10-30.md), [nhật ký thực hiện và bằng chứng](tasks/IMPLEMENTATION_PROGRESS_2026-11-01.md).
 
-M1–M2 nộp link code và Jupyter Book. Dữ liệu làm việc giữ để xử lý tiếp; việc xuất bản/nộp dữ liệu cuối thuộc M3. Bộ source báo cáo riêng được chuẩn bị bằng `tools/build_report.py`; chưa có URL Pages mới được xác nhận trong lần sửa này.
+M1–M2 nộp link code và Jupyter Book. Dữ liệu làm việc giữ để xử lý tiếp; việc xuất bản/nộp dữ liệu cuối thuộc M3. Bản báo cáo dùng số liệu tổng hợp được chuẩn bị bằng `tools/build_public_submission_book.py`; bộ dựng Book từ working tables vẫn có trong `tools/build_report.py`.
+
+Bản nộp tiến độ 06/11 dùng snapshot Drive 73 paper/119 version. Audit nguồn xác minh 118 version; parser có 81 success, 31 partial, 5 empty và 2 lỗi. Năm bảng hợp lệ về cấu trúc trên snapshot; chưa xử lý đủ toàn nhóm và chưa có benchmark M2 Colab CPU-only. [Link và hướng dẫn nộp](tasks/NOP_M1_M2_2026-11-06.md).
 
 ## 1. Cài đặt và kiểm tra
 

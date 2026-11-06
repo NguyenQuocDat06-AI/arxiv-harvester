@@ -23,8 +23,10 @@ def load_m1(directory: str | Path | None = None) -> dict:
         raise ValueError("Report refuses mock data")
     versions = pd.DataFrame([{"arxiv_id": p["id"], **v} for p in papers.to_dict("records") for v in p.get("versions") or []],
                             columns=["arxiv_id", "version", "created", "size_before_bytes", "size_after_bytes", "source_status"])
+    audit_path = path / "source_audit.parquet"
+    audit = pd.DataFrame(pq.ParquetFile(audit_path).read().to_pylist()) if audit_path.exists() else pd.DataFrame()
     return {"directory": path, "papers": papers, "references": refs, "versions": versions,
-            "observations": observations, "stats": stats,
+            "observations": observations, "stats": stats, "source_audit": audit,
             "provenance": "mock" if stats.get("is_mock") is True else "recorded real" if stats.get("is_mock") is False else "not supplied/unknown"}
 
 
@@ -66,11 +68,19 @@ def run_table(directory: Path) -> pd.DataFrame:
         if stats.get("is_mock") is True:
             continue
         env, mem, disk = stats.get("environment", {}), stats.get("memory", {}), stats.get("disk", {})
+        metadata_path = path.with_name("run_metadata.json")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+        if metadata.get("run_id") != stats.get("run_id"):
+            metadata = {}
         rows.append({"run_id": stats.get("run_id", path.parent.name), "status": stats.get("status"),
                      "colab_cpu": bool(env.get("is_google_colab") and env.get("cpu_only")),
                      "runtime_sec": stats.get("runtime_sec"), "runtime_scope": stats.get("runtime_scope", "profiler scope; see run configuration"),
                      "disk_scope": stats.get("disk_scope", "watched directories in stats.json"),
                      "processed_this_run": stats.get("processed_this_run", stats.get("results", {}).get("processed_this_run")),
+                     "assigned_ids": stats.get("results", {}).get("total_ids"),
+                     "child_wall_sec": metadata.get("child_wall_sec"),
+                     "arxiv_metadata_interval_sec": stats.get("run_args", {}).get("rate_limit_sec"),
+                     "arxiv_source_interval_sec": stats.get("run_args", {}).get("source_rate_limit_sec"),
                      "publications_reused": stats.get("reused"), "versions_reused": stats.get("results", {}).get("versions_reused"),
                      "peak_rss_mb": mem.get("peak_rss_mb"), "avg_rss_mb": mem.get("avg_rss_mb"),
                      "peak_disk_bytes": disk.get("peak_bytes"), "final_disk_bytes": disk.get("final_bytes")})
