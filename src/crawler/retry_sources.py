@@ -13,7 +13,7 @@ from pathlib import Path
 import shutil
 import pyarrow.parquet as pq
 from .records import base_id, merge_publications
-from .source_downloader import download_and_clean_source, get_dir_size_bytes
+from .source_downloader import ALLOWLIST_EXTENSIONS, download_and_clean_source, get_dir_size_bytes
 from .storage import save_publications_parquet
 from .profiler import _write_json_atomic
 
@@ -31,7 +31,7 @@ def _verified_source(row: dict) -> dict | None:
     if not directory.is_dir() or directory.is_symlink():
         return None
     files = list(directory.rglob("*"))
-    if any(p.is_symlink() or (p.is_file() and p.suffix.lower() not in {".tex", ".bib"}) for p in files):
+    if any(p.is_symlink() or (p.is_file() and p.suffix.lower() not in ALLOWLIST_EXTENSIONS) for p in files):
         return None
     tex = any(p.is_file() and p.suffix.lower() == ".tex" for p in files)
     if evidence.get("status") == "success":

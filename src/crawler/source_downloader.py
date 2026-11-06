@@ -40,10 +40,11 @@ DEFAULT_USER_AGENT: str = (
     "arxiv-harvester/0.1.0 (Course Project; mailto:24120282@student.hcmus.edu.vn)"
 )
 
-# Chỉ giữ nguồn TeX và BibTeX.
+# Giữ .bbl làm nguồn bibliography bổ trợ theo QA.
 ALLOWLIST_EXTENSIONS: set[str] = {
     ".tex",
     ".bib",
+    ".bbl",
 }
 
 # Hậu kiểm tra tệp ngoài allowlist.
@@ -196,7 +197,7 @@ def _safe_extract_tar(
     dest_dir: Path,
     max_total_bytes: int = 500 * 1024 * 1024,
 ) -> tuple[int, int]:
-    """Giải nén .tex/.bib; trả về tổng byte gốc và byte được giữ."""
+    """Giải nén nguồn và bibliography; trả về byte gốc và byte được giữ."""
     root = dest_dir.resolve()
     dest_dir.mkdir(parents=True, exist_ok=True)
 
@@ -236,7 +237,7 @@ def _safe_extract_tar(
                 raise ValueError(f"Dung lượng giải nén vượt giới hạn {max_total_bytes} byte")
 
             ext = Path(member.name).suffix.lower()
-            # Chỉ giải nén .tex và .bib.
+            # Không giải nén ảnh hoặc tệp thực thi.
             if ext not in ALLOWLIST_EXTENSIONS:
                 continue
 
@@ -764,6 +765,9 @@ def download_and_clean_source(
             read_timeout_sec=read_timeout_sec,
             max_elapsed_sec=max_elapsed_sec,
         )
+        directory = Path(result["source_dir"])
+        result["bbl_files"] = sorted(p.relative_to(directory).as_posix() for p in directory.rglob("*")
+                                     if p.is_file() and not p.is_symlink() and p.suffix.lower() == ".bbl") if directory.is_dir() else []
         if result["status"] == "pdf_only" and any(p.is_file() and p.suffix.lower() == ".tex" for p in Path(result["source_dir"]).rglob("*")):
             result.update(status="error", error_message="PDF response conflicts with existing TeX; previous source preserved")
         manifest = Path(sources_dir).parent / "manifests" / (result["version_id"].replace("/", "_") + ".json")
@@ -794,7 +798,7 @@ if __name__ == "__main__":
     print(f"  - Version ID: {res['version_id']}")
     print(f"  - Status: {res['status']}")
     print(f"  - Original size (uncompressed): {res['size_before_bytes']} bytes")
-    print(f"  - Cleaned size (.tex/.bib): {res['size_after_bytes']} bytes")
+    print(f"  - Cleaned source size: {res['size_after_bytes']} bytes")
     print(f"  - Saved directory: {res['source_dir']}")
     print(f"  - Elapsed: {res['elapsed_sec']}s")
 

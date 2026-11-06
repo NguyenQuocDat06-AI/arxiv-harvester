@@ -8,7 +8,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 from .records import base_id
-from .source_downloader import get_dir_size_bytes
+from .source_downloader import ALLOWLIST_EXTENSIONS, get_dir_size_bytes
 from .storage import _write_parquet_atomic
 from .profiler import _write_json_atomic
 
@@ -30,7 +30,7 @@ def check_source_version(raw_dir: str | Path, identifier: str, version: dict) ->
     entries = list(directory.rglob("*")) if directory.is_dir() else []
     regular = [p for p in entries if p.is_file() and not p.is_symlink()]
     tex = [p for p in regular if p.suffix.lower() == ".tex"]
-    unexpected = [p for p in entries if p.is_symlink() or (p.is_file() and p.suffix.lower() not in {".tex", ".bib"})]
+    unexpected = [p for p in entries if p.is_symlink() or (p.is_file() and p.suffix.lower() not in ALLOWLIST_EXTENSIONS)]
     actual_size = get_dir_size_bytes(directory) if directory.exists() else 0
     status = version.get("source_status")
     if status == "success":
@@ -49,7 +49,8 @@ def check_source_version(raw_dir: str | Path, identifier: str, version: dict) ->
     else:
         verified, reason = False, "source_pending_or_failed"
     return {"arxiv_id": identifier, "version": tag, "source_status": status, "verified": verified,
-            "reason": reason, "tex_files": len(tex), "files": len(regular), "actual_size_bytes": actual_size,
+            "reason": reason, "tex_files": len(tex), "bbl_files": sum(p.suffix.lower() == ".bbl" for p in regular),
+            "files": len(regular), "actual_size_bytes": actual_size,
             "recorded_size_bytes": version.get("size_after_bytes"), "raw_dir": str(raw), "source_dir": str(directory)}
 
 
