@@ -1,5 +1,7 @@
 # Khôi phục lịch sử đóng góp — 06/11/2026
 
+**Trạng thái cuối:** theo yêu cầu của nhóm, nhánh chính và mặc định là `main`. Sau đợt khôi phục dưới đây, `main` được fast-forward từ `develop` để chứa đầy đủ source và lịch sử đóng góp.
+
 ## Trạng thái trước khi sửa
 
 - Repository source: `NguyenQuocDat06-AI/arxiv-harvester`.
@@ -33,3 +35,12 @@ Không đổi metadata của commit gốc, không tạo commit thay cho thành v
 - Các kết quả xác nhận remote, nhánh mặc định và URL Book được lưu trong `build/history_recovery_20261106/` sau khi push.
 
 Book tiếp tục dùng https://nguyenquocdat06-ai.github.io/arxiv-harvester-book/. Repository báo cáo và dữ liệu/số đo đã công bố không bị thay đổi trong đợt khôi phục.
+
+## Đặt lại `main` làm nhánh chính
+
+- Lấy lại các refs trên remote và xác nhận `main` là ancestor của `develop`.
+- Cập nhật tài liệu về vai trò hai nhánh: `main` là nhánh chính; `develop` là nhánh tích hợp.
+- Fast-forward `main` từ mốc khởi tạo `88aa738` tới lịch sử đã khôi phục của `develop`, gồm commit merge `6d1c614` và tài liệu đóng góp `fb9ccc0`.
+- Đồng bộ cả hai nhánh rồi đặt nhánh mặc định GitHub về `main`. Không viết lại các commit đã có.
+- Đối chiếu main/develop cùng HEAD, mọi tip feature gốc là ancestor của main, và các nhánh feature giữ nguyên SHA.
+- Lưu kết quả tại `build/history_recovery_20261106/main-before.json` và `main-final.json`; các tệp kiểm tra này giữ local.
