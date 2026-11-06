@@ -12,7 +12,7 @@ M1–M2 nộp link code và Jupyter Book. Dữ liệu làm việc giữ để x�
 
 Bản nộp tiến độ 06/11 dùng snapshot Drive 73 paper/119 version. Audit nguồn xác minh 118 version; parser có 81 success, 31 partial, 5 empty và 2 lỗi. Năm bảng hợp lệ về cấu trúc trên snapshot; chưa xử lý đủ toàn nhóm và chưa có benchmark M2 Colab CPU-only. [Link và hướng dẫn nộp](tasks/NOP_M1_M2_2026-11-06.md).
 
-Book có tám chương chính và hai phụ lục, gồm công thức thống kê, ví dụ parser thực thi từ source ghim, phân tích lỗi và lệnh tái lập. Nội dung chi tiết được sinh từ `tools/submission_report_content.py` qua bộ dựng báo cáo.
+Book có trang tổng quan riêng cho M1/M2, tám chương chi tiết, phần thảo luận và ba phụ lục. Các bảng chỉ tiêu có mẫu số; ví dụ parser chạy từ source ghim; biểu đồ tài nguyên parser lấy từ số đo thật. Nội dung được sinh từ `tools/submission_report_content.py` và `tools/submission_report_presentation.py`. Xem [các nguồn tham khảo và tiến trình chỉnh báo cáo](tasks/REPORT_REVIEW_2026-11-06.md).
 
 ## 1. Cài đặt và kiểm tra
 

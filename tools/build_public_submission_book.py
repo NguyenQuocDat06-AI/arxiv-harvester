@@ -27,6 +27,40 @@ def measurements(data, child_wall=None):
             'phases':data.get('phases',{})}
 
 
+def resource_profile(parsed: Path, stats: dict, window_sec=5.0):
+    """Aggregate numeric resource samples; omit run IDs and filesystem paths."""
+    run_id = stats.get('run_id')
+    samples = parsed / 'runs' / str(run_id) / 'resource_samples.jsonl'
+    if not run_id or not samples.is_file():
+        return None
+    windows = {}
+    counts = Counter()
+    with samples.open(encoding='utf-8') as stream:
+        for line in stream:
+            row = json.loads(line)
+            kind = row.get('kind')
+            if kind not in {'rss', 'disk'}:
+                continue
+            elapsed = float(row['elapsed_sec'])
+            if elapsed < 0 or elapsed > stats['runtime_sec'] + 1:
+                raise ValueError('Resource sample lies outside the measured run')
+            bucket = windows.setdefault(int(elapsed // window_sec), {'rss': [], 'disk': []})
+            bucket[kind].append(int(row['rss_bytes' if kind == 'rss' else 'total_bytes']))
+            counts[kind] += 1
+    rows = []
+    for index, bucket in sorted(windows.items()):
+        rss, disk = bucket['rss'], bucket['disk']
+        rows.append({
+            'window_start_sec': index * window_sec,
+            'window_end_sec': min((index + 1) * window_sec, stats['runtime_sec']),
+            'rss_sample_mean_mib': sum(rss) / len(rss) / 1024**2 if rss else None,
+            'rss_peak_mib': max(rss) / 1024**2 if rss else None,
+            'disk_peak_bytes': max(disk) if disk else None,
+        })
+    return {'window_sec': window_sec, 'rss_samples': counts['rss'],
+            'disk_samples': counts['disk'], 'rows': rows}
+
+
 def aggregate(snapshot: Path, parsed: Path, colab_run: Path):
     scope=json.loads((snapshot/'snapshot.json').read_text(encoding='utf-8'))
     stat=json.loads((parsed/'stats.json').read_text(encoding='utf-8'))
@@ -99,7 +133,8 @@ def aggregate(snapshot: Path, parsed: Path, colab_run: Path):
                     'versions_with_unmeasured_counts':stat.get('versions_with_unmeasured_counts'),
                     'structural_valid':quality['structural_valid'],'processing_complete':quality['processing_complete']},
               'crawler_measurement':crawl,'parser_measurement':{**measurements(stat),'final_output_bytes':stat['final_output_bytes'],
-                    'avg_sec_per_publication':stat['avg_sec_per_processed_publication']}}
+                    'avg_sec_per_publication':stat['avg_sec_per_processed_publication'],
+                    'resource_profile':resource_profile(parsed,stat)}}
     baseline=parsed.parent/'parsed/stats.json'
     if baseline.exists() and baseline.resolve()!=(parsed/'stats.json').resolve():
         old=json.loads(baseline.read_text(encoding='utf-8'))
