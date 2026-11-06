@@ -897,3 +897,5 @@ Notebook đọc `report_summary.json` và sinh bảng/biểu đồ khi build. C�
 
 Sửa `index.md`, notebook trong `chapters/` hoặc cập nhật thống kê có bằng chứng; build đạt rồi push `main`. Giữ nguyên tên tài khoản/repository và Pages để URL nộp không đổi. Không sửa trực tiếp HTML trong `_build/`.
 ''',encoding='utf-8')
+    from tools.submission_report_presentation import present
+    present(output, summary)
