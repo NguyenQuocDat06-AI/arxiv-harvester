@@ -182,7 +182,8 @@ print('Profiler time và child wall khác phạm vi; không sửa log để đ�
  'Parser tìm root có documentclass, duyệt include từ thư mục biên dịch và lưu source map. Paragraph/sentence được chia ngoài nhóm TeX và toán. Các node list, figure/table, acknowledgements và appendix được giữ, bibliography tách khỏi hierarchy. Root mơ hồ được cấu hình khi có bằng chứng; ca chưa chọn được vẫn là lỗi. Mã P001… chỉ là nhãn coverage, không công bố ID hoặc nội dung source.',
  """m=data['m2']; display(pd.Series(m['status_counts'],name='versions').to_frame())
 pd.Series(m['status_counts']).plot.bar(title='Kết quả parser theo version',ylabel='Số version'); plt.tight_layout(); plt.show()
-display(pd.DataFrame(m['coverage']))
+with pd.option_context('display.max_rows',None,'display.max_columns',None):
+ display(pd.DataFrame(m['coverage']))
 display(pd.Series(m['diagnostic_categories'],name='versions_with_diagnostic').to_frame())
 print('Mỗi version trong snapshot đều có manifest, kể cả empty và lỗi; recorded coverage không đồng nghĩa success.')
 """),

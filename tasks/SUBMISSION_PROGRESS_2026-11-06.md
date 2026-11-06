@@ -8,8 +8,8 @@ Phạm vi được yêu cầu: dùng tạm dữ liệu Drive đã có, không c�
 - [x] Tạo snapshot 73 paper/119 version; audit xác minh 118 version (113 TeX, 5 empty), còn một version nguồn lỗi. Course export có 73 paper/200 cạnh arXiv, cấu trúc hợp lệ.
 - [x] Chạy parser và validation: 81 success, 31 partial, 5 empty, 1 root mơ hồ, 1 thiếu nguồn. Năm bảng hợp lệ; chưa đạt processing_complete.
 - [x] Hoàn thiện báo cáo tám chương, bảng/biểu đồ được sinh khi build và ghi rõ giới hạn benchmark.
-- [ ] Dựng Book, xuất bản trên repository báo cáo riêng và xác minh link public.
-- [ ] Ghi link và hướng dẫn thao tác nộp Moodle.
+- [x] Dựng Book và xuất bản trên repository báo cáo riêng. Workflow Pages đạt; HTTP không đăng nhập cho trang mở đầu, tám chương và bảy hình đều 200.
+- [x] Ghi link và hướng dẫn thao tác nộp Moodle trong `tasks/NOP_M1_M2_2026-11-06.md`; chưa thao tác nút nộp trong Moodle.
 
 Không thay dữ liệu gốc trên Drive. File test giữ local theo yêu cầu trước đó.
 
@@ -24,4 +24,8 @@ Không thay dữ liệu gốc trên Drive. File test giữ local theo yêu cầu
 
 25 kiểm tra parser/gathering local đạt. Parser mới thực sự chạy trên Windows CPU trong 143,052 giây cho 73 paper; không trình bày thành số đo Colab. Lượt Colab gốc `20261104T115511Z-d7e4bba4` được giữ riêng: 261,958 giây profiler, 263,652 giây child wall, trạng thái paused_rate_limit.
 
-Lần push bản chứa Parquet và metadata Drive bị automatic approval review từ chối. Đã giữ bản đó local và dựng repository sạch khác: chỉ 17 file source/thống kê tổng hợp, không có ID/text paper, Parquet, manifest hoặc log Drive. Bản công khai đã được push tới repository `NguyenQuocDat06-AI/arxiv-harvester-book`; đang chờ workflow Pages.
+Lần push bản chứa Parquet và metadata Drive bị automatic approval review từ chối. Đã giữ bản đó local và dựng repository sạch khác: chỉ 17 file source/thống kê tổng hợp, không có ID/text paper, Parquet, manifest hoặc log Drive. Bản công khai đã được push tới repository `NguyenQuocDat06-AI/arxiv-harvester-book`; Pages đã deploy thành công.
+
+Link Book: https://nguyenquocdat06-ai.github.io/arxiv-harvester-book/
+
+Link code: https://github.com/NguyenQuocDat06-AI/arxiv-harvester/tree/develop
