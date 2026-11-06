@@ -148,6 +148,10 @@ class CheckpointBackup:
         if include_outputs or not self.previous:
             for path in walk(self.shard):
                 if path.is_file() and "_checkpoint" not in path.relative_to(self.shard).parts:
+                    # The profiler still appends until this run's stats are exported.
+                    if (path.name == "resource_samples.jsonl" and path.parent.parent.name == "runs"
+                            and not (path.parent / "stats.json").is_file()):
+                        continue
                     files["shard/" + path.relative_to(self.shard).as_posix()] = path
         signatures = {name: (path.stat().st_mtime_ns, path.stat().st_size) for name, path in files.items()}
         files = {name: path for name, path in files.items()

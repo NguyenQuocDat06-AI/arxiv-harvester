@@ -93,6 +93,7 @@ class ResourceProfiler:
         sample_interval_sec: float = 0.5,
         watch_dirs: dict[str, str] | None = None,
         disk_interval_sec: float = 5.0,
+        samples_path: str | Path | None = None,
     ) -> None:
         if not math.isfinite(sample_interval_sec) or sample_interval_sec <= 0:
             raise ValueError("sample_interval_sec phải lớn hơn 0")
@@ -100,6 +101,8 @@ class ResourceProfiler:
             raise ValueError("disk_interval_sec phải lớn hơn 0")
         self.sample_interval_sec = sample_interval_sec
         self.disk_interval_sec = disk_interval_sec
+        self.samples_path = Path(samples_path) if samples_path is not None else None
+        self._sample_write_error = None
         self._last_disk_sample = None
         self.watch_dirs = dict(watch_dirs or {})
         self._process = psutil.Process()
@@ -127,6 +130,10 @@ class ResourceProfiler:
             label: dir_size_bytes(path) for label, path in self.watch_dirs.items()
         }
         self._start_perf = time.perf_counter()
+        if self.samples_path is not None:
+            self.samples_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.samples_path.open("x", encoding="utf-8"):
+                pass
         self._sample()
         self._thread = threading.Thread(
             target=self._sampling_loop, name="resource-profiler", daemon=True
@@ -175,6 +182,16 @@ class ResourceProfiler:
             if disk:
                 self._disk_samples.append({"elapsed_sec": timestamp - self._start_perf,
                                            "total_bytes": sum(sizes[label] for label, _ in roots), "dirs": sizes})
+            if self.samples_path is not None:
+                rows = [{"kind": "rss", "elapsed_sec": timestamp - self._start_perf, "rss_bytes": rss}]
+                if disk:
+                    rows.append({"kind": "disk", **self._disk_samples[-1]})
+                try:
+                    with self.samples_path.open("a", encoding="utf-8") as stream:
+                        for row in rows:
+                            stream.write(json.dumps(row) + "\n")
+                except OSError as error:
+                    self._sample_write_error = repr(error)
 
     def capture(self, disk: bool = True) -> None:
         if self._start_perf is not None and self._end_perf is None:
@@ -267,13 +284,17 @@ class ResourceProfiler:
             }
             samples_path = Path(output_json_path).parent / "resource_samples.jsonl"
             samples_path.parent.mkdir(parents=True, exist_ok=True)
-            with samples_path.open("w", encoding="utf-8") as stream:
+            samples_temporary = samples_path.with_name(samples_path.name + ".tmp")
+            with samples_temporary.open("w", encoding="utf-8") as stream:
                 for timestamp, rss in zip(timestamps, samples):
                     stream.write(json.dumps({"kind": "rss", "elapsed_sec": timestamp - self._start_perf, "rss_bytes": rss}) + "\n")
                 for sample in disk_samples:
                     stream.write(json.dumps({"kind": "disk", **sample}) + "\n")
+            samples_temporary.replace(samples_path)
             self._result["samples_file"] = str(samples_path)
         result = {**self._result, **(extra or {})}
+        if self._sample_write_error is not None:
+            result["sample_log_error"] = self._sample_write_error
         _write_json_atomic(output_json_path, result)
         return result
 
