@@ -12,6 +12,7 @@ class Gathered:
     files: list[str]
     source_map: list[dict]
     diagnostics: list[str] = field(default_factory=list)
+    bibliography_files: list[str] = field(default_factory=list)
 
 
 def read_text(path: Path) -> str:

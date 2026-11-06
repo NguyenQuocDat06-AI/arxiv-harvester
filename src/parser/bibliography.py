@@ -6,7 +6,7 @@ import hashlib
 from pathlib import Path
 import re
 from .gather import Gathered, read_text
-from .latex import commands, group, sentences
+from .latex import commands, group, sentences, strip_comments
 from .normalize import CITES, normalize
 
 
@@ -187,45 +187,15 @@ def cited_keys(text: str) -> set[str]:
     return keys
 
 
-def extract_entries(gathered: Gathered, version_dir: str | Path, version: int) -> tuple[list[Entry], list[str]]:
-    directory = Path(version_dir).resolve()
-    files, diagnostics, entries = set(), [], []
-    macros = {}
-    source_starts = [row["start"] for row in gathered.source_map]
-    for command in commands(gathered.text):
-        location = bisect_right(source_starts, command.start) - 1
-        filename = gathered.source_map[location]["file"] if location >= 0 else gathered.root
-        if command.name not in {"bibliography", "addbibresource"} or not command.args:
-            continue
-        for name in command.args[0].split(","):
-            path = (directory / filename).parent / name.strip()
-            if not path.suffix:
-                path = path.with_suffix(".bib")
-            path = path.resolve()
-            if not path.is_relative_to(directory) or not path.is_file():
-                diagnostics.append(f"missing/unsafe bibliography: {name}")
-            elif path not in files:
-                files.add(path)
-                try:
-                    entries.extend(parse_bibtex(read_text(path), version, macros))
-                except ValueError as error:
-                    diagnostics.append(f"{path.name}: {error}")
-    used = cited_keys(gathered.text)
-    if "*" not in used:
-        # Include crossref parents of cited entries.
-        by_key = {entry.key: entry for entry in entries}
-        wanted = set(used)
-        for _ in range(len(entries)):
-            extra = {by_key[key].fields["crossref"] for key in wanted if key in by_key and by_key[key].fields.get("crossref")}
-            if extra.issubset(wanted):
-                break
-            wanted.update(extra)
-        entries = [entry for entry in entries if entry.key in wanted]
-    bibitems = [command for command in commands(gathered.text) if command.name == "bibitem" and command.args]
+def parse_bibitems(text: str, version: int) -> list[Entry]:
+    """Recover available fields while keeping the original citation text."""
+    text = strip_comments(text)
+    entries = []
+    bibitems = [command for command in commands(text) if command.name == "bibitem" and command.args]
     for index, command in enumerate(bibitems):
-        end = bibitems[index + 1].start if index + 1 < len(bibitems) else gathered.text.find(r"\end{thebibliography}", command.end)
-        end = len(gathered.text) if end < 0 else end
-        raw = gathered.text[command.end:end].strip()
+        end = bibitems[index + 1].start if index + 1 < len(bibitems) else text.find(r"\end{thebibliography}", command.end)
+        end = len(text) if end < 0 else end
+        raw = text[command.end:end].strip()
         pieces = [part.strip() for part in re.split(r"\\newblock\s*", raw) if part.strip()]
         if len(pieces) < 2:
             pieces = sentences(raw)
@@ -240,6 +210,86 @@ def extract_entries(gathered: Gathered, version_dir: str | Path, version: int) -
             fields["author"] = normalize(pieces[0]).rstrip(".")
             fields["title"] = normalize(pieces[1]).rstrip(".")
         entries.append(Entry(command.args[0], "misc", fields, version, raw))
+    return entries
+
+
+def _compiled_bibliography(gathered: Gathered, directory: Path, candidates: list[Path], version: int):
+    root_bbl = (directory / gathered.root).with_suffix(".bbl")
+    options = [root_bbl] if root_bbl.exists() else list(dict.fromkeys(p for p in candidates if p.exists()))
+    if len(options) > 1:
+        return [], ["ambiguous compiled bibliography; original .bbl files retained"]
+    if not options:
+        return [], []
+    path = options[0].resolve()
+    if not path.is_relative_to(directory) or not path.is_file():
+        return [], ["unsafe compiled bibliography path"]
+    relative = path.relative_to(directory).as_posix()
+    try:
+        entries = parse_bibitems(read_text(path), version)
+    except (OSError, ValueError) as error:
+        return [], [f"unreadable compiled bibliography {relative}: {error}"]
+    if relative not in gathered.bibliography_files:
+        gathered.bibliography_files.append(relative)
+    if not entries:
+        return [], [f"unsupported/empty compiled bibliography: {relative}; original retained"]
+    return entries, []
+
+
+def extract_entries(gathered: Gathered, version_dir: str | Path, version: int) -> tuple[list[Entry], list[str]]:
+    directory = Path(version_dir).resolve()
+    files, diagnostics, entries = set(), [], []
+    missing, bbl_candidates, has_bibliography = [], [], False
+    macros = {}
+    source_starts = [row["start"] for row in gathered.source_map]
+    for command in commands(gathered.text):
+        location = bisect_right(source_starts, command.start) - 1
+        filename = gathered.source_map[location]["file"] if location >= 0 else gathered.root
+        if command.name == "printbibliography":
+            has_bibliography = True
+        if command.name not in {"bibliography", "addbibresource"} or not command.args:
+            continue
+        has_bibliography = True
+        for name in command.args[0].split(","):
+            path = (directory / filename).parent / name.strip()
+            if not path.suffix:
+                path = path.with_suffix(".bib")
+            bbl_candidates.append(path.with_suffix(".bbl"))
+            path = path.resolve()
+            if not path.is_relative_to(directory):
+                diagnostics.append(f"unsafe bibliography: {name}")
+            elif not path.is_file():
+                missing.append(f"missing/unsafe bibliography: {name}")
+            elif path not in files:
+                files.add(path)
+                try:
+                    entries.extend(parse_bibtex(read_text(path), version, macros))
+                    relative = path.relative_to(directory).as_posix()
+                    if relative not in gathered.bibliography_files:
+                        gathered.bibliography_files.append(relative)
+                except ValueError as error:
+                    missing.append(f"{path.name}: {error}")
+    used = cited_keys(gathered.text)
+    inline = parse_bibitems(gathered.text, version)
+    known = {entry.key for entry in [*entries, *inline]}
+    recovered = []
+    if has_bibliography and (missing or not known or (used - {"*"}) - known):
+        recovered, errors = _compiled_bibliography(gathered, directory, bbl_candidates, version)
+        diagnostics.extend(errors)
+        if recovered:
+            missing = []
+    diagnostics.extend(missing)
+    if "*" not in used:
+        # Include crossref parents of cited entries.
+        by_key = {entry.key: entry for entry in entries}
+        wanted = set(used)
+        for _ in range(len(entries)):
+            extra = {by_key[key].fields["crossref"] for key in wanted if key in by_key and by_key[key].fields.get("crossref")}
+            if extra.issubset(wanted):
+                break
+            wanted.update(extra)
+        entries = [entry for entry in entries if entry.key in wanted]
+    entries.extend(inline)
+    entries.extend(entry for entry in recovered if entry.key not in known)
     return entries, diagnostics
 
 

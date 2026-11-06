@@ -63,7 +63,8 @@ def enrich_references(shard_dir: str, output_dir: str, raw_dir: str | None = Non
                     break
                 for reference in rows:
                     identifier = reference.get("ref_arxiv_id")
-                    if not identifier or reference.get("ref_s2_id"):
+                    fields = ("ref_s2_id", "ref_title", "ref_authors", "ref_year", "ref_doi", "ref_venue", "ref_submission_date")
+                    if not identifier or all(reference.get(field) for field in fields):
                         continue
                     cache = cache_dir / (identifier.replace("/", "_") + ".json")
                     try:
@@ -80,7 +81,7 @@ def enrich_references(shard_dir: str, output_dir: str, raw_dir: str | None = Non
                             _write_json_atomic(str(cache), metadata)
                         enriched = s2._record_from_s2(reference["arxiv_id"], metadata)
                         changed = []
-                        for field in ("ref_s2_id", "ref_title", "ref_authors", "ref_year", "ref_doi", "ref_venue"):
+                        for field in fields:
                             if not reference.get(field) and enriched.get(field):
                                 reference[field] = enriched[field]
                                 changed.append(field)
@@ -89,8 +90,9 @@ def enrich_references(shard_dir: str, output_dir: str, raw_dir: str | None = Non
                             report["field_provenance"].append({"arxiv_id": reference["arxiv_id"], "ref_arxiv_id": identifier,
                                                                 "fields": changed, "metadata_source": "semantic_scholar",
                                                                 "edge_source": reference.get("source"),
+                                                                "date_source": "semantic_scholar.publicationDate" if "ref_submission_date" in changed else None,
                                                                 "publication_date": metadata.get("publicationDate")})
-                        # Keep edge provenance; S2 publicationDate is not a verified arXiv submission date.
+                        # QA permits publicationDate here; existing dates and edge provenance stay unchanged.
                     except Exception as error:
                         report["errors"][identifier] = str(error)
                         cooldown = s2.rate_limiter.policy.snapshot("semantic_scholar")["remaining_sec"]

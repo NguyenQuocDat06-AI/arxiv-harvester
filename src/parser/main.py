@@ -76,7 +76,7 @@ def fingerprint(paper: dict, raw: Path, code_hash: str, preferred_root: str | di
         directory = raw / "unzipped" / paper["id"].replace("/", "_") / version["version"]
         if directory.exists():
             for path in sorted(directory.rglob("*")):
-                if path.is_file() and path.suffix.lower() in {".tex", ".bib"}:
+                if path.is_file() and path.suffix.lower() in {".tex", ".bib", ".bbl"}:
                     if not path.resolve().is_relative_to(directory.resolve()) or path.is_symlink():
                         raise ValueError("Source link escapes/is outside the version corpus")
                     digest.update(path.relative_to(directory).as_posix().encode())
@@ -111,9 +111,11 @@ def process_publication(paper: dict, raw: Path, preferred_root: str | dict | Non
                 trees[number] = tree
                 entries.extend(bibliography)
                 gathering[number] = {"root": gathered.root, "files": gathered.files, "source_map": gathered.source_map,
+                                     "bibliography_files": gathered.bibliography_files,
                                      "cited_keys": sorted(cited_keys(gathered.text) - {"*"})}
                 manifest.update({"root": gathered.root, "root_selection": "configured" if selected_root else "unique_candidate",
-                                 "files": gathered.files, "elements_before": len(tree.nodes),
+                                 "files": gathered.files, "bibliography_files": gathered.bibliography_files,
+                                 "elements_before": len(tree.nodes),
                                  "counts_measured": True,
                                  "bibtex_before": len(bibliography), "diagnostics": [*gathered.diagnostics, *tree.diagnostics, *bib_errors]})
                 manifest["status"] = "partial" if manifest["diagnostics"] else "success"

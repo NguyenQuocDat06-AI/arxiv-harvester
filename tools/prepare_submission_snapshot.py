@@ -72,7 +72,7 @@ def prepare(downloads: Path, output: Path, inventory: Path) -> dict:
                 if not member.isfile():
                     raise ValueError('Non-file archive member')
                 payload = archive.extractfile(member).read()
-                if member.name.startswith('raw/') and (name.suffix.lower() in {'.tex', '.bib'} or name.parts[1] == 'manifests'):
+                if member.name.startswith('raw/') and (name.suffix.lower() in {'.tex', '.bib', '.bbl'} or name.parts[1] == 'manifests'):
                     target = output.joinpath(*name.parts)
                     if not target.resolve().is_relative_to(raw.resolve()):
                         raise ValueError('Raw path escapes snapshot')
