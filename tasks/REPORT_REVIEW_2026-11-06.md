@@ -45,6 +45,7 @@ Giữ snapshot 73 paper/119 version và các số đo đã lưu. M1 là lượt 
 - Kiểm tra public: 15 trang, 15 hình và `_static/report.css` trả HTTP 200; trang đầu hiển thị nội dung mới. Tệp kết quả ở `build/submission_20261106/public_verification.json`.
 - Source Book gồm 24 file, không lưu output notebook; dữ liệu nguồn và log gốc không được đưa lên GitHub.
 - Source crawler/parser không thay đổi trong đợt chỉnh trình bày này. Hai repository và URL nộp được giữ nguyên.
+- Generator giữ cấu hình `PYTHONPATH` của workflow Pages đã dùng thành công, để source sinh mới khớp cách triển khai hiện hành.
 
 URL giữ xuyên suốt: https://nguyenquocdat06-ai.github.io/arxiv-harvester-book/.
 

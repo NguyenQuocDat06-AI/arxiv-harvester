@@ -344,6 +344,8 @@ jobs:
           cache: pip
       - run: python -m pip install -r requirements.txt
       - run: jupyter-book build . --all -W
+        env:
+          PYTHONPATH: ${{ github.workspace }}
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v4
         with:
