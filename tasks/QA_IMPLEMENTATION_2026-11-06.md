@@ -34,7 +34,7 @@ Số liệu 73 paper/119 version và hai lượt đo lịch sử giữ nguyên. 
 - [x] Cập nhật nội dung Book, hai chương chính và đối chiếu QA.
 - [x] Kiểm tra local, build Book và giữ tests local.
 - [x] Commit/push source `main`, đồng bộ `develop`.
-- [ ] Deploy vào repository Book hiện có và kiểm tra URL public.
+- [x] Deploy vào repository Book hiện có và kiểm tra URL public.
 
 Kiểm tra chức năng: `python -m pytest -q` đạt **281 passed** trong **56,87 giây**. Test giữ local. Công cụ tổng hợp đã đọc hai lượt M1/M2 cũ riêng biệt; số đo giữ 261,958 giây profiler/263,652 giây child wall ở M1 và 143,052 giây Windows ở M2.
 
@@ -47,7 +47,7 @@ Book local build đạt với `--all -W`: **16 trang, 47 code cell thực thi, 1
 - Code chức năng: `6cd8dac6d1491083286d538dd7fffacf66f4cc4c`.
 - Template/nội dung QA và notebook Colab: `a3f5acf`, đã push lên `main` và `develop`.
 - Source Book: `1d600417dfdc64c0c24ea35a51c0462a25525d17`, đã push vào repository báo cáo hiện có.
-- Workflow Pages: https://github.com/NguyenQuocDat06-AI/arxiv-harvester-book/actions/runs/42236777130.
+- Workflow Pages thành công: https://github.com/NguyenQuocDat06-AI/arxiv-harvester-book/actions/runs/42253065090.
 - URL nộp giữ nguyên: https://nguyenquocdat06-ai.github.io/arxiv-harvester-book/.
 
 Lần deploy đầu đã build đạt nhưng bước Pages timeout sau 10 phút. Đã chạy lại job của cùng commit; số liệu và source Book không thay đổi trong lần chạy lại.
@@ -55,3 +55,13 @@ Lần deploy đầu đã build đạt nhưng bước Pages timeout sau 10 phút.
 Lần chạy lại gặp hai artifact `github-pages` trùng tên trong cùng run. Run mới `42239170503` có một artifact nhưng Pages trả `cancelled` ngay cho SHA đã bị hủy trước đó. Workflow được sửa để tên artifact chứa `run_id` và `run_attempt`, khớp giữa upload/deploy, và cho phép chờ Pages tối đa 20 phút. Generator giữ cùng cấu hình để các lần dựng source sau không làm mất sửa đổi. Thay đổi workflow tạo commit mới; không viết lại lịch sử hay thay URL.
 
 Lần commit Book đầu bị dừng vì automatic approval review không chạy được do hạn mức. Ở lượt tiếp tục, bước duyệt đã thực hiện được và commit/push hoàn tất; không đổi đường xuất bản hay bỏ qua bước duyệt.
+
+## Xác nhận hoàn tất
+
+- Nội dung QA ở commit Book `1d60041`; workflow đã sửa ở `abcda213b809c8d8edcb9ba3710d92d6221c895c`.
+- Workflow `42253065090` hoàn tất với `success`; backend Pages trả `succeed`.
+- Kiểm tra không đăng nhập: 16 trang nội dung, 15 hình và stylesheet đều trả HTTP 200. Trang đầu có mốc nộp tiến độ, phụ lục QA đã hiển thị. Kết quả tại `build/submission_20261106/public_verification.json`.
+- Các số đo cũ giữ nguyên; bảng tổng hợp phiên M1 và M2 được tách riêng. Nguồn Book không chứa corpus, log gốc hoặc output notebook.
+- Nhánh chính/mặc định vẫn là `main`; `develop` được đồng bộ. Các nhánh và commit gốc của thành viên được giữ.
+
+Bản Book đã cập nhật để nộp link tiến độ. Việc thu thập đủ dải nhóm, xử lý các phần partial/error và benchmark cuối trên Colab vẫn cần được hoàn thiện trước hạn Poster theo QA.
