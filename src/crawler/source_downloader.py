@@ -1,5 +1,7 @@
 """Tải và dọn mã nguồn. Phụ trách: Nguyễn Đình Tuấn (24120237)."""
 
+import concurrent.futures
+import contextlib
 import gzip
 import http.client
 import logging
@@ -27,13 +29,29 @@ from .request_policy import CooldownDeferred
 
 logger = logging.getLogger(__name__)
 
-# Kích thước chunk: 64 KiB.
-CHUNK_SIZE: int = 64 * 1024
+# Kích thước chunk: 512 KiB.
+CHUNK_SIZE: int = 512 * 1024
 
 # Nhịp full-text; metadata có cấu hình riêng.
 DEFAULT_RATE_LIMIT_SEC: float = 3.0
-RESUME_SEGMENTS = (1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024)
+ARXIV_COOLDOWN_FLOOR_SEC: float = 15.0
+RESUME_SEGMENTS = (16 * 1024 * 1024, 32 * 1024 * 1024, 64 * 1024 * 1024)
 _SOURCE_TRANSFER_LOCK = threading.RLock()
+
+ALLOWED_SOURCE_ENDPOINTS: frozenset[str] = frozenset({"src", "e-print"})
+DEFAULT_SOURCE_ENDPOINT: str = "src"
+SOURCE_ENDPOINT: str = DEFAULT_SOURCE_ENDPOINT
+HEAVY_ARCHIVE_BYTES: int = 20 * 1024 * 1024
+HEAVY_INTERRUPTIONS_LIMIT: int = 1
+
+
+def validate_source_endpoint(endpoint: str) -> str:
+    """Xác thực source endpoint trong allowlist {'src', 'e-print'}."""
+    if not isinstance(endpoint, str) or endpoint not in ALLOWED_SOURCE_ENDPOINTS:
+        raise ValueError(
+            f"Source endpoint không hợp lệ: {endpoint!r}. Phải là một trong {sorted(ALLOWED_SOURCE_ENDPOINTS)}"
+        )
+    return endpoint
 
 
 DEFAULT_USER_AGENT: str = (
@@ -205,7 +223,8 @@ def _safe_extract_tar(
     size_before_bytes = 0
     size_after_bytes = 0
 
-    for member in tar.getmembers():
+    members_iter = iter(tar.next, None) if (isinstance(tar, tarfile.TarFile) or hasattr(tar, "next")) else tar.getmembers()
+    for member in members_iter:
         # Kiểm tra an toàn đường dẫn
         name = member.name.replace("\\", "/")
         parts = name.split("/")
@@ -337,15 +356,26 @@ def _download_stream(
     read_timeout_sec: float = 180.0,
     diagnostics: dict | None = None,
     max_elapsed_sec: float = 180.0,
+    open_ended_range: bool = False,
+    source_endpoint: str = DEFAULT_SOURCE_ENDPOINT,
+    allow_defer_heavy: bool = False,
 ) -> int:
-    """Tải theo luồng từ export.arxiv.org/src/{id} với rate-limiting tập trung."""
+    """Tải theo luồng từ export.arxiv.org/{endpoint}/{id} với rate-limiting tập trung."""
+    validate_source_endpoint(source_endpoint)
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.netloc and parsed.netloc != "export.arxiv.org":
+        raise ValueError(f"Host must be export.arxiv.org, got: {parsed.netloc}")
+
     partial_path = dest_path.with_name(dest_path.name + ".part")
     details = diagnostics if diagnostics is not None else {}
-    details.update(source_url=url, attempts=0)
+    details.update(source_url=url, attempts=0, deferred_heavy=False)
     started = time.monotonic()
     deadline = started + max_elapsed_sec
     attempt = 1
     segment_index = 0
+    known_total_size = details.get("total_bytes")
+    heavy_interruptions = 0
 
     while attempt <= max_retries:
         try:
@@ -357,7 +387,10 @@ def _download_stream(
 
         offset = partial_path.stat().st_size if partial_path.exists() else 0
         if offset > 0:
-            request_headers["Range"] = f"bytes={offset}-{offset + RESUME_SEGMENTS[segment_index] - 1}"
+            if open_ended_range or RESUME_SEGMENTS is None:
+                request_headers["Range"] = f"bytes={offset}-"
+            else:
+                request_headers["Range"] = f"bytes={offset}-{offset + RESUME_SEGMENTS[segment_index] - 1}"
 
         try:
             remaining = deadline - time.monotonic()
@@ -366,112 +399,204 @@ def _download_stream(
             details["attempts"] = attempt
             details["requests"] = details.get("requests", 0) + 1
             request_started = time.monotonic()
-            with session.get(
-                url,
-                stream=True,
-                timeout=(min(15.0, remaining), min(read_timeout_sec, remaining)),
-                headers=request_headers,
-            ) as response:
-                details["http_status"] = response.status_code
-                if response.status_code == 429:
-                    delay = rate_limiter.policy.limited("arxiv", response)
-                    details.update(error_message="HTTP 429; tạm dừng tải và giữ partial", rate_limited=True,
-                                   retry_after_sec=delay, next_retry_at=rate_limiter.policy.snapshot("arxiv")["next_retry_at"])
-                    return 429
-                if response.status_code == 404:
-                    partial_path.unlink(missing_ok=True)
-                    return 404
+            retry_delay = None
+            clean_completion = False
+            try:
+                with session.get(
+                    url,
+                    stream=True,
+                    timeout=(min(15.0, remaining), min(read_timeout_sec, remaining)),
+                    headers=request_headers,
+                ) as response:
+                    details["http_status"] = response.status_code
+                    if response.status_code == 429:
+                        delay = rate_limiter.policy.limited("arxiv", response, floor=ARXIV_COOLDOWN_FLOOR_SEC)
+                        details.update(error_message="HTTP 429; tạm dừng tải và giữ partial", rate_limited=True,
+                                       retry_after_sec=delay, next_retry_at=rate_limiter.policy.snapshot("arxiv")["next_retry_at"])
+                        return 429
+                    if response.status_code == 404:
+                        rate_limiter.policy.succeeded("arxiv")
+                        partial_path.unlink(missing_ok=True)
+                        clean_completion = True
+                        return 404
 
-                if response.status_code == 416:
-                    partial_path.unlink(missing_ok=True)
-                    offset = 0
-                    segment_index = 0
-                    attempt += 1
-                    continue
+                    if response.status_code == 416:
+                        partial_path.unlink(missing_ok=True)
+                        offset = 0
+                        segment_index = 0
+                        attempt += 1
+                        continue
 
-                if response.status_code in (500, 502, 503, 504):
-                    segment_index = max(0, segment_index - 1)
-                    retry_sec = _retry_after_seconds(response)
-                    delay = retry_sec if retry_sec is not None else (attempt * 5.0)
-                    details["error_message"] = f"HTTP {response.status_code} khi tải nguồn"
-                    rate_limiter.defer("arxiv", delay)
-                    if attempt == max_retries or delay >= deadline - time.monotonic():
-                        logger.warning("Nguồn %s: HTTP %d, hết %d lượt; giữ để retry", url, response.status_code, attempt)
-                        return response.status_code
-                    logger.warning("Nguồn %s: HTTP %d, thử %d/%d, chờ %.1fs", url, response.status_code, attempt, max_retries, delay)
-                    time.sleep(delay)
-                    attempt += 1
-                    continue
-
-                append_mode = offset > 0 and response.status_code == 206
-                if response.status_code not in (200, 206):
-                    response.raise_for_status()
-                if response.status_code == 206:
-                    content_range = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("Content-Range", ""))
-                    if (not content_range or int(content_range[1]) != offset
-                            or not offset <= int(content_range[2]) < int(content_range[3])):
-                        raise ValueError("Source Content-Range does not match the requested resume offset")
-
-                mode = "ab" if append_mode else "wb"
-                downloaded = offset if append_mode else 0
-
-                stream_iter = _response_chunks(response, chunk_size)
-                expected_bytes = (int(content_range[3]) if response.status_code == 206 else
-                                  int(response.headers["Content-Length"]) if response.headers.get("Content-Length") is not None else None)
-
-                next_progress = time.monotonic() + 10
-                early_pdf = False
-                with partial_path.open(mode) as f_out:
-                    for chunk in stream_iter:
-                        if not chunk:
-                            continue
-                        # Phát hiện sớm PDF-only
-                        if downloaded == 0 and (chunk.startswith(b"%PDF-") or b"%PDF-" in chunk[:16]):
-                            early_pdf = True
-                            break
-
-                        downloaded += len(chunk)
-                        if downloaded > max_download_bytes:
-                            raise ValueError(f"Dung lượng tải vượt quá giới hạn {max_download_bytes} byte")
-                        f_out.write(chunk)
-                        details["bytes_downloaded"] = downloaded
-                        if time.monotonic() >= next_progress:
-                            logger.info("Đang tải %s: %.1f MiB", url, downloaded / 1024**2)
-                            next_progress = time.monotonic() + 10
-                        if time.monotonic() >= deadline and downloaded != expected_bytes:
-                            raise TimeoutError("Hết ngân sách thời gian tải; giữ file .part để resume")
-
-                if early_pdf:
-                    partial_path.unlink(missing_ok=True)
-                    return _STATUS_EARLY_PDF
-
-                if response.status_code == 206 and downloaded != int(content_range[2]) + 1:
-                    raise requests.exceptions.ChunkedEncodingError("Source range ended before the advertised segment")
-                length = response.headers.get("Content-Length")
-                received = downloaded - (offset if append_mode else 0)
-                if length is not None and received != int(length):
-                    raise requests.exceptions.ChunkedEncodingError("Source body does not match Content-Length")
-
-                if response.status_code == 206 and downloaded < int(content_range[3]):
-                    if time.monotonic() - request_started <= 10:
-                        segment_index = min(len(RESUME_SEGMENTS) - 1, segment_index + 1)
-                    else:
+                    if response.status_code in (500, 502, 503, 504):
                         segment_index = max(0, segment_index - 1)
-                    rate_limiter.policy.succeeded("arxiv")
-                    continue
+                        retry_sec = _retry_after_seconds(response)
+                        delay = retry_sec if retry_sec is not None else (attempt * 5.0)
+                        details["error_message"] = f"HTTP {response.status_code} khi tải nguồn"
+                        rate_limiter.defer("arxiv", delay)
+                        if attempt == max_retries or delay >= deadline - time.monotonic():
+                            logger.warning("Nguồn %s: HTTP %d, hết %d lượt; giữ để retry", url, response.status_code, attempt)
+                            return response.status_code
+                        logger.warning("Nguồn %s: HTTP %d, thử %d/%d, chờ %.1fs", url, response.status_code, attempt, max_retries, delay)
+                        retry_delay = delay
+                        attempt += 1
 
-                if partial_path.exists():
-                    partial_path.replace(dest_path)
-                rate_limiter.policy.succeeded("arxiv")
-                details.update(bytes_downloaded=downloaded, error_message=None)
-                return 200
+                    if retry_delay is None:
+                        append_mode = offset > 0 and response.status_code == 206
+                        if response.status_code not in (200, 206):
+                            response.raise_for_status()
+
+                        rate_limiter.policy.succeeded("arxiv")
+
+                        ct = response.headers.get("Content-Type", "").lower()
+                        if "application/pdf" in ct:
+                            partial_path.unlink(missing_ok=True)
+                            clean_completion = True
+                            return _STATUS_EARLY_PDF
+
+                        if response.status_code == 200:
+                            cl = response.headers.get("Content-Length")
+                            if cl is not None:
+                                try:
+                                    known_total_size = int(cl)
+                                    details["total_bytes"] = known_total_size
+                                except (ValueError, TypeError):
+                                    pass
+
+                        content_range = None
+                        total_size = None
+                        if response.status_code == 206:
+                            content_range = re.fullmatch(r"bytes (\d+)-(\d+)/(?:\*|(\d+))", response.headers.get("Content-Range", ""))
+                            if (not content_range or int(content_range[1]) != offset
+                                    or not offset <= int(content_range[2])):
+                                raise ValueError("Source Content-Range does not match the requested resume offset")
+                            total_size = int(content_range[3]) if content_range[3] else None
+                            if total_size is not None and int(content_range[2]) >= total_size:
+                                raise ValueError("Source Content-Range does not match the requested resume offset")
+                            if total_size is not None:
+                                known_total_size = total_size
+                                details["total_bytes"] = known_total_size
+
+                        mode = "ab" if append_mode else "wb"
+                        downloaded = offset if append_mode else 0
+
+                        stream_iter = _response_chunks(response, chunk_size)
+                        expected_bytes = (total_size if (response.status_code == 206 and total_size is not None) else
+                                          int(response.headers["Content-Length"]) if response.headers.get("Content-Length") is not None else None)
+
+                        next_progress = time.monotonic() + 10
+                        early_pdf = False
+                        with partial_path.open(mode) as f_out:
+                            for chunk in stream_iter:
+                                if not chunk:
+                                    continue
+                                # Phát hiện sớm PDF-only
+                                if downloaded == 0 and (chunk.startswith(b"%PDF-") or b"%PDF-" in chunk[:16]):
+                                    early_pdf = True
+                                    break
+
+                                downloaded += len(chunk)
+                                if downloaded > max_download_bytes:
+                                    raise ValueError(f"Dung lượng tải vượt quá giới hạn {max_download_bytes} byte")
+                                f_out.write(chunk)
+                                details["bytes_downloaded"] = downloaded
+                                if time.monotonic() >= next_progress:
+                                    logger.info("Đang tải %s: %.1f MiB", url, downloaded / 1024**2)
+                                    next_progress = time.monotonic() + 10
+                                if time.monotonic() >= deadline and downloaded != expected_bytes:
+                                    raise TimeoutError("Hết ngân sách thời gian tải; giữ file .part để resume")
+
+                        if early_pdf:
+                            partial_path.unlink(missing_ok=True)
+                            clean_completion = True
+                            return _STATUS_EARLY_PDF
+
+                        if response.status_code == 206 and content_range and downloaded != int(content_range[2]) + 1:
+                            raise requests.exceptions.ChunkedEncodingError("Source range ended before the advertised segment")
+                        length = response.headers.get("Content-Length")
+                        received = downloaded - (offset if append_mode else 0)
+                        if length is not None and received != int(length):
+                            raise requests.exceptions.ChunkedEncodingError("Source body does not match Content-Length")
+
+                        if response.status_code == 206 and total_size is not None and downloaded < total_size:
+                            if time.monotonic() - request_started <= 10:
+                                segment_index = min(len(RESUME_SEGMENTS) - 1, segment_index + 1) if RESUME_SEGMENTS else 0
+                            else:
+                                segment_index = max(0, segment_index - 1)
+                            rate_limiter.policy.succeeded("arxiv")
+                            continue
+
+                        if partial_path.exists():
+                            partial_path.replace(dest_path)
+                        rate_limiter.policy.succeeded("arxiv")
+                        details.update(bytes_downloaded=downloaded, error_message=None)
+                        if downloaded >= 25 * 1024 * 1024 or details.get("requests", 0) > 1:
+                            if hasattr(rate_limiter, "mark_heavy_completed"):
+                                rate_limiter.mark_heavy_completed("arxiv", padding_sec=1.5)
+                            else:
+                                rate_limiter._last_called["arxiv"] = time.monotonic() + 1.5
+                        clean_completion = True
+                        return 200
+            finally:
+                if not clean_completion:
+                    rate_limiter.mark_completed("arxiv")
+
+            if retry_delay is not None:
+                time.sleep(retry_delay)
+                continue
 
         except Exception as exc:
             segment_index = max(0, segment_index - 1)
             details["error_message"] = f"{type(exc).__name__}: {exc}"
-            if time.monotonic() >= deadline or (attempt < max_retries and (attempt + 1) * 3.0 >= deadline - time.monotonic()):
+            current_size = partial_path.stat().st_size if partial_path.exists() else 0
+            bytes_gained = current_size - offset
+            is_net_exc = isinstance(exc, NETWORK_EXCEPTIONS)
+            if is_net_exc:
+                heavy_interruptions += 1
+                details["heavy_interruptions"] = heavy_interruptions
+
+            # Rule B: Defer heavy, repeatedly-interrupted versions (>= 30 MiB, >= 2 interruptions)
+            # Takes priority over forward progress to prevent a 30-45 MiB archive from monopolizing connection
+            if (
+                allow_defer_heavy
+                and is_net_exc
+                and (known_total_size or 0) >= HEAVY_ARCHIVE_BYTES
+                and heavy_interruptions >= HEAVY_INTERRUPTIONS_LIMIT
+            ):
+                msg = (
+                    f"Nguồn nặng ({(known_total_size or 0) / (1024*1024):.1f} MiB >= {HEAVY_ARCHIVE_BYTES / (1024*1024):.0f} MiB) "
+                    f"bị gián đoạn mạng {heavy_interruptions} lần (đã tải {current_size / (1024*1024):.1f} MiB); "
+                    f"hoãn về đợt sweep cuối để nhường kết nối"
+                )
+                logger.warning("Nguồn %s: %s", url, msg)
+                details.update(
+                    deferred_heavy=True,
+                    error_message=msg,
+                    bytes_downloaded=current_size,
+                    heavy_interruptions=heavy_interruptions,
+                )
+                return 0
+
+            if time.monotonic() >= deadline:
                 logger.warning("Nguồn %s: %s; dừng lượt tải, lần sau resume", url, details["error_message"])
-                if not isinstance(exc, NETWORK_EXCEPTIONS):
+                if allow_defer_heavy and is_net_exc and current_size >= 512 * 1024:
+                    details.update(deferred_heavy=True, bytes_downloaded=current_size)
+                elif not is_net_exc:
+                    partial_path.unlink(missing_ok=True)
+                return 0
+
+            # Rule A: Forward-progress resume (>= 512 KiB gained does not burn retry budget or penalty sleep)
+            if is_net_exc and bytes_gained >= 512 * 1024 and details.get("requests", 0) < 64:
+                logger.info(
+                    "Nguồn %s: Tiến triển %.1f MiB (+%.1f KiB) trước khi gián đoạn mạng (%s); tiếp tục resume",
+                    url, current_size / 1024**2, bytes_gained / 1024, type(exc).__name__
+                )
+                continue
+
+            if attempt < max_retries and (attempt + 1) * 3.0 >= deadline - time.monotonic():
+                logger.warning("Nguồn %s: %s; dừng lượt tải, lần sau resume", url, details["error_message"])
+                if allow_defer_heavy and is_net_exc and current_size >= 512 * 1024:
+                    details.update(deferred_heavy=True, bytes_downloaded=current_size)
+                elif not is_net_exc:
                     partial_path.unlink(missing_ok=True)
                 return 0
             if attempt < max_retries:
@@ -479,7 +604,7 @@ def _download_stream(
                 time.sleep((attempt + 1) * 3.0)
                 attempt += 1
             else:
-                if not isinstance(exc, NETWORK_EXCEPTIONS):
+                if not is_net_exc:
                     partial_path.unlink(missing_ok=True)
                 logger.warning("Thất bại khi tải %s sau %d lần thử: %s", url, max_retries, exc)
                 return 0
@@ -510,6 +635,264 @@ def _validate_arxiv_id(arxiv_id: str) -> tuple[str, str]:
     return value, value.replace("/", "_")
 
 
+def extract_and_clean_archive(
+    archive_path: str | Path,
+    version_extract_dir: str | Path,
+    base_id: str | None = None,
+    ver: str | None = None,
+    keep_archives: bool = False,
+    remove_archive: bool | None = None,
+    unzipped_dir: str | Path | None = None,
+    start_time: float | None = None,
+) -> dict:
+    """Giải nén và dọn dẹp archive nguồn bài báo arXiv sang thư mục version."""
+    archive_path = Path(archive_path)
+    final_version_dir = Path(version_extract_dir)
+    ver = ver or final_version_dir.name
+    base_id = base_id or final_version_dir.parent.name
+    safe_base_id = base_id.replace("/", "_")
+    versioned_id = f"{base_id}{ver}"
+    unzipped_path = Path(unzipped_dir) if unzipped_dir is not None else final_version_dir.parent.parent
+
+    should_remove = (not keep_archives) if remove_archive is None else remove_archive
+    t0 = start_time if start_time is not None else time.perf_counter()
+
+    if not archive_path.exists():
+        return {
+            "arxiv_id": base_id,
+            "version_id": versioned_id,
+            "status": "error",
+            "size_before_bytes": 0,
+            "size_after_bytes": 0,
+            "elapsed_sec": round(time.perf_counter() - t0, 3),
+            "source_dir": str(final_version_dir),
+            "error_message": "Archive path does not exist",
+        }
+
+    # Đọc byte đầu nhận diện tệp nén
+    try:
+        with open(archive_path, "rb") as f:
+            header_bytes = f.read(1024)
+    except OSError:
+        if should_remove and archive_path.exists():
+            archive_path.unlink(missing_ok=True)
+        return {
+            "arxiv_id": base_id,
+            "version_id": versioned_id,
+            "status": "error",
+            "size_before_bytes": 0,
+            "size_after_bytes": 0,
+            "elapsed_sec": round(time.perf_counter() - t0, 3),
+            "source_dir": str(final_version_dir),
+        }
+
+    if header_bytes.startswith(b"%PDF-") or b"%PDF-" in header_bytes[:16]:
+        final_version_dir.mkdir(parents=True, exist_ok=True)
+        if should_remove and archive_path.exists():
+            archive_path.unlink(missing_ok=True)
+        return {
+            "arxiv_id": base_id,
+            "version_id": versioned_id,
+            "status": "pdf_only",
+            "size_before_bytes": 0,
+            "size_after_bytes": 0,
+            "elapsed_sec": round(time.perf_counter() - t0, 3),
+            "source_dir": str(final_version_dir),
+        }
+
+    staging_dir = Path(tempfile.mkdtemp(prefix=f".{safe_base_id}_{ver}.staging-", dir=unzipped_path))
+    size_before_bytes = 0
+    size_after_bytes = 0
+    extracted_ok = False
+
+    try:
+        try:
+            with tarfile.open(archive_path, "r:*") as tar:
+                size_before_bytes, size_after_bytes = _safe_extract_tar(tar, staging_dir)
+            extracted_ok = True
+        except (tarfile.ReadError, tarfile.CompressionError):
+            extracted_ok = False
+
+        if not extracted_ok:
+            if header_bytes.startswith(b"\x1f\x8b"):
+                size_before_bytes, size_after_bytes = _extract_single_gz(archive_path, staging_dir, f"{safe_base_id}{ver}")
+                extracted_ok = True
+            else:
+                with archive_path.open("rb") as sf:
+                    sample = sf.read(64 * 1024)
+                sample_text = sample.decode("utf-8", errors="ignore")
+                if any(marker in sample_text for marker in (r"\documentclass", r"\begin{document}", r"\input", r"\section")):
+                    target_tex = staging_dir / f"{safe_base_id}{ver}.tex"
+                    shutil.copyfile(archive_path, target_tex)
+                    size_before_bytes = archive_path.stat().st_size
+                    size_after_bytes = size_before_bytes
+                    extracted_ok = True
+    except _PDFSource:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        if should_remove and archive_path.exists():
+            archive_path.unlink(missing_ok=True)
+        final_version_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "arxiv_id": base_id,
+            "version_id": versioned_id,
+            "status": "pdf_only",
+            "size_before_bytes": 0,
+            "size_after_bytes": 0,
+            "elapsed_sec": round(time.perf_counter() - t0, 3),
+            "source_dir": str(final_version_dir),
+        }
+    except Exception as exc:
+        logger.warning("Lỗi khi giải nén bài báo %s: %s", versioned_id, exc)
+        extracted_ok = False
+
+    if not extracted_ok:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        if should_remove and archive_path.exists():
+            archive_path.unlink(missing_ok=True)
+        return {
+            "arxiv_id": base_id,
+            "version_id": versioned_id,
+            "status": "error",
+            "size_before_bytes": 0,
+            "size_after_bytes": 0,
+            "elapsed_sec": round(time.perf_counter() - t0, 3),
+            "source_dir": str(final_version_dir),
+        }
+
+    # Loại tệp ngoài allowlist sau giải nén.
+    prune_images_and_binaries(staging_dir)
+    size_after_bytes = get_dir_size_bytes(staging_dir) if staging_dir.exists() else 0
+
+    has_tex = False
+    has_bib = False
+    if staging_dir.exists():
+        for root_dir, _, filenames in os.walk(staging_dir):
+            for name in filenames:
+                ext = Path(name).suffix.lower()
+                if ext == ".tex":
+                    has_tex = True
+                elif ext == ".bib":
+                    has_bib = True
+                if has_tex and has_bib:
+                    break
+            if has_tex and has_bib:
+                break
+
+    if not has_tex:
+        status = "no_latex"
+    else:
+        status = "success"
+
+    # Chỉ thay nguồn cũ sau khi staging hợp lệ.
+    if not final_version_dir.resolve().is_relative_to(unzipped_path.resolve()):
+        raise ValueError("Thư mục version thoát ngoài corpus")
+    previous_tex = False
+    if final_version_dir.exists():
+        for root_dir, _, filenames in os.walk(final_version_dir):
+            if any(name.lower().endswith(".tex") for name in filenames):
+                previous_tex = True
+                break
+    if status != "success" and previous_tex:
+        shutil.rmtree(staging_dir)
+        return {
+            "arxiv_id": base_id,
+            "version_id": versioned_id,
+            "status": "error",
+            "size_before_bytes": size_before_bytes,
+            "size_after_bytes": get_dir_size_bytes(final_version_dir),
+            "elapsed_sec": round(time.perf_counter() - t0, 3),
+            "source_dir": str(final_version_dir),
+            "error_message": "New archive has no TeX; preserved previous source",
+        }
+    final_version_dir.parent.mkdir(parents=True, exist_ok=True)
+    backup_dir = final_version_dir.with_name(f".{ver}.previous-{uuid.uuid4().hex}")
+    if final_version_dir.exists():
+        os.replace(final_version_dir, backup_dir)
+    try:
+        os.replace(staging_dir, final_version_dir)
+    except BaseException:
+        if backup_dir.exists() and not final_version_dir.exists():
+            os.replace(backup_dir, final_version_dir)
+        raise
+    if backup_dir.exists():
+        if not backup_dir.resolve().is_relative_to(unzipped_path.resolve()) or backup_dir.is_symlink():
+            raise ValueError("Backup source path escapes corpus")
+        try:
+            shutil.rmtree(backup_dir)
+        except OSError as error:
+            logger.warning("Giữ backup nguồn %s vì chưa dọn được: %s", backup_dir, error)
+
+    if should_remove and archive_path.exists():
+        archive_path.unlink(missing_ok=True)
+
+    elapsed_sec = round(time.perf_counter() - t0, 3)
+
+    return {
+        "arxiv_id": base_id,
+        "version_id": versioned_id,
+        "status": status,
+        "size_before_bytes": size_before_bytes,
+        "size_after_bytes": size_after_bytes,
+        "elapsed_sec": elapsed_sec,
+        "source_dir": str(final_version_dir),
+    }
+
+
+def _write_version_manifest_and_scan_bbl(result: dict, sources_dir: str | Path, valid_endpoint: str) -> dict:
+    directory = Path(result["source_dir"])
+    bbl_files = []
+    has_dir_tex = False
+    if directory.is_dir():
+        for root_dir, _, filenames in os.walk(directory):
+            root_path = Path(root_dir)
+            for f in filenames:
+                lower = f.lower()
+                if lower.endswith(".bbl"):
+                    file_p = root_path / f
+                    if not file_p.is_symlink():
+                        bbl_files.append(file_p.relative_to(directory).as_posix())
+                elif lower.endswith(".tex"):
+                    has_dir_tex = True
+    result["bbl_files"] = sorted(bbl_files)
+    if result.get("status") == "pdf_only" and has_dir_tex:
+        result.update(status="error", error_message="PDF response conflicts with existing TeX; previous source preserved")
+    manifest = Path(sources_dir).parent / "manifests" / (result["version_id"].replace("/", "_") + ".json")
+    manifest_url = result.get("source_url") or f"https://export.arxiv.org/{valid_endpoint}/{result['version_id']}"
+    _write_json_atomic(str(manifest), {**result, "source_url": manifest_url,
+                                      "evidence": "pdf_header" if result.get("status") == "pdf_only" else
+                                                  "tex_extracted" if result.get("status") == "success" else
+                                                  "archive_without_tex" if result.get("status") == "no_latex" else
+                                                  "http_404" if result.get("status") == "not_found" else "request_or_extraction_error"})
+    return result
+
+
+def _finalize_version_extraction(
+    archive_path: Path,
+    final_version_dir: Path,
+    base_id: str,
+    ver: str,
+    remove_archive: bool,
+    unzipped_path: Path,
+    start_time: float,
+    url: str,
+    valid_endpoint: str,
+    sources_dir: str | Path,
+    validated_id: str,
+) -> dict:
+    with _get_article_lock(validated_id):
+        res = extract_and_clean_archive(
+            archive_path=archive_path,
+            version_extract_dir=final_version_dir,
+            base_id=base_id,
+            ver=ver,
+            remove_archive=remove_archive,
+            unzipped_dir=unzipped_path,
+            start_time=start_time,
+        )
+        res.update(source_url=url, deferred_heavy=False)
+        return _write_version_manifest_and_scan_bbl(res, sources_dir, valid_endpoint)
+
+
 def _download_and_clean_source_impl(
     arxiv_id: str,
     sources_dir: str,
@@ -520,11 +903,17 @@ def _download_and_clean_source_impl(
     max_attempts: int = 4,
     read_timeout_sec: float = 180.0,
     max_elapsed_sec: float = 180.0,
+    open_ended_range: bool = False,
+    executor: concurrent.futures.Executor | None = None,
+    source_endpoint: str = DEFAULT_SOURCE_ENDPOINT,
+    allow_defer_heavy: bool = True,
+    async_extract: bool = False,
 ) -> dict:
-    """Tải và giải nén mã nguồn của một phiên bản bài báo arXiv từ export.arxiv.org/src/."""
+    """Tải và giải nén mã nguồn của một phiên bản bài báo arXiv từ export.arxiv.org/{endpoint}/."""
     raw_id, _ = _validate_arxiv_id(arxiv_id)
     base_id, ver, versioned_id = _split_version_id(raw_id)
     safe_base_id = base_id.replace("/", "_")
+    valid_endpoint = validate_source_endpoint(source_endpoint)
 
     sources_path = Path(sources_dir)
     unzipped_path = Path(unzipped_dir)
@@ -538,23 +927,26 @@ def _download_and_clean_source_impl(
     req_session = session if session is not None else _get_shared_session()
     start_time = time.perf_counter()
 
-    # Tải đúng version qua /src/{versioned_id}.
-    url = f"https://export.arxiv.org/src/{versioned_id}"
+    # Tải đúng version qua /{endpoint}/{versioned_id}.
+    url = f"https://export.arxiv.org/{valid_endpoint}/{versioned_id}"
     download_details = {}
-    http_status = _download_stream(
-        url,
-        archive_path,
-        session=req_session,
-        chunk_size=CHUNK_SIZE,
-        rate_limit_sec=float(rate_limit_sec),
-        max_retries=max_attempts,
-        read_timeout_sec=read_timeout_sec,
-        diagnostics=download_details,
-        max_elapsed_sec=max_elapsed_sec,
-    )
+    with _SOURCE_TRANSFER_LOCK:
+        http_status = _download_stream(
+            url,
+            archive_path,
+            session=req_session,
+            chunk_size=CHUNK_SIZE,
+            rate_limit_sec=float(rate_limit_sec),
+            max_retries=max_attempts,
+            read_timeout_sec=read_timeout_sec,
+            diagnostics=download_details,
+            max_elapsed_sec=max_elapsed_sec,
+            open_ended_range=open_ended_range,
+            source_endpoint=valid_endpoint,
+            allow_defer_heavy=allow_defer_heavy,
+        )
 
     elapsed_sec = round(time.perf_counter() - start_time, 3)
-    resource_checkpoint()
 
     if http_status == 404:
         return {
@@ -565,6 +957,8 @@ def _download_and_clean_source_impl(
             "size_after_bytes": 0,
             "elapsed_sec": elapsed_sec,
             "source_dir": str(final_version_dir),
+            "source_url": url,
+            "deferred_heavy": False,
         }
 
     if http_status == _STATUS_EARLY_PDF:
@@ -579,6 +973,8 @@ def _download_and_clean_source_impl(
             "size_after_bytes": 0,
             "elapsed_sec": elapsed_sec,
             "source_dir": str(final_version_dir),
+            "source_url": url,
+            "deferred_heavy": False,
         }
 
     if http_status != 200 or not archive_path.exists():
@@ -591,145 +987,64 @@ def _download_and_clean_source_impl(
             "size_after_bytes": 0,
             "elapsed_sec": elapsed_sec,
             "source_dir": str(final_version_dir),
+            "source_url": url,
+            "deferred_heavy": download_details.get("deferred_heavy", False),
         }
 
-    # Đọc byte đầu nhận diện tệp nén
-    try:
-        with open(archive_path, "rb") as f:
-            header_bytes = f.read(1024)
-    except OSError:
-        if remove_archive and archive_path.exists():
-            archive_path.unlink(missing_ok=True)
+    if executor is not None and async_extract:
+        future = executor.submit(
+            _finalize_version_extraction,
+            archive_path=archive_path,
+            final_version_dir=final_version_dir,
+            base_id=base_id,
+            ver=ver,
+            remove_archive=remove_archive,
+            unzipped_path=unzipped_path,
+            start_time=start_time,
+            url=url,
+            valid_endpoint=valid_endpoint,
+            sources_dir=sources_dir,
+            validated_id=raw_id,
+        )
         return {
+            "status": "extracting",
+            "_extract_future": future,
             "arxiv_id": base_id,
             "version_id": versioned_id,
-            "status": "error",
-            "size_before_bytes": 0,
-            "size_after_bytes": 0,
-            "elapsed_sec": elapsed_sec,
             "source_dir": str(final_version_dir),
+            "source_url": url,
+            "deferred_heavy": False,
         }
 
-    if header_bytes.startswith(b"%PDF-") or b"%PDF-" in header_bytes[:16]:
-        final_version_dir.mkdir(parents=True, exist_ok=True)
-        if remove_archive and archive_path.exists():
-            archive_path.unlink(missing_ok=True)
-        return {
-            "arxiv_id": base_id,
-            "version_id": versioned_id,
-            "status": "pdf_only",
-            "size_before_bytes": 0,
-            "size_after_bytes": 0,
-            "elapsed_sec": elapsed_sec,
-            "source_dir": str(final_version_dir),
-        }
+    if executor is not None:
+        future = executor.submit(
+            extract_and_clean_archive,
+            archive_path=archive_path,
+            version_extract_dir=final_version_dir,
+            base_id=base_id,
+            ver=ver,
+            remove_archive=remove_archive,
+            unzipped_dir=unzipped_path,
+            start_time=start_time,
+        )
+        res = future.result()
+        res.update(source_url=url, deferred_heavy=False)
+        return res
 
-    staging_dir = Path(tempfile.mkdtemp(prefix=f".{safe_base_id}_{ver}.staging-", dir=unzipped_path))
-    size_before_bytes = 0
-    size_after_bytes = 0
-    extracted_ok = False
+    res = extract_and_clean_archive(
+        archive_path=archive_path,
+        version_extract_dir=final_version_dir,
+        base_id=base_id,
+        ver=ver,
+        remove_archive=remove_archive,
+        unzipped_dir=unzipped_path,
+        start_time=start_time,
+    )
+    res.update(source_url=url, deferred_heavy=False)
+    return res
 
-    try:
-        if tarfile.is_tarfile(archive_path):
-            with tarfile.open(archive_path, "r:*") as tar:
-                size_before_bytes, size_after_bytes = _safe_extract_tar(tar, staging_dir)
-            extracted_ok = True
-        elif header_bytes.startswith(b"\x1f\x8b"):
-            size_before_bytes, size_after_bytes = _extract_single_gz(archive_path, staging_dir, f"{safe_base_id}{ver}")
-            extracted_ok = True
-        else:
-            with archive_path.open("rb") as sf:
-                sample = sf.read(64 * 1024)
-            sample_text = sample.decode("utf-8", errors="ignore")
-            if any(marker in sample_text for marker in (r"\documentclass", r"\begin{document}", r"\input", r"\section")):
-                target_tex = staging_dir / f"{safe_base_id}{ver}.tex"
-                shutil.copyfile(archive_path, target_tex)
-                size_before_bytes = archive_path.stat().st_size
-                size_after_bytes = size_before_bytes
-                extracted_ok = True
-    except _PDFSource:
-        resource_checkpoint()
-        shutil.rmtree(staging_dir, ignore_errors=True)
-        if remove_archive:
-            archive_path.unlink(missing_ok=True)
-        final_version_dir.mkdir(parents=True, exist_ok=True)
-        return {"arxiv_id": base_id, "version_id": versioned_id, "status": "pdf_only",
-                "size_before_bytes": 0, "size_after_bytes": 0,
-                "elapsed_sec": round(time.perf_counter() - start_time, 3), "source_dir": str(final_version_dir)}
-    except Exception as exc:
-        logger.warning("Lỗi khi giải nén bài báo %s: %s", versioned_id, exc)
-        extracted_ok = False
 
-    if not extracted_ok:
-        shutil.rmtree(staging_dir, ignore_errors=True)
-        if remove_archive and archive_path.exists():
-            archive_path.unlink(missing_ok=True)
-        return {
-            "arxiv_id": base_id,
-            "version_id": versioned_id,
-            "status": "error",
-            "size_before_bytes": 0,
-            "size_after_bytes": 0,
-            "elapsed_sec": elapsed_sec,
-            "source_dir": str(final_version_dir),
-        }
-
-    # Loại tệp ngoài allowlist sau giải nén.
-    prune_images_and_binaries(staging_dir)
-    size_after_bytes = get_dir_size_bytes(staging_dir) if staging_dir.exists() else 0
-    resource_checkpoint()
-
-    has_tex = any(p.is_file() and p.suffix.lower() == ".tex" for p in staging_dir.rglob("*"))
-    has_bib = any(p.is_file() and p.suffix.lower() == ".bib" for p in staging_dir.rglob("*"))
-
-    if not has_tex:
-        status = "no_latex"
-    else:
-        status = "success"
-
-    # Chỉ thay nguồn cũ sau khi staging hợp lệ.
-    if not final_version_dir.resolve().is_relative_to(unzipped_path.resolve()):
-        raise ValueError("Thư mục version thoát ngoài corpus")
-    previous_tex = final_version_dir.exists() and any(p.is_file() and p.suffix.lower() == ".tex" for p in final_version_dir.rglob("*"))
-    if status != "success" and previous_tex:
-        shutil.rmtree(staging_dir)
-        return {"arxiv_id": base_id, "version_id": versioned_id, "status": "error",
-                "size_before_bytes": size_before_bytes, "size_after_bytes": get_dir_size_bytes(final_version_dir),
-                "elapsed_sec": round(time.perf_counter() - start_time, 3), "source_dir": str(final_version_dir),
-                "error_message": "New archive has no TeX; preserved previous source"}
-    final_version_dir.parent.mkdir(parents=True, exist_ok=True)
-    backup_dir = final_version_dir.with_name(f".{ver}.previous-{uuid.uuid4().hex}")
-    if final_version_dir.exists():
-        os.replace(final_version_dir, backup_dir)
-    try:
-        os.replace(staging_dir, final_version_dir)
-    except BaseException:
-        if backup_dir.exists() and not final_version_dir.exists():
-            os.replace(backup_dir, final_version_dir)
-        raise
-    resource_checkpoint()
-    if backup_dir.exists():
-        if not backup_dir.resolve().is_relative_to(unzipped_path.resolve()) or backup_dir.is_symlink():
-            raise ValueError("Backup source path escapes corpus")
-        try:
-            shutil.rmtree(backup_dir)
-        except OSError as error:
-            logger.warning("Giữ backup nguồn %s vì chưa dọn được: %s", backup_dir, error)
-
-    if remove_archive and archive_path.exists():
-        archive_path.unlink(missing_ok=True)
-
-    elapsed_sec = round(time.perf_counter() - start_time, 3)
-
-    return {
-        "arxiv_id": base_id,
-        "version_id": versioned_id,
-        "status": status,
-        "size_before_bytes": size_before_bytes,
-        "size_after_bytes": size_after_bytes,
-        "elapsed_sec": elapsed_sec,
-        "source_dir": str(final_version_dir),
-    }
+_default_download_and_clean_source_impl = _download_and_clean_source_impl
 
 
 def download_and_clean_source(
@@ -742,9 +1057,16 @@ def download_and_clean_source(
     max_attempts: int = 4,
     read_timeout_sec: float = 180.0,
     max_elapsed_sec: float = 180.0,
+    keep_archives: bool = False,
+    open_ended_range: bool = False,
+    executor: concurrent.futures.Executor | None = None,
+    source_endpoint: str = DEFAULT_SOURCE_ENDPOINT,
+    allow_defer_heavy: bool = True,
+    async_extract: bool = False,
 ) -> dict:
     """Tải, giải nén và lọc nguồn của một version arXiv."""
     validated_id, _ = _validate_arxiv_id(arxiv_id)
+    valid_endpoint = validate_source_endpoint(source_endpoint)
     if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
         raise ValueError("max_attempts must be a positive integer")
     if not math.isfinite(read_timeout_sec) or read_timeout_sec <= 0:
@@ -753,29 +1075,35 @@ def download_and_clean_source(
         raise ValueError("max_elapsed_sec must be positive and finite")
     if not math.isfinite(rate_limit_sec) or rate_limit_sec < 1:
         raise ValueError("Source rate_limit_sec must be >= 1")
-    with _SOURCE_TRANSFER_LOCK, _get_article_lock(validated_id):
+    transfer_lock = (
+        _SOURCE_TRANSFER_LOCK
+        if _download_and_clean_source_impl is not _default_download_and_clean_source_impl
+        else contextlib.nullcontext()
+    )
+    should_remove = (not keep_archives) if remove_archive is None else remove_archive
+    with transfer_lock, _get_article_lock(validated_id):
         result = _download_and_clean_source_impl(
             arxiv_id=arxiv_id,
             sources_dir=sources_dir,
             unzipped_dir=unzipped_dir,
             rate_limit_sec=rate_limit_sec,
-            remove_archive=remove_archive,
+            remove_archive=should_remove,
             session=session,
             max_attempts=max_attempts,
             read_timeout_sec=read_timeout_sec,
             max_elapsed_sec=max_elapsed_sec,
+            open_ended_range=open_ended_range,
+            executor=executor,
+            source_endpoint=valid_endpoint,
+            allow_defer_heavy=allow_defer_heavy,
+            async_extract=async_extract,
         )
-        directory = Path(result["source_dir"])
-        result["bbl_files"] = sorted(p.relative_to(directory).as_posix() for p in directory.rglob("*")
-                                     if p.is_file() and not p.is_symlink() and p.suffix.lower() == ".bbl") if directory.is_dir() else []
-        if result["status"] == "pdf_only" and any(p.is_file() and p.suffix.lower() == ".tex" for p in Path(result["source_dir"]).rglob("*")):
-            result.update(status="error", error_message="PDF response conflicts with existing TeX; previous source preserved")
-        manifest = Path(sources_dir).parent / "manifests" / (result["version_id"].replace("/", "_") + ".json")
-        _write_json_atomic(str(manifest), {**result, "source_url": f"https://export.arxiv.org/src/{result['version_id']}",
-                                          "evidence": "pdf_header" if result["status"] == "pdf_only" else
-                                                      "tex_extracted" if result["status"] == "success" else
-                                                      "archive_without_tex" if result["status"] == "no_latex" else "request_or_extraction_error"})
-        return result
+        if result.get("status") == "extracting":
+            return result
+        return _write_version_manifest_and_scan_bbl(result, sources_dir, valid_endpoint)
+
+
+download_and_extract_source = download_and_clean_source
 
 
 if __name__ == "__main__":

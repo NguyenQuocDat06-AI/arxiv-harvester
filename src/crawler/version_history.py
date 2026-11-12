@@ -85,9 +85,12 @@ def fetch_history(paper_id: str, cache_dir: str | Path, session=None, refresh=Fa
     try:
         for attempt in range(4):
             rate_limiter.wait("arxiv", interval=3.0)
-            response = client.get(OAI_URL, params={"verb": "GetRecord", "identifier": "oai:arXiv.org:" + paper_id,
-                                                 "metadataPrefix": "arXivRaw"}, timeout=45,
-                                  headers={"User-Agent": "arxiv-harvester/0.2 (course revision-history reconciliation)"})
+            try:
+                response = client.get(OAI_URL, params={"verb": "GetRecord", "identifier": "oai:arXiv.org:" + paper_id,
+                                                     "metadataPrefix": "arXivRaw"}, timeout=45,
+                                      headers={"User-Agent": "arxiv-harvester/0.2 (course revision-history reconciliation)"})
+            finally:
+                rate_limiter.mark_completed("arxiv")
             if response.status_code == 429:
                 from .exceptions import arXivRateLimitError
                 delay = rate_limiter.policy.limited("arxiv", response)

@@ -29,7 +29,8 @@ def runtime_info() -> dict:
                          "adaptive_s2", "source_retry_diagnostics", "s2_batch", "per_paper_checkpoint",
                          "persistent_cooldown", "http_diagnostics", "segmented_resume",
                          "source_pacing", "adaptive_ranges", "drive_batch_backup", "auto_rate_resume",
-                         "durable_run_artifacts", "assignment_validation"]}
+                         "durable_run_artifacts", "assignment_validation", "bounded_pipeline",
+                         "incremental_run_mirror", "independent_provider_wait", "exact_disk_samples"]}
 
 
 def checkpoint_plan(shard_dir: str | Path, raw_dir: str | Path, member_id: str, id_range: dict) -> dict:
@@ -184,6 +185,9 @@ def validate_run(shard_dir: str | Path, raw_dir: str | Path, export_dir: str | P
     dates_missing = sum(v.get("created") is None for p in pubs for v in p.get("versions") or [])
     if dates_missing:
         warnings.append("Some revision dates remain unverified")
+    unavailable_sources = sum(v.get("source_status") == "not_found" for p in pubs for v in p.get("versions") or [])
+    if unavailable_sources:
+        warnings.append(f"{unavailable_sources} source versions returned verified HTTP 404; report this coverage gap separately")
     result.update(ready_for_full=not errors, papers=len(pubs), working_references=len(refs),
                   course_export=course_check, source_audit=source_audit,
                   reference_statuses=dict(statuses), missing_version_dates=dates_missing,

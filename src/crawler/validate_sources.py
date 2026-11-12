@@ -46,6 +46,16 @@ def check_source_version(raw_dir: str | Path, identifier: str, version: dict) ->
                     and evidence.get("evidence") in {"pdf_header", "archive_without_tex"}
                     and not tex and not unexpected and actual_size == (version.get("size_after_bytes") or 0))
         reason = "empty_verified" if verified else "empty_unverified"
+    elif status == "not_found":
+        manifest = raw / "manifests" / (identifier.replace("/", "_") + tag + ".json")
+        try:
+            evidence = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            evidence = {}
+        verified = (evidence.get("version_id") == identifier + tag and evidence.get("status") == "not_found"
+                    and evidence.get("evidence") == "http_404"
+                    and not tex and not unexpected and actual_size == 0)
+        reason = "not_found_verified" if verified else "not_found_unverified"
     else:
         verified, reason = False, "source_pending_or_failed"
     return {"arxiv_id": identifier, "version": tag, "source_status": status, "verified": verified,

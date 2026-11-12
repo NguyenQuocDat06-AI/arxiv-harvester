@@ -13,9 +13,12 @@ from pathlib import Path
 import random
 import re
 import tempfile
+import threading
 import time
 
 logger = logging.getLogger(__name__)
+
+ARXIV_COOLDOWN_FLOOR_SEC: float = 15.0
 
 
 class CooldownDeferred(Exception):
@@ -132,6 +135,7 @@ class RequestPolicy:
         self.credential_present = bool(credential)
         self.max_wait_sec = max_wait_sec
         self.memory = {}
+        self._memory_lock = threading.RLock()
         self.diagnostic_file = None
         if self.directory:
             self.directory.mkdir(parents=True, exist_ok=True)
@@ -143,7 +147,8 @@ class RequestPolicy:
     def state(self, provider):
         key = provider + ("-" + self.credential_tag if provider == "semantic_scholar" else "")
         if self.directory is None:
-            yield self.memory.setdefault(key, {})
+            with self._memory_lock:
+                yield self.memory.setdefault(key, {})
             return
         path = self.directory / (key + ".json")
         with LocalMutex(str(path)):
@@ -157,9 +162,11 @@ class RequestPolicy:
                         raise ValueError("Invalid request state timestamp/counter")
             except (ValueError, OSError) as error:
                 raise RuntimeError(f"Không đọc được network state {path.name}; không gửi request") from error
+            original_snapshot = dict(value)
             yield value
-            from .profiler import _write_json_atomic
-            _write_json_atomic(str(path), value)
+            if value != original_snapshot:
+                from .profiler import _write_json_atomic
+                _write_json_atomic(str(path), value)
 
     def reserve(self, provider, interval):
         with self.state(provider) as state:
@@ -170,6 +177,10 @@ class RequestPolicy:
                 state["last_request"] = now
             return delay
 
+    def mark_completed(self, provider: str) -> None:
+        with self.state(provider) as state:
+            state["last_request"] = self.now()
+
     def defer(self, provider, seconds):
         with self.state(provider) as state:
             state["not_before"] = max(state.get("not_before", 0), self.now() + seconds)
@@ -179,10 +190,16 @@ class RequestPolicy:
         diagnostic = response_diagnostic(response, secrets)
         with self.state(provider) as state:
             streak = min(20, state.get("consecutive_429", 0) + 1)
-            base = min(900.0, max(60.0, floor) * 2 ** (streak - 1))
-            delay = max(server_wait or 0.0, base + random.uniform(0, base * 0.1))
+            if server_wait is not None and server_wait > 0:
+                # Priority 1: Comply strictly with server Retry-After RFC and assignment rule
+                delay = server_wait + random.uniform(0.0, 0.5)
+            else:
+                # Priority 2: Fallback exponential backoff
+                base = min(900.0, max(1.0, floor) * (2 ** (streak - 1)))
+                delay = base + random.uniform(0, base * 0.1)
             state.update(not_before=max(state.get("not_before", 0), self.now() + delay),
-                         consecutive_429=streak, successes=0, interval=min(60.0, max(5.0, state.get("interval", 0)) * 2),
+                         consecutive_429=streak, successes=0,
+                         interval=min(10.0, max(5.0, state.get("interval", 0)) * 2),
                          last_diagnostic=diagnostic, updated_at=time.time())
             next_retry = time.time() + max(0, state["not_before"] - self.now())
         event = {"provider": provider, "received_at": datetime.now(timezone.utc).isoformat(),
@@ -200,6 +217,8 @@ class RequestPolicy:
     def succeeded(self, provider):
         with self.state(provider) as state:
             state["consecutive_429"] = 0
+            if provider == "arxiv":
+                state["interval"] = 0.0
             state["successes"] = state.get("successes", 0) + 1
             if state["successes"] >= 2:
                 state["interval"] = state.get("interval", 0) * 0.5

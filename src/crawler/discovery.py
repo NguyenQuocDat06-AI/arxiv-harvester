@@ -102,6 +102,45 @@ def _parse_entry(entry: ET.Element) -> dict | None:
     }
 
 
+def confirm_missing_id(paper_id: str, rate_limit_sec: float = 3.0) -> bool:
+    """An OAI idDoesNotExist response confirms absence; other failures do not."""
+    from .exceptions import arXivConnectionError
+    endpoint = "https://oaipmh.arxiv.org/oai"
+    rate_limiter.wait("arxiv", interval=max(3.0, rate_limit_sec))
+    try:
+        try:
+            response = requests.get(endpoint, params={"verb": "GetRecord", "metadataPrefix": "arXivRaw",
+                                                      "identifier": "oai:arXiv.org:"+paper_id},
+                                    timeout=20, headers={"User-Agent": "arxiv-harvester/0.2 (ID boundary verification)"})
+        finally:
+            rate_limiter.mark_completed("arxiv")
+        if response.status_code in (429, 503):
+            delay = rate_limiter.policy.limited("arxiv", response, floor=15.0)
+            raise arXivRateLimitError("OAI boundary verification needs cooldown", retry_after=delay, failed_ids=[paper_id])
+        response.raise_for_status()
+        root = ET.fromstring(response.text)
+        ns = "{http://www.openarchives.org/OAI/2.0/}"
+        if root.tag != ns+"OAI-PMH":
+            raise ValueError("Expected an OAI-PMH response")
+        request = root.find(ns+"request")
+        if request is None or request.get("identifier") != "oai:arXiv.org:"+paper_id:
+            raise ValueError("OAI response does not match requested ID")
+        errors = root.findall(ns+"error")
+        if len(errors) == 1 and errors[0].get("code") == "idDoesNotExist":
+            rate_limiter.policy.succeeded("arxiv")
+            return True
+        identifier = root.find(".//"+ns+"header/"+ns+"identifier")
+        if not errors and identifier is not None and identifier.text == "oai:arXiv.org:"+paper_id:
+            rate_limiter.policy.succeeded("arxiv")
+            return False
+        raise ValueError("OAI did not establish existence or absence")
+    except arXivRateLimitError:
+        raise
+    except Exception as error:
+        raise arXivConnectionError("Could not verify ID existence: "+str(error), endpoint=endpoint, timeout=20.0,
+                                    failed_ids=[paper_id]) from error
+
+
 def discover_metadata_batch(
     arxiv_ids: list[str], rate_limit_sec: float = 3.0, max_retries: int = 3
 ) -> DiscoveryBatchResult:
@@ -126,16 +165,18 @@ def discover_metadata_batch(
             except CooldownDeferred as error:
                 raise arXivRateLimitError(str(error), retry_after=error.retry_after, failed_ids=chunk) from error
             try:
-                resp = requests.get(
-                    API_URL, params=params, headers=headers, timeout=20.0
-                )
+                try:
+                    resp = requests.get(
+                        API_URL, params=params, headers=headers, timeout=20.0
+                    )
+                finally:
+                    rate_limiter.mark_completed("arxiv")
 
                 if resp.status_code == 429:
-                    delay = rate_limiter.policy.limited("arxiv", resp)
+                    delay = rate_limiter.policy.limited("arxiv", resp, floor=15.0)
                     raise arXivRateLimitError("arXiv HTTP 429; checkpoint được giữ", retry_after=delay, failed_ids=chunk)
                 if resp.status_code == 503:
-                    sleep_time = retry_after(resp) or (attempt + 1) * 5.0
-                    rate_limiter.defer("arxiv", sleep_time)
+                    sleep_time = rate_limiter.policy.limited("arxiv", resp, floor=15.0)
                     if attempt == max_retries - 1:
                         last_exc = arXivRateLimitError(
                             f"HTTP {resp.status_code} after {attempt + 1} attempts for {chunk[0]}..{chunk[-1]}. Retry after {sleep_time}s",

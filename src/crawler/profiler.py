@@ -28,14 +28,18 @@ def resource_checkpoint() -> None:
         profiler.capture(disk=True)
 
 
+def clear_dir_size_cache() -> None:
+    """Compatibility hook; directory sizes are measured without an mtime cache."""
+
+
 def dir_size_bytes(path: str) -> int:
-    """Cộng kích thước tệp thường trong cây thư mục, không đi theo symlink."""
-    total = 0
-    stack = [path]
+    """Count regular files exactly, including files that grew in place."""
+    if not os.path.isdir(path) or os.path.islink(path):
+        return 0
+    total, stack = 0, [path]
     while stack:
-        current = stack.pop()
         try:
-            with os.scandir(current) as entries:
+            with os.scandir(stack.pop()) as entries:
                 for entry in entries:
                     try:
                         if entry.is_dir(follow_symlinks=False):
@@ -92,7 +96,7 @@ class ResourceProfiler:
         self,
         sample_interval_sec: float = 0.5,
         watch_dirs: dict[str, str] | None = None,
-        disk_interval_sec: float = 5.0,
+        disk_interval_sec: float = 30.0,
         samples_path: str | Path | None = None,
     ) -> None:
         if not math.isfinite(sample_interval_sec) or sample_interval_sec <= 0:
@@ -110,6 +114,11 @@ class ResourceProfiler:
         self._sample_times: list[float] = []
         self._disk_samples: list[dict] = []
         self._sampling_lock = threading.Lock()
+        self._disk_lock = threading.Lock()
+        self._sample_file_lock = threading.Lock()
+        self._disk_thread = None
+        self._children = []
+        self._children_checked_at = float('-inf')
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -139,59 +148,71 @@ class ResourceProfiler:
             target=self._sampling_loop, name="resource-profiler", daemon=True
         )
         self._thread.start()
+        self._disk_thread = threading.Thread(target=self._disk_sampling_loop,
+                                             name="disk-profiler", daemon=True)
+        self._disk_thread.start()
+
+    def _append_samples(self, rows):
+        if self.samples_path is None:
+            return
+        try:
+            with self._sample_file_lock, self.samples_path.open("a", encoding="utf-8") as stream:
+                for row in rows:
+                    stream.write(json.dumps(row) + "\n")
+        except OSError as error:
+            self._sample_write_error = repr(error)
 
     def _sample(self, disk: bool = True) -> None:
         with self._sampling_lock:
-            self._sample_unlocked(disk)
+            self._sample_memory()
+        if disk:
+            self._sample_disk()
 
-    def _sample_unlocked(self, disk: bool = True) -> None:
+    def _sample_memory(self):
         try:
             rss = self._process.memory_info().rss
         except psutil.Error:
             return
-        try:
-            children = self._process.children(recursive=True)
-        except psutil.Error:
-            children = []
-        seen = {self._process.pid}
-        for child in children:
-            if child.pid in seen:
-                continue
-            seen.add(child.pid)
-            try:
-                rss += child.memory_info().rss
-            except psutil.Error:
-                pass
         timestamp = time.perf_counter()
-        sizes = {label: dir_size_bytes(path) for label, path in self.watch_dirs.items()} if disk else {}
-        if disk:
-            self._last_disk_sample = timestamp
-        roots = []
-        for label, path in sorted(self.watch_dirs.items(), key=lambda item: len(os.path.abspath(item[1]))):
-            absolute = os.path.realpath(path)
-            def contained(parent):
+        if timestamp - self._children_checked_at >= 1:
+            try:
+                self._children = self._process.children(recursive=True)
+            except (psutil.Error, AttributeError):
+                self._children = []
+            self._children_checked_at = timestamp
+        seen = {self._process.pid}
+        for child in self._children:
+            if child.pid not in seen:
+                seen.add(child.pid)
                 try:
-                    return os.path.commonpath([absolute, parent]) == parent
-                except ValueError:
-                    return False
-            if not any(contained(parent) for _, parent in roots):
-                roots.append((label, absolute))
+                    rss += child.memory_info().rss
+                except psutil.Error:
+                    pass
         with self._lock:
             self._samples.append(rss)
             self._sample_times.append(timestamp)
-            if disk:
-                self._disk_samples.append({"elapsed_sec": timestamp - self._start_perf,
-                                           "total_bytes": sum(sizes[label] for label, _ in roots), "dirs": sizes})
-            if self.samples_path is not None:
-                rows = [{"kind": "rss", "elapsed_sec": timestamp - self._start_perf, "rss_bytes": rss}]
-                if disk:
-                    rows.append({"kind": "disk", **self._disk_samples[-1]})
-                try:
-                    with self.samples_path.open("a", encoding="utf-8") as stream:
-                        for row in rows:
-                            stream.write(json.dumps(row) + "\n")
-                except OSError as error:
-                    self._sample_write_error = repr(error)
+        self._append_samples([{"kind": "rss", "elapsed_sec": timestamp-self._start_perf, "rss_bytes": rss}])
+
+    def _sample_disk(self):
+        with self._disk_lock:
+            sizes = {label: dir_size_bytes(path) for label, path in self.watch_dirs.items()}
+            timestamp = time.perf_counter()
+            roots = []
+            for label, path in sorted(self.watch_dirs.items(), key=lambda item: len(os.path.abspath(item[1]))):
+                absolute = os.path.realpath(path)
+                def contained(parent):
+                    try:
+                        return os.path.commonpath([absolute, parent]) == parent
+                    except ValueError:
+                        return False
+                if not any(contained(parent) for _, parent in roots):
+                    roots.append((label, absolute))
+            sample = {"elapsed_sec": timestamp-self._start_perf,
+                      "total_bytes": sum(sizes[label] for label, _ in roots), "dirs": sizes}
+            with self._lock:
+                self._disk_samples.append(sample)
+                self._last_disk_sample = timestamp
+            self._append_samples([{"kind": "disk", **sample}])
 
     def capture(self, disk: bool = True) -> None:
         if self._start_perf is not None and self._end_perf is None:
@@ -199,8 +220,11 @@ class ResourceProfiler:
 
     def _sampling_loop(self) -> None:
         while not self._stop_event.wait(self.sample_interval_sec):
-            disk = self._last_disk_sample is None or time.perf_counter() - self._last_disk_sample >= self.disk_interval_sec
-            self._sample(disk=disk)
+            self._sample(disk=False)
+
+    def _disk_sampling_loop(self):
+        while not self._stop_event.wait(self.disk_interval_sec):
+            self._sample_disk()
 
     @contextmanager
     def phase(self, name: str) -> Iterator[None]:
@@ -211,8 +235,9 @@ class ResourceProfiler:
             yield
         finally:
             elapsed = time.perf_counter() - begin
-            self._phase_sec[name] = self._phase_sec.get(name, 0.0) + elapsed
-            self._phase_calls[name] = self._phase_calls.get(name, 0) + 1
+            with self._lock:
+                self._phase_sec[name] = self._phase_sec.get(name, 0.0) + elapsed
+                self._phase_calls[name] = self._phase_calls.get(name, 0) + 1
             self.capture(disk=False)
             _ACTIVE_PROFILER.reset(token)
 
@@ -222,7 +247,9 @@ class ResourceProfiler:
         if self._end_perf is not None:
             return
         self._stop_event.set()
-        self._thread.join(timeout=max(5.0, self.sample_interval_sec * 4))
+        self._thread.join()
+        if self._disk_thread is not None:
+            self._disk_thread.join()
         self._sample()
         self._end_perf = time.perf_counter()
 
@@ -237,9 +264,7 @@ class ResourceProfiler:
             duration = sum(b - a for a, b in zip(timestamps, timestamps[1:]))
             average = (sum(value * (b - a) for value, a, b in zip(samples, timestamps, timestamps[1:])) / duration
                        if duration else statistics.fmean(samples))
-            disk_after = {
-                label: dir_size_bytes(path) for label, path in self.watch_dirs.items()
-            }
+            disk_after = disk_samples[-1]["dirs"] if disk_samples else self._disk_before
             os_peak = _os_peak_rss_bytes(self._process)
             self._result = {
                 "started_at_utc": self._started_at,
@@ -264,12 +289,14 @@ class ResourceProfiler:
                     ),
                     "num_samples": len(samples),
                     "sample_interval_sec": self.sample_interval_sec,
+                    "child_refresh_interval_sec": 1.0,
                 },
                 "disk": {
                     "unit": "bytes",
                     "peak_bytes": max((s["total_bytes"] for s in disk_samples), default=0),
                     "final_bytes": disk_samples[-1]["total_bytes"] if disk_samples else 0,
-                    "method": "periodic samples and operation checkpoints; nested directories counted once",
+                    "method": "exact directory walks at sampled times and operation checkpoints; nested directories counted once",
+                    "peak_is_sampled": True,
                     "sample_interval_sec": self.disk_interval_sec,
                     "dirs": {
                         label: {

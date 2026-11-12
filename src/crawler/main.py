@@ -4,6 +4,8 @@ Phụ trách: Trịnh Vỹ Triết (24120474).
 """
 
 import argparse
+import concurrent.futures
+import contextlib
 import json
 import logging
 import os
@@ -14,6 +16,8 @@ import uuid
 import math
 import hashlib
 from copy import deepcopy
+from collections import deque
+from .pipeline_support import BoundedExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from itertools import islice
@@ -24,10 +28,10 @@ from .id_range import iter_assigned_arxiv_ids
 from .profiler import ResourceProfiler
 from .reference_scraper import ReferenceResult, scrape_references_for_paper, get_request_stats, configure_request_policy, reset_request_stats
 from .reference_batch import scrape_references_batch, complete_batch_result
-from .records import base_id, merge_publications, merge_references, sources_complete, tex_complete, REFERENCE_TERMINAL, REFERENCE_REPLACE
+from .records import base_id, merge_publications, merge_references, sources_complete, tex_complete, REFERENCE_TERMINAL, REFERENCE_REPLACE, SOURCE_TERMINAL
 from .observations import save_observations, request_delta, combine_request_metrics
 from .profiler import _write_json_atomic
-from .source_downloader import download_and_clean_source
+from .source_downloader import download_and_clean_source, download_and_extract_source, extract_and_clean_archive
 from .validate_sources import check_source_version
 from .rate_limiter import rate_limiter
 from .request_policy import network_runtime, CooldownDeferred
@@ -119,7 +123,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--s2-rate-limit-sec", type=_non_negative_float, default=5.0,
                         help="Khoảng nghỉ S2, độc lập với arXiv (mặc định: 5 giây)")
-    parser.add_argument("--s2-batch-size", type=_positive_int, default=5,
+    parser.add_argument("--disk-profile-interval-sec", type=_non_negative_float, default=30.0,
+                        help="Chu kỳ quét dung lượng đĩa, giây (mặc định 30)")
+    parser.add_argument("--s2-batch-size", type=_positive_int, default=50,
                         help="Số paper/request S2, tối đa 500; đặt 1 để gọi riêng")
     parser.add_argument("--rate-state-dir", help="Thư mục lưu cooldown dùng chung qua các lượt chạy")
     parser.add_argument("--max-rate-wait-sec", type=_non_negative_float, default=180.0,
@@ -128,8 +134,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Lưu checkpoint, chờ cooldown arXiv rồi tự tiếp tục; có thể Stop khi đang chờ")
     parser.add_argument("--recheck-missing", action="store_true",
                         help="Kiểm tra lại các ID đã đánh dấu missing trong phạm vi lượt chạy")
-    parser.add_argument("--checkpoint-every-papers", type=_positive_int, default=1,
+    parser.add_argument("--checkpoint-every-papers", type=_positive_int, default=25,
                         help="Lưu checkpoint sau số paper này, độc lập với batch API")
+    parser.add_argument("--max-inflight-papers", type=_positive_int, default=25,
+                        help="So paper toi da dang cho xu ly nen (mac dinh 25)")
     parser.add_argument("--s2-max-attempts", type=_positive_int, default=3,
                         help="Số lần thử S2 trong một lượt (mặc định: 3)")
     parser.add_argument("--s2-cooldown-sec", type=_non_negative_float, default=60.0,
@@ -173,6 +181,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Thư mục xuất chuẩn môn học (mặc định: <output-dir>/course_export)",
     )
+    parser.add_argument(
+        "--source-endpoint",
+        choices=["src", "e-print"],
+        default="src",
+        help="Endpoint tải source từ export.arxiv.org (mặc định: src; tùy chọn: e-print)",
+    )
+    parser.add_argument(
+        "--open-ended-range",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Tải phần còn lại của file resume trong 1 request không giới hạn range segment (mặc định: True)",
+    )
     return parser
 
 
@@ -195,6 +215,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("mốc bắt đầu phải đứng trước hoặc trùng mốc kết thúc")
     if args.profile_interval_sec == 0:
         parser.error("--profile-interval-sec phải lớn hơn 0")
+    if args.disk_profile_interval_sec == 0:
+        parser.error("--disk-profile-interval-sec phải lớn hơn 0")
     if args.rate_limit_sec < 3 or args.source_rate_limit_sec < 1:
         parser.error("Metadata cần >= 3 giây; tải nguồn cần >= 1 giây")
     if args.s2_rate_limit_sec < 1 or min(args.source_read_timeout_sec, args.source_max_seconds, args.max_rate_wait_sec) <= 0:
@@ -322,16 +344,24 @@ def _materialize(checkpoint: Checkpoint) -> tuple[dict, dict, dict]:
     return publications, references, observations
 
 
-def _version_reusable(paper_id: str, version: dict, unzipped_dir: str) -> bool:
-    if not re.fullmatch(r"v[1-9]\d*", str(version.get("version") or "")):
+def _version_reusable(paper_id: str, version: dict, unzipped_dir: str,
+                      session_cache: dict | None = None) -> bool:
+    v_tag = str(version.get("version") or "")
+    if not re.fullmatch(r"v[1-9]\d*", v_tag):
         return False
-    return check_source_version(Path(unzipped_dir).parent, paper_id, version)["verified"]
+    if session_cache is not None:
+        verified_set = session_cache.setdefault("verified_reusable", set())
+        if (paper_id, v_tag) in verified_set and version.get("source_status") in SOURCE_TERMINAL:
+            return True
+    verified = check_source_version(Path(unzipped_dir).parent, paper_id, version)["verified"]
+    if verified and session_cache is not None:
+        session_cache.setdefault("verified_reusable", set()).add((paper_id, v_tag))
+    return verified
 
 
-def _process_paper(arxiv_id: str, args: argparse.Namespace, profiler: ResourceProfiler,
-                   sources_dir: str, unzipped_dir: str, paper_record: dict | None = None,
-                   previous_references: list | None = None, previous_observation: dict | None = None,
-                   prefetched_references: ReferenceResult | None = None) -> tuple[dict, list[dict]]:
+def _download_paper_sources(arxiv_id: str, args: argparse.Namespace, profiler: ResourceProfiler,
+                            sources_dir: str, unzipped_dir: str,
+                            paper_record: dict | None = None) -> tuple[dict, dict]:
     paper = paper_record if paper_record is not None else {"id": arxiv_id}
     dry_run = getattr(args, "dry_run", False)
     versions = paper.get("versions") or []
@@ -339,6 +369,8 @@ def _process_paper(arxiv_id: str, args: argparse.Namespace, profiler: ResourcePr
         raise ValueError(f"Thiếu thông tin version của {arxiv_id}; cần xác minh metadata")
     paper["id"] = arxiv_id
     summary = {"arxiv_id": arxiv_id, "version_results": [], "versions_attempted": 0, "versions_reused": 0}
+    session_cache = getattr(args, "_session_cache", None)
+    extract_executor = getattr(args, "_extract_executor", None)
     for version in versions:
         tag = version.get("version") or ""
         if not re.fullmatch(r"v[1-9]\d*", tag):
@@ -346,28 +378,61 @@ def _process_paper(arxiv_id: str, args: argparse.Namespace, profiler: ResourcePr
         if dry_run:
             version["source_status"] = "pending"
             continue
-        if _version_reusable(arxiv_id, version, unzipped_dir):
+        if _version_reusable(arxiv_id, version, unzipped_dir, session_cache=session_cache):
             summary["versions_reused"] += 1
             continue
         summary["versions_attempted"] += 1
         try:
             with profiler.phase("download_clean"):
-                result = download_and_clean_source(arxiv_id + tag, sources_dir, unzipped_dir,
-                                                   rate_limit_sec=getattr(args, "source_rate_limit_sec", 3.0),
-                                                   max_attempts=getattr(args, "source_download_attempts", 3),
-                                                   read_timeout_sec=getattr(args, "source_read_timeout_sec", 90.0),
-                                                   max_elapsed_sec=getattr(args, "source_max_seconds", 180.0))
+                try:
+                    result = download_and_clean_source(
+                        arxiv_id + tag,
+                        sources_dir,
+                        unzipped_dir,
+                        rate_limit_sec=getattr(args, "source_rate_limit_sec", 3.0),
+                        max_attempts=getattr(args, "source_download_attempts", 3),
+                        read_timeout_sec=getattr(args, "source_read_timeout_sec", 90.0),
+                        max_elapsed_sec=getattr(args, "source_max_seconds", 180.0),
+                        open_ended_range=getattr(args, "open_ended_range", True),
+                        source_endpoint=getattr(args, "source_endpoint", "src") or "src",
+                        allow_defer_heavy=getattr(args, "allow_defer_heavy", True),
+                        executor=extract_executor,
+                        async_extract=bool(extract_executor is not None),
+                    )
+                except TypeError as type_err:
+                    err_msg = str(type_err)
+                    if any(k in err_msg for k in ("source_endpoint", "allow_defer_heavy", "executor", "async_extract", "open_ended_range")):
+                        result = download_and_clean_source(
+                            arxiv_id + tag,
+                            sources_dir,
+                            unzipped_dir,
+                            rate_limit_sec=getattr(args, "source_rate_limit_sec", 3.0),
+                            max_attempts=getattr(args, "source_download_attempts", 3),
+                            read_timeout_sec=getattr(args, "source_read_timeout_sec", 90.0),
+                            max_elapsed_sec=getattr(args, "source_max_seconds", 180.0),
+                        )
+                    else:
+                        raise
         except NotImplementedError:
             raise
         except Exception as error:
             result = {"status": "error", "error_message": repr(error)}
         status = result.get("status")
-        version["source_status"] = "success" if status == "ok" else status or "error"
+        if status == "extracting":
+            version["_extract_future"] = result.get("_extract_future")
+            version["source_status"] = "extracting"
+        else:
+            version["source_status"] = "success" if status == "ok" else status or "error"
+            if version["source_status"] in SOURCE_TERMINAL and session_cache is not None:
+                session_cache.setdefault("verified_reusable", set()).add((arxiv_id, tag))
         for field in ("size_before_bytes", "size_after_bytes"):
             if result.get(field) is not None:
                 version[field] = result[field]
         summary["version_results"].append(result)
-        profiler.capture()
+        if result.get("deferred_heavy"):
+            summary["deferred_heavy"] = True
+            logger.info("Hoãn paper %s (version %s dung lượng >= 30 MiB bị gián đoạn nhiều lần)", arxiv_id, tag)
+            break
         if result.get("rate_limited"):
             summary["rate_limited"] = True
             summary["retry_after_sec"] = result.get("retry_after_sec")
@@ -379,6 +444,61 @@ def _process_paper(arxiv_id: str, args: argparse.Namespace, profiler: ResourcePr
         paper[field] = sum(values) if values else None
     summary.update({"status": paper["source_status"], "size_before_bytes": paper["size_before_bytes"],
                     "size_after_bytes": paper["size_after_bytes"]})
+    return summary, paper
+
+
+def _finalize_paper_extractions(download: dict, paper_meta: dict, unzipped_dir: str,
+                                session_cache: dict | None = None, profiler: ResourceProfiler | None = None) -> None:
+    arxiv_id = paper_meta.get("id") or paper_meta.get("arxiv_id", "")
+    versions = paper_meta.get("versions") or []
+    has_extracting = False
+    for v in versions:
+        fut = v.pop("_extract_future", None)
+        if fut is not None:
+            has_extracting = True
+            phase_ctx = profiler.phase("extraction_wait") if profiler is not None else contextlib.nullcontext()
+            try:
+                with phase_ctx:
+                    final_res = fut.result()
+            except Exception as exc:
+                final_res = {
+                    "arxiv_id": arxiv_id,
+                    "version_id": f"{arxiv_id}{v.get('version')}",
+                    "status": "error",
+                    "error_message": repr(exc),
+                    "size_before_bytes": 0,
+                    "size_after_bytes": 0,
+                }
+            st = final_res.get("status")
+            v["source_status"] = "success" if st == "ok" else st or "error"
+            for field in ("size_before_bytes", "size_after_bytes"):
+                if final_res.get(field) is not None:
+                    v[field] = final_res[field]
+            v_tag = str(v.get("version") or "")
+            for res_idx, r in enumerate(download.get("version_results", [])):
+                if r.get("_extract_future") is fut or r.get("version_id") == f"{arxiv_id}{v_tag}":
+                    download["version_results"][res_idx] = final_res
+                    break
+            if final_res.get("status") in SOURCE_TERMINAL and session_cache is not None:
+                session_cache.setdefault("verified_reusable", set()).add((arxiv_id, v_tag))
+
+    if has_extracting:
+        paper_meta["source_status"] = resolve_paper_source_status([v.get("source_status") for v in versions])
+        for field in ("size_before_bytes", "size_after_bytes"):
+            values = [v[field] for v in versions if v.get(field) is not None]
+            paper_meta[field] = sum(values) if values else None
+        download.update({
+            "status": paper_meta["source_status"],
+            "size_before_bytes": paper_meta.get("size_before_bytes"),
+            "size_after_bytes": paper_meta.get("size_after_bytes"),
+        })
+
+
+def _resolve_paper_references(arxiv_id: str, args: argparse.Namespace, profiler: ResourceProfiler,
+                              unzipped_dir: str, previous_references: list | None = None,
+                              previous_observation: dict | None = None,
+                              prefetched_references: ReferenceResult | None = None) -> tuple[dict, list[dict]]:
+    dry_run = getattr(args, "dry_run", False)
     old = previous_observation or {}
     if dry_run:
         references = []
@@ -413,8 +533,21 @@ def _process_paper(arxiv_id: str, args: argparse.Namespace, profiler: ResourcePr
                                                  request_delta(before, get_request_stats()))}
         if status == "not_indexed":
             observation["expected_count"] = None
-    summary["observation"] = observation
-    return summary, list(references)
+    return observation, list(references)
+
+
+def _process_paper(arxiv_id: str, args: argparse.Namespace, profiler: ResourceProfiler,
+                   sources_dir: str, unzipped_dir: str, paper_record: dict | None = None,
+                   previous_references: list | None = None, previous_observation: dict | None = None,
+                   prefetched_references: ReferenceResult | None = None) -> tuple[dict, list[dict]]:
+    summary, paper = _download_paper_sources(arxiv_id, args, profiler, sources_dir, unzipped_dir, paper_record)
+    _finalize_paper_extractions(summary, paper, unzipped_dir, session_cache=getattr(args, "_session_cache", None), profiler=profiler)
+    obs, refs = _resolve_paper_references(arxiv_id, args, profiler, unzipped_dir,
+                                          previous_references, previous_observation, prefetched_references)
+    if not sources_complete(paper) and obs.get("reference_status") == "not_indexed":
+        obs["reference_status"] = "api_error"
+    summary["observation"] = obs
+    return summary, refs
 
 
 def _summary(publications: dict, references: dict, observations: dict, missing: set, errors: dict) -> dict:
@@ -435,210 +568,373 @@ def _summary(publications: dict, references: dict, observations: dict, missing: 
             "versions_succeeded": sum(v.get("source_status") == "success" for p in publications.values() for v in p.get("versions", []))}
 
 
-def run_pipeline(args: argparse.Namespace, profiler: ResourceProfiler, checkpoint: Checkpoint) -> dict:
+def run_pipeline(args: argparse.Namespace, profiler: ResourceProfiler, checkpoint: Checkpoint,
+                 session_cache: dict | None = None, policy: Any = None, extra: dict | None = None) -> dict:
     pipeline_started = time.perf_counter()
-    publications, references, observations = _materialize(checkpoint)
-    state = checkpoint.state
-    missing = set(state.get("confirmed_missing", []))
-    sources_dir, unzipped_dir = os.path.join(args.raw_dir, "sources"), os.path.join(args.raw_dir, "unzipped")
+    policy = policy or rate_limiter.policy
+    extra = extra if extra is not None else getattr(args, "_extra", {})
+    args._extra = extra
+    cache = session_cache if session_cache is not None else {}
+    for name in ("discovered_found", "prefetched_refs"):
+        cache.setdefault(name, {})
+    cache.setdefault("discovered_absent", set())
+    args._session_cache = cache
+    if cache.get("materialized_batch") == checkpoint.state.get("next_batch") and cache.get("materialized") is not None:
+        publications, references, observations = cache["materialized"]
+    else:
+        publications, references, observations = _materialize(checkpoint)
+    cache["materialized"] = publications, references, observations
+    cache["materialized_batch"] = checkpoint.state.get("next_batch")
+    missing = set(checkpoint.state.get("confirmed_missing", []))
+    errors = dict(checkpoint.state.get("failed", {}))
+    sources_dir, unzipped_dir = (os.path.join(args.raw_dir, name) for name in ("sources", "unzipped"))
     os.makedirs(sources_dir, exist_ok=True)
     os.makedirs(unzipped_dir, exist_ok=True)
     with profiler.phase("id_generation"):
         if not hasattr(args, "_assigned_ids"):
-            all_ids = sorted(publications) if getattr(args, "existing_only", False) else list(
+            assigned = sorted(publications) if args.existing_only else list(
                 iter_assigned_arxiv_ids(args.start_month, args.start_id, args.end_month, args.end_id))
-            args._assigned_ids = all_ids[:args.max_papers] if args.max_papers else all_ids
+            args._assigned_ids = assigned[:args.max_papers] if args.max_papers else assigned
         all_ids = args._assigned_ids
     if getattr(args, "recheck_missing", False) and not getattr(args, "_missing_rechecked", False):
-        count = len(missing.intersection(all_ids))
         missing.difference_update(all_ids)
         args._missing_rechecked = True
-        if count:
-            logger.info("Kiểm tra lại %d ID đã đánh dấu missing", count)
-    pending = [key for key in all_ids if key not in missing and
-               (key not in publications or not all(_version_reusable(key, v, unzipped_dir) for v in publications[key].get("versions", []))
-                or not sources_complete(publications[key]) or observations.get(key, {}).get("reference_status") not in REFERENCE_TERMINAL)]
+    pending = [key for key in all_ids if key not in missing and (
+        key not in publications or not sources_complete(publications[key]) or
+        not all(_version_reusable(key, v, unzipped_dir, cache) for v in publications[key].get("versions", [])) or
+        observations.get(key, {}).get("reference_status") not in REFERENCE_TERMINAL)]
     pending_at_start = len(pending)
     deferred_s2 = []
-    if rate_limiter.policy.snapshot("semantic_scholar")["remaining_sec"] > 0:
-        for key in pending:
-            paper = publications.get(key)
-            if (paper and observations.get(key, {}).get("reference_status") == "api_error"
-                    and sources_complete(paper)
-                    and all(_version_reusable(key, version, unzipped_dir) for version in paper.get("versions", []))):
-                deferred_s2.append(key)
-        deferred_set = set(deferred_s2)
-        pending = [key for key in pending if key not in deferred_set]
-        if deferred_s2:
-            logger.info("Hoãn %d bài chỉ còn lỗi S2 đến khi hết cooldown", len(deferred_s2))
+    if policy.snapshot("semantic_scholar")["remaining_sec"] > 0:
+        deferred_s2 = [key for key in pending if key in publications and
+                       sources_complete(publications[key]) and
+                       observations.get(key, {}).get("reference_status") == "api_error" and
+                       all(_version_reusable(key, v, unzipped_dir, cache) for v in publications[key].get("versions", []))]
+        pending = [key for key in pending if key not in set(deferred_s2)]
     deferred = getattr(args, "_rate_deferred_ids", set())
-    pending.sort(key=lambda key: key in deferred)
+    heavy = getattr(args, "_heavy_deferred_ids", set())
+    pending.sort(key=lambda key: (key in deferred, key in heavy))
     logger.info("Phạm vi %d ID; %d cần xử lý, %d đã đủ hoặc đã xác nhận không tồn tại",
-                len(all_ids), len(pending), len(all_ids) - len(pending))
-    attempted_versions = reused_versions = 0
-    errors = dict(state.get("failed", {}))
+                len(all_ids), len(pending), len(all_ids)-len(pending))
+    checkpoint_every = getattr(args, "checkpoint_every_papers", 25)
+    max_inflight = 1 if checkpoint_every == 1 else getattr(args, "max_inflight_papers", 25)
+    s2_executor = cache.get("s2_executor")
+    owns_s2 = s2_executor is None
+    if owns_s2:
+        s2_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="S2")
+    post_executor = BoundedExecutor(max_workers=1, max_pending=max_inflight, thread_name_prefix="PostProcessor")
+    extract_executor = BoundedExecutor(max_workers=2, max_pending=4, thread_name_prefix="ArchiveExtractor",
+                                       profiler=profiler, phase_name="extract_clean")
+    drive_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="DriveBackup")
+    args._extract_executor = extract_executor
+    drive_future = None
+    reference_futures = {}
+    jobs = deque()
+    batch_pubs, batch_refs, batch_status, batch_metrics = [], [], [], []
     metrics = []
-    metrics_path = Path(args._run_dir) / "paper_metrics.jsonl"
+    attempted_versions = reused_versions = visited_ids = 0
+    last_checkpoint = time.perf_counter()
+    metrics_path = Path(args._run_dir)/"paper_metrics.jsonl"
     metrics_path.touch(exist_ok=True)
-    visited_ids = 0
-    for batch in _batched(pending, args.batch_size):
-        need_discovery = [key for key in batch if key not in publications or not publications[key].get("versions")]
-        found = {key: deepcopy(publications[key]) for key in batch if key in publications and key not in need_discovery}
-        discovery_started = time.perf_counter()
-        if need_discovery:
-            with profiler.phase("discovery"):
-                try:
-                    metadata = discover_metadata_batch(need_discovery, rate_limit_sec=args.rate_limit_sec)
-                    for record in metadata:
-                        key = _record_id(record)
-                        if key in batch:
-                            found[key] = merge_publications(publications.get(key), record)
-                    failures = getattr(metadata, "failed_ids", {})
-                    for key in need_discovery:
-                        if key in failures:
-                            errors[key] = str(failures[key])
-                        elif key not in found:
-                            if key in getattr(metadata, "missing_confirmed", set()):
-                                missing.add(key)
-                                errors.pop(key, None)
-                            else:
-                                errors[key] = "discovery: ID chưa được xác minh trong feed"
-                except NotImplementedError:
-                    raise
-                except (arXivRateLimitError, CooldownDeferred) as error:
-                    args._paused_rate_limit = True
-                    args._rate_retry_after = getattr(error, "retry_after", None)
-                    errors.update({key: f"discovery: {error!r}" for key in need_discovery})
-                except Exception as error:
-                    errors.update({key: f"discovery: {error!r}" for key in need_discovery})
-        discovery_sec = time.perf_counter() - discovery_started
-        if not found and rate_limiter.policy.snapshot("arxiv")["remaining_sec"] > 0:
-            args._paused_rate_limit = True
-        prefetched = {}
-        reference_batch_sec = 0.0
-        needs_references = [key for key in batch if key in found and
-                            observations.get(key, {}).get("reference_status") not in REFERENCE_TERMINAL]
-        if needs_references and not args.dry_run and args.s2_batch_size > 1:
-            began = time.perf_counter()
-            with profiler.phase("references"):
-                prefetched = scrape_references_batch(needs_references, rate_limit_sec=args.s2_rate_limit_sec,
-                                                       batch_size=args.s2_batch_size)
-            reference_batch_sec = time.perf_counter() - began
-        batch_pubs, batch_refs, batch_status, batch_metrics = [], [], [], []
-        visited_this_batch = 0
+    failures = []
+    extra["paper_metric_scope"] = "Per-paper latency includes queue waits; overlapping paper latencies are not wall time."
+    extra["phase_timing_scope"] = "Worker service intervals may overlap; use runtime_sec or child_wall_sec for end-to-end time."
+    extra["pipeline_max_inflight_observed"] = extra.get("pipeline_max_inflight_observed", 0)
 
-        def flush_checkpoint():
-            nonlocal errors
-            batch_no = checkpoint.state["next_batch"]
-            storage_started = time.perf_counter()
-            next_state = deepcopy(checkpoint.state)
-            with profiler.phase("storage"):
-                for kind, rows, writer in (("publications", batch_pubs, save_publications_parquet),
-                                           ("references", batch_refs, save_references_parquet),
-                                           ("statuses", batch_status, save_observations)):
-                    if rows:
-                        name = f"{kind}_{batch_no:05d}.parquet"
-                        writer(rows, checkpoint.part_path(name))
-                        next_state["parts"].setdefault(kind, []).append(name)
-            storage_sec = time.perf_counter() - storage_started
-            current = _summary(publications, references, observations, missing, errors)
-            errors = dict(current["failed_ids"])
-            next_state.update({"schema_version": 2, "next_batch": batch_no + 1, "confirmed_missing": sorted(missing),
-                               "done_ids": sorted(set(publications) | missing), "failed": errors, "counts": current,
-                               "paper_states": {key: {"sources": {v["version"]: v.get("source_status") for v in p.get("versions", [])},
-                                                      "reference_status": observations.get(key, {}).get("reference_status", "unknown")}
-                                                for key, p in publications.items()}})
-            _write_json_atomic(checkpoint.path, next_state)
-            checkpoint.state = next_state
-            backup = getattr(args, "_drive_backup", None)
-            if backup:
-                args._backup_papers += len(batch_pubs)
-                if args._backup_papers >= args.backup_every_papers:
-                    try:
-                        with profiler.phase("drive_backup"):
-                            backup.save(args._backup_dirty_ids)
-                    except BaseException:
-                        args._backup_failed = True
-                        raise
-                    args._backup_dirty_ids.clear()
-                    args._backup_papers = 0
-            with metrics_path.open("a", encoding="utf-8") as stream:
-                for metric in batch_metrics:
-                    metric["storage_allocated_sec"] = storage_sec / max(1, len(batch_metrics))
-                    metric["elapsed_sec"] = (metric["compute_sec"] + metric["discovery_allocated_sec"]
-                                             + metric["reference_batch_allocated_sec"] + metric["storage_allocated_sec"])
-                    stream.write(json.dumps(metric) + "\n")
-                    metrics.append(metric)
-            logger.info("Đã lưu checkpoint %d: %d paper, %d hoàn tất, %d cần retry",
-                        batch_no, len(batch_pubs), current["succeeded"], current["failed"])
-            for rows in (batch_pubs, batch_refs, batch_status, batch_metrics):
-                rows.clear()
+    def fetch_references(keys):
+        started = time.perf_counter()
+        with profiler.phase("s2_batch"):
+            result = scrape_references_batch(keys, rate_limit_sec=args.s2_rate_limit_sec, batch_size=args.s2_batch_size)
+        return result, time.perf_counter()-started, len(keys)
 
-        for key in batch:
-            visited_this_batch += 1
-            if key not in found:
+    def stage_b(key, download, paper, old_refs, old_obs, started, source_sec, discovery_sec, ref_future):
+        post_started = time.perf_counter()
+        begin = time.perf_counter()
+        _finalize_paper_extractions(download, paper, unzipped_dir, session_cache=cache, profiler=profiler)
+        extraction_wait = time.perf_counter()-begin
+        begin = time.perf_counter()
+        prefetched = cache["prefetched_refs"].get(key)
+        batch_allocated = 0.0
+        if ref_future is not None:
+            try:
+                results, duration, count = ref_future.result()
+                prefetched = results.get(key)
+                batch_allocated = duration/max(1,count)
+            except Exception as error:
+                prefetched = ReferenceResult([], status="api_error", error_message=repr(error))
+        if prefetched is not None:
+            cache["prefetched_refs"][key] = prefetched
+        call = lambda: _resolve_paper_references(key, args, profiler, unzipped_dir, old_refs, old_obs, prefetched)
+        if args.dry_run or (old_obs or {}).get("reference_status") in REFERENCE_TERMINAL:
+            obs, refs = call()
+        else:
+            obs, refs = s2_executor.submit(call).result()
+        if not sources_complete(paper) and obs.get("reference_status") == "not_indexed":
+            obs["reference_status"] = "api_error"
+        reference_wait = time.perf_counter()-begin
+        finished = time.perf_counter()
+        metric = {"arxiv_id": key, "run_id": args._run_id, "source_sec": source_sec,
+                  "post_queue_sec": max(0.0, post_started-started-source_sec),
+                  "extraction_wait_sec": extraction_wait, "reference_wait_sec": reference_wait,
+                  "compute_sec": source_sec+max(0.0, finished-post_started-extraction_wait-reference_wait),
+                  "latency_sec": finished-started, "elapsed_sec": finished-started,
+                  "discovery_allocated_sec": discovery_sec, "reference_batch_allocated_sec": batch_allocated,
+                  "versions_attempted": download["versions_attempted"], "versions_reused": download["versions_reused"]}
+        return key, paper, download, obs, refs, metric
+
+    def collect(wait_one=False, wait_all=False):
+        nonlocal attempted_versions, reused_versions
+        collected = 0
+        while jobs:
+            if not wait_all and not jobs[0][1].done() and not (wait_one and collected == 0):
+                break
+            key, future = jobs.popleft()
+            try:
+                key, paper, download, obs, refs, metric = future.result()
+            except BaseException as error:
+                errors[key] = repr(error)
+                failures.append(error)
                 continue
-            if not found[key].get("versions"):
-                errors[key] = "discovery: thiếu thông tin version; cần xác minh lại"
-                continue
-            if getattr(args, "_drive_backup", None):
-                args._backup_dirty_ids.add(key)
-            started = time.perf_counter()
-            download, new_refs = _process_paper(key, args, profiler, sources_dir, unzipped_dir,
-                                                found[key], references.get(key), observations.get(key), prefetched.get(key))
-            pub = merge_publications(publications.get(key), found[key])
-            obs = download["observation"]
-            publications[key] = pub
+            publications[key] = merge_publications(publications.get(key), paper)
             if obs["reference_update"] == "replace":
-                references[key] = merge_references(new_refs)
+                references[key] = merge_references(refs)
             elif obs["reference_update"] == "merge":
-                references[key] = merge_references([*references.get(key, []), *new_refs])
+                references[key] = merge_references([*references.get(key, []), *refs])
             observations[key] = obs
             attempted_versions += download["versions_attempted"]
             reused_versions += download["versions_reused"]
-            batch_pubs.append(pub)
+            batch_pubs.append(publications[key])
             if obs["reference_update"] != "keep":
-                batch_refs.extend(new_refs)
+                batch_refs.extend(refs)
             batch_status.append(obs)
-            batch_metrics.append({"arxiv_id": key, "compute_sec": time.perf_counter() - started,
-                                  "discovery_allocated_sec": discovery_sec / max(1, len(found)),
-                                  "reference_batch_allocated_sec": reference_batch_sec / max(1, len(prefetched)) if key in prefetched else 0.0,
-                                  "versions_attempted": download["versions_attempted"],
-                                  "versions_reused": download["versions_reused"], "run_id": args._run_id})
-            if len(batch_pubs) >= args.checkpoint_every_papers:
-                flush_checkpoint()
-            if download.get("rate_limited"):
-                args._paused_rate_limit = True
-                args._rate_retry_after = download.get("retry_after_sec")
-                args._rate_failed_id = key
+            batch_metrics.append(metric)
+            if getattr(args, "_drive_backup", None):
+                args._backup_dirty_ids.add(key)
+            collected += 1
+
+    def flush():
+        nonlocal errors, drive_future, last_checkpoint
+        if drive_future is not None:
+            drive_future.result()
+            drive_future = None
+        started = time.perf_counter()
+        batch_no = checkpoint.state["next_batch"]
+        next_state = deepcopy(checkpoint.state)
+        with profiler.phase("storage"):
+            for kind, rows, writer in (("publications", batch_pubs, save_publications_parquet),
+                                       ("references", batch_refs, save_references_parquet),
+                                       ("statuses", batch_status, save_observations)):
+                if rows:
+                    name = f"{kind}_{batch_no:05d}.parquet"
+                    writer(rows, checkpoint.part_path(name))
+                    next_state["parts"].setdefault(kind, []).append(name)
+            current = _summary(publications, references, observations, missing, errors)
+            errors = dict(current["failed_ids"])
+            next_state.update(schema_version=2, next_batch=batch_no+1, confirmed_missing=sorted(missing),
+                              done_ids=sorted(set(publications)|missing), failed=errors, counts=current,
+                              paper_states={key: {"sources": {v["version"]: v.get("source_status") for v in p.get("versions", [])},
+                                                  "reference_status": observations.get(key, {}).get("reference_status", "unknown")}
+                                            for key, p in publications.items()})
+            _write_json_atomic(checkpoint.path, next_state)
+            checkpoint.state = next_state
+            cache["materialized_batch"] = next_state["next_batch"]
+        storage_sec = time.perf_counter()-started
+        with metrics_path.open("a", encoding="utf-8") as stream:
+            for metric in batch_metrics:
+                metric["storage_allocated_sec"] = storage_sec/max(1, len(batch_metrics))
+                stream.write(json.dumps(metric)+"\n")
+                metrics.append(metric)
+        backup = getattr(args, "_drive_backup", None)
+        if backup:
+            args._backup_papers += len(batch_pubs)
+            if args._backup_papers >= args.backup_every_papers:
+                dirty = set(args._backup_dirty_ids)
+                def save_backup():
+                    try:
+                        with profiler.phase("drive_backup"):
+                            backup.save(dirty)
+                    except BaseException:
+                        args._backup_failed = True
+                        raise
+                if args.backup_every_papers == 1:
+                    save_backup()
+                else:
+                    drive_future = drive_executor.submit(save_backup)
+                args._backup_dirty_ids.clear()
+                args._backup_papers = 0
+        logger.info("Đã lưu checkpoint %d: %d paper, %d hoàn tất, %d cần retry",
+                    batch_no, len(batch_pubs), current["succeeded"], current["failed"])
+        for rows in (batch_pubs, batch_refs, batch_status, batch_metrics):
+            rows.clear()
+        last_checkpoint = time.perf_counter()
+
+    def maybe_flush():
+        if batch_pubs and (len(batch_pubs) >= checkpoint_every or time.perf_counter()-last_checkpoint >= 30):
+            flush()
+        if failures:
+            raise failures[0]
+
+    try:
+        for batch in _batched(pending, args.batch_size):
+            collect()
+            maybe_flush()
+            found = {key: deepcopy(publications[key]) for key in batch if key in publications and publications[key].get("versions")}
+            needed = [key for key in batch if key not in found and key not in cache["discovered_found"] and key not in cache["discovered_absent"]]
+            discovery_started = time.perf_counter()
+            if needed:
+                with profiler.phase("discovery"):
+                    try:
+                        metadata = discover_metadata_batch(needed, rate_limit_sec=args.rate_limit_sec)
+                        for record in metadata:
+                            key = _record_id(record)
+                            cache["discovered_found"][key] = record
+                        for key in needed:
+                            if key in getattr(metadata, "missing_confirmed", set()):
+                                cache["discovered_absent"].add(key)
+                            elif key not in cache["discovered_found"]:
+                                errors[key] = str(getattr(metadata, "failed_ids", {}).get(key, "ID chưa được xác minh"))
+                    except (arXivRateLimitError, CooldownDeferred) as error:
+                        args._paused_rate_limit = True
+                        args._rate_retry_after = getattr(error, "retry_after", None)
+                        errors.update({key: f"discovery: {error!r}" for key in needed})
+                    except (KeyboardInterrupt, NotImplementedError):
+                        raise
+                    except Exception as error:
+                        errors.update({key: f"discovery: {error!r}" for key in needed})
+            for key in batch:
+                if key in cache["discovered_found"] and key not in found:
+                    found[key] = merge_publications(publications.get(key), cache["discovered_found"][key])
+                if key in cache["discovered_absent"]:
+                    missing.add(key)
+                    errors.pop(key, None)
+            discovery_share = (time.perf_counter()-discovery_started)/max(1, len(found))
+            needing_refs = []
+            for key in batch:
+                if key not in found or observations.get(key, {}).get("reference_status") in REFERENCE_TERMINAL:
+                    continue
+                previous = cache["prefetched_refs"].get(key)
+                if previous is not None and previous.status == "api_error" and policy.snapshot("semantic_scholar")["remaining_sec"] <= 0:
+                    cache["prefetched_refs"].pop(key, None)
+                if key not in cache["prefetched_refs"] and key not in reference_futures:
+                    needing_refs.append(key)
+            if needing_refs and not args.dry_run and args.s2_batch_size > 1:
+                future = s2_executor.submit(fetch_references, needing_refs)
+                reference_futures.update({key: future for key in needing_refs})
+            for key in batch:
+                visited_ids += 1
+                collect(wait_one=len(jobs) >= max_inflight)
+                maybe_flush()
+                if drive_future is not None and drive_future.done():
+                    drive_future.result()
+                if key not in found:
+                    continue
+                if not found[key].get("versions"):
+                    errors[key] = "discovery: thiếu thông tin version"
+                    continue
+                started = time.perf_counter()
+                try:
+                    download, paper = _download_paper_sources(key, args, profiler, sources_dir, unzipped_dir, found[key])
+                except BaseException:
+                    if getattr(args, "_drive_backup", None):
+                        args._backup_dirty_ids.add(key)
+                    raise
+                source_sec = time.perf_counter()-started
+                future = post_executor.submit(stage_b, key, download, paper, references.get(key), observations.get(key),
+                                              started, source_sec, discovery_share, reference_futures.get(key))
+                jobs.append((key, future))
+                extra["pipeline_max_inflight_observed"] = max(extra["pipeline_max_inflight_observed"], len(jobs))
+                if checkpoint_every == 1:
+                    collect(wait_one=True)
+                    maybe_flush()
+                if download.get("deferred_heavy"):
+                    args._heavy_deferred_ids.add(key)
+                if download.get("rate_limited"):
+                    collect(wait_all=True)
+                    flush()
+                    args._rate_retry_after = download.get("retry_after_sec")
+                    args._rate_deferred_ids.add(key)
+                    if not args.auto_resume_rate_limit:
+                        args._paused_rate_limit = True
+                        args._rate_failed_id = key
+                        break
+                    _wait_for_arxiv_inplace(args, profiler, policy, retry_after=args._rate_retry_after, extra=extra)
+                    extra["auto_rate_limit_resumes"] = extra.get("auto_rate_limit_resumes", 0)+1
+                    if policy.snapshot("arxiv").get("consecutive_429", 0) >= 10:
+                        args._paused_rate_limit = True
+                        break
+            collect()
+            maybe_flush()
+            elapsed = time.perf_counter()-pipeline_started
+            remaining = max(0, len(pending)-visited_ids)
+            logger.info("Tiến độ tải: %d/%d ID; %d bài chờ xử lý nền; ước tính lượt còn lại %.2f giờ",
+                        visited_ids, len(pending), len(jobs), elapsed/max(1, visited_ids)*remaining/3600)
+            if args._paused_rate_limit:
                 break
-        if batch_pubs or not found or any(key in errors for key in batch):
-            flush_checkpoint()
-        current = _summary(publications, references, observations, missing, errors)
-        visited_ids += visited_this_batch
-        remaining_ids = len(pending) - visited_ids
-        eta_hours = ((time.perf_counter() - pipeline_started) / visited_ids * remaining_ids / 3600)
-        logger.info("Tiến độ: %d/%d ID trong lượt; %d hoàn tất, %d cần retry; ước tính lượt còn lại %.2f giờ",
-                    visited_ids, len(pending), current["succeeded"], current["failed"], eta_hours)
-        if getattr(args, "_paused_rate_limit", False):
-            break
-    with profiler.phase("storage"):
-        save_publications_parquet([publications[key] for key in sorted(publications)], os.path.join(args.output_dir, "publications.parquet"))
-        save_references_parquet([row for key in sorted(references) for row in references[key]], os.path.join(args.output_dir, "references.parquet"))
-        save_observations([observations[key] for key in sorted(observations)], os.path.join(args.output_dir, "crawl_status.parquet"))
+    finally:
+        active_error = sys.exc_info()[0] is not None
+        if jobs:
+            logger.info("Chờ %d bài xử lý nền và sao lưu trước khi kết thúc lượt", len(jobs))
+        try:
+            collect(wait_all=True)
+            if not getattr(args, "_backup_failed", False) and (batch_pubs or errors != checkpoint.state.get("failed", {}) or missing != set(checkpoint.state.get("confirmed_missing", []))):
+                flush()
+        finally:
+            post_executor.shutdown(wait=True)
+            extract_executor.shutdown(wait=True)
+            args._extract_executor = None
+            try:
+                if drive_future is not None:
+                    drive_future.result()
+            finally:
+                drive_executor.shutdown(wait=True)
+                if owns_s2:
+                    s2_executor.shutdown(wait=True)
+        if failures and not active_error:
+            raise failures[0]
+    if not getattr(args, "_in_rate_resume_loop", False):
+        with profiler.phase("storage"):
+            save_publications_parquet([publications[key] for key in sorted(publications)], os.path.join(args.output_dir, "publications.parquet"))
+            save_references_parquet([row for key in sorted(references) for row in references[key]], os.path.join(args.output_dir, "references.parquet"))
+            save_observations([observations[key] for key in sorted(observations)], os.path.join(args.output_dir, "crawl_status.parquet"))
     current = _summary(publications, references, observations, missing, errors)
     current.update(total_ids=len(all_ids), processed_this_run=len(metrics), pending_at_start=pending_at_start,
-                   deferred_s2_cooldown=len(deferred_s2),
-                   versions_attempted=attempted_versions, versions_reused=reused_versions,
-                   avg_paper_sec_this_run=sum(m["elapsed_sec"] for m in metrics) / len(metrics) if metrics else None)
-    current["pending_after_run"] = sum(key not in missing and (key not in publications or not sources_complete(publications[key])
-                                      or observations.get(key, {}).get("reference_status") not in REFERENCE_TERMINAL) for key in all_ids)
+                   deferred_s2_cooldown=len(deferred_s2), versions_attempted=attempted_versions, versions_reused=reused_versions,
+                   avg_paper_sec_this_run=sum(m["elapsed_sec"] for m in metrics)/len(metrics) if metrics else None)
+    current["pending_after_run"] = sum(key not in missing and (key not in publications or not sources_complete(publications[key]) or
+        observations.get(key, {}).get("reference_status") not in REFERENCE_TERMINAL) for key in all_ids)
     return current
+
+
+
+def _wait_for_arxiv_inplace(args, profiler, policy, retry_after: float | None = None, extra: dict | None = None) -> None:
+    fallback_deadline = time.monotonic() + (retry_after or getattr(args, "_rate_retry_after", None) or 0.0)
+    started = time.monotonic()
+    try:
+        with profiler.phase("rate_limit_wait"):
+            while True:
+                state = policy.snapshot("arxiv")
+                remaining = state["remaining_sec"] if state.get("not_before") else max(0.0, fallback_deadline - time.monotonic())
+                if remaining <= 0:
+                    break
+                logger.info("Đang chờ arXiv rate limit %.0fs tại chỗ; hết cooldown sẽ tự tiếp tục...", remaining)
+                time.sleep(min(15.0, remaining))
+            try:
+                with policy.state("arxiv") as st:
+                    st["interval"] = 0.0
+                if policy.snapshot("semantic_scholar")["remaining_sec"] <= 0:
+                    with policy.state("semantic_scholar") as st:
+                        st["interval"] = 0.0
+            except Exception:
+                pass
+    finally:
+        wait_dur = max(0.0, time.monotonic() - started)
+        if extra is not None:
+            extra["auto_rate_limit_wait_sec"] = extra.get("auto_rate_limit_wait_sec", 0.0) + wait_dur
 
 
 def _wait_for_arxiv(args, profiler, policy, extra):
     backup = getattr(args, "_drive_backup", None)
-    if backup:
+    if backup and getattr(args, "_backup_dirty_ids", None):
         try:
             with profiler.phase("drive_backup"):
                 backup.save(args._backup_dirty_ids, include_outputs=True)
@@ -655,57 +951,111 @@ def _wait_for_arxiv(args, profiler, policy, extra):
                 state = policy.snapshot("arxiv")
                 remaining = state["remaining_sec"] if state.get("not_before") else max(0, fallback_deadline - time.monotonic())
                 if remaining <= 0:
-                    return
+                    break
                 logger.info("Full đang chờ arXiv %.0fs; checkpoint đã lưu, hết cooldown sẽ tự tiếp tục. Stop để dừng.", remaining)
                 time.sleep(min(15.0, remaining))
+            try:
+                with policy.state("arxiv") as st:
+                    st["interval"] = 0.0
+                if policy.snapshot("semantic_scholar")["remaining_sec"] <= 0:
+                    with policy.state("semantic_scholar") as st:
+                        st["interval"] = 0.0
+            except Exception:
+                pass
     finally:
         extra["auto_rate_limit_wait_sec"] += max(0, time.monotonic() - started)
 
 
-def _run_with_rate_resume(args, profiler, checkpoint, policy, extra):
+def _run_with_rate_resume(args, profiler, checkpoint, policy, extra, session_cache: dict | None = None):
     extra.update(auto_rate_limit_resumes=0, auto_rate_limit_wait_sec=0.0, pipeline_passes=0)
     first_pending = None
     args._rate_deferred_ids = set()
-    while True:
-        args._paused_rate_limit = False
-        args._rate_retry_after = None
-        args._rate_failed_id = None
-        extra["pipeline_passes"] += 1
-        try:
-            current = run_pipeline(args, profiler, checkpoint)
-        except (arXivRateLimitError, CooldownDeferred) as error:
-            if not args.auto_resume_rate_limit:
+    if not hasattr(args, "_heavy_deferred_ids") or args._heavy_deferred_ids is None:
+        args._heavy_deferred_ids = set()
+    if session_cache is None:
+        session_cache = {
+            "discovered_found": {},
+            "discovered_absent": set(),
+            "prefetched_refs": {},
+        }
+    args._in_rate_resume_loop = True
+    session_cache.setdefault("s2_executor", concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="S2Prefetcher"))
+    try:
+        while True:
+            args._paused_rate_limit = False
+            args._rate_retry_after = None
+            args._rate_failed_id = None
+            extra["pipeline_passes"] += 1
+            try:
+                current = run_pipeline(args, profiler, checkpoint, session_cache=session_cache, policy=policy, extra=extra)
+            except (arXivRateLimitError, CooldownDeferred) as error:
+                if not args.auto_resume_rate_limit:
+                    raise
+                args._paused_rate_limit = True
+                args._rate_retry_after = getattr(error, "retry_after", None)
+                extra["last_rate_limit_error"] = str(error)
+                current = None
+            except BaseException:
+                cached_mat = session_cache.get("materialized")
+                pubs, refs, observations = cached_mat if cached_mat is not None else _materialize(checkpoint)
+                with profiler.phase("storage"):
+                    save_publications_parquet([pubs[key] for key in sorted(pubs)], os.path.join(args.output_dir, "publications.parquet"))
+                    save_references_parquet([row for key in sorted(refs) for row in refs[key]], os.path.join(args.output_dir, "references.parquet"))
+                    save_observations([observations[key] for key in sorted(observations)], os.path.join(args.output_dir, "crawl_status.parquet"))
+                state = checkpoint.state
+                current = {**extra.get("results", {}), **_summary(pubs, refs, observations,
+                           set(state.get("confirmed_missing", [])), state.get("failed", {}))}
+                if hasattr(args, "_assigned_ids"):
+                    current["total_ids"] = len(args._assigned_ids)
+                    current["pending_after_run"] = sum(key not in set(state.get("confirmed_missing", [])) and
+                        (key not in pubs or not sources_complete(pubs[key]) or
+                         observations.get(key, {}).get("reference_status") not in REFERENCE_TERMINAL) for key in args._assigned_ids)
+                extra["results"] = _accumulate_paper_metrics(args, current, first_pending)
                 raise
-            args._paused_rate_limit = True
-            args._rate_retry_after = getattr(error, "retry_after", None)
-            extra["last_rate_limit_error"] = str(error)
-            current = None
-        except BaseException:
-            pubs, refs, observations = _materialize(checkpoint)
-            state = checkpoint.state
-            current = {**extra.get("results", {}), **_summary(pubs, refs, observations,
-                       set(state.get("confirmed_missing", [])), state.get("failed", {}))}
-            if hasattr(args, "_assigned_ids"):
-                current["total_ids"] = len(args._assigned_ids)
-                current["pending_after_run"] = sum(key not in set(state.get("confirmed_missing", [])) and
-                    (key not in pubs or not sources_complete(pubs[key]) or
-                     observations.get(key, {}).get("reference_status") not in REFERENCE_TERMINAL) for key in args._assigned_ids)
-            extra["results"] = _accumulate_paper_metrics(args, current, first_pending)
-            raise
-        if current is not None:
-            if first_pending is None:
-                first_pending = current["pending_at_start"]
-            current = _accumulate_paper_metrics(args, current, first_pending)
-            extra["results"] = current
-        if not args.auto_resume_rate_limit or not args._paused_rate_limit:
-            return current
-        if args._rate_failed_id:
-            args._rate_deferred_ids.add(args._rate_failed_id)
-            logger.info("Hoãn %s về cuối hàng đợi; tiếp tục các ID khác sau cooldown", args._rate_failed_id)
-        _wait_for_arxiv(args, profiler, policy, extra)
-        extra["auto_rate_limit_resumes"] += 1
-        logger.info("Tiếp tục toàn dải sau cooldown arXiv, lần %d; giữ các ID đã xong",
-                    extra["auto_rate_limit_resumes"])
+            if current is not None:
+                if first_pending is None:
+                    first_pending = current["pending_at_start"]
+                current = _accumulate_paper_metrics(args, current, first_pending)
+                extra["results"] = current
+            rate_deferred = getattr(args, "_rate_deferred_ids", set())
+            heavy_deferred = getattr(args, "_heavy_deferred_ids", set())
+            has_pending_rate = bool(rate_deferred and current and current.get("pending_after_run", 0) > 0)
+            has_pending_heavy = bool(heavy_deferred and current and current.get("pending_after_run", 0) > 0)
+            max_sweeps = getattr(args, "max_heavy_sweeps", 10)
+            if extra.get("heavy_sweep_passes", 0) >= max_sweeps:
+                has_pending_heavy = False
+            if extra.get("rate_sweep_passes", 0) >= max_sweeps:
+                has_pending_rate = False
+            if not args.auto_resume_rate_limit or (not args._paused_rate_limit and not has_pending_heavy and not has_pending_rate):
+                cached_mat = session_cache.get("materialized")
+                pubs, refs, observations = cached_mat if cached_mat is not None else _materialize(checkpoint)
+                with profiler.phase("storage"):
+                    save_publications_parquet([pubs[key] for key in sorted(pubs)], os.path.join(args.output_dir, "publications.parquet"))
+                    save_references_parquet([row for key in sorted(refs) for row in refs[key]], os.path.join(args.output_dir, "references.parquet"))
+                    save_observations([observations[key] for key in sorted(observations)], os.path.join(args.output_dir, "crawl_status.parquet"))
+                return current
+            if args._rate_failed_id:
+                args._rate_deferred_ids.add(args._rate_failed_id)
+                logger.info("Hoãn %s về cuối hàng đợi; tiếp tục các ID khác sau cooldown", args._rate_failed_id)
+            if args._paused_rate_limit:
+                _wait_for_arxiv(args, profiler, policy, extra)
+                extra["auto_rate_limit_resumes"] += 1
+                logger.info("Tiếp tục toàn dải sau cooldown arXiv, lần %d; giữ các ID đã xong",
+                            extra["auto_rate_limit_resumes"])
+            elif has_pending_rate:
+                extra["rate_sweep_passes"] = extra.get("rate_sweep_passes", 0) + 1
+                logger.info("Bắt đầu đợt sweep lần %d cho %d bài báo bị rate limit đã hoãn",
+                            extra["rate_sweep_passes"], len(rate_deferred))
+                rate_deferred.clear()
+            else:
+                extra["heavy_sweep_passes"] = extra.get("heavy_sweep_passes", 0) + 1
+                logger.info("Bắt đầu đợt sweep lần %d cho %d bài báo dung lượng lớn đã hoãn",
+                            extra["heavy_sweep_passes"], len(heavy_deferred))
+    finally:
+        args._in_rate_resume_loop = False
+        s2_exec = session_cache.pop("s2_executor", None)
+        if s2_exec is not None:
+            s2_exec.shutdown(wait=True)
 
 
 def _accumulate_paper_metrics(args, current, first_pending):
@@ -761,6 +1111,7 @@ def _execute_main(args, policy):
         from .drive_backup import CheckpointBackup
         args._drive_backup = CheckpointBackup(args.raw_dir, args.output_dir, args.backup_dir)
     profiler = ResourceProfiler(sample_interval_sec=args.profile_interval_sec,
+                                 disk_interval_sec=args.disk_profile_interval_sec,
                                  watch_dirs={"raw_sources": os.path.join(args.raw_dir, "sources"),
                                              "raw_unzipped": os.path.join(args.raw_dir, "unzipped"), "shard": args.output_dir,
                                              "network_state": str(policy.directory)},
@@ -774,7 +1125,8 @@ def _execute_main(args, policy):
                                                        "auto_resume_rate_limit",
                                                        "recheck_missing",
                                                        "source_rate_limit_sec", "backup_dir", "backup_every_papers",
-                                                       "source_download_attempts", "source_read_timeout_sec", "source_max_seconds")}}
+                                                       "source_download_attempts", "source_read_timeout_sec", "source_max_seconds",
+                                                       "source_endpoint", "max_inflight_papers", "disk_profile_interval_sec")}}
     extra["runtime_scope"] = "profiler start through final data backup; excludes final output backup and notebook validation"
     extra["disk_scope"] = "raw sources, extracted files, shard and network state; excludes external course export and Drive backup"
     extra["run_args"]["existing_only"] = getattr(args, "existing_only", False)

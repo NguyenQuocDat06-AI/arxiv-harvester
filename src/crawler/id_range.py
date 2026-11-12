@@ -1,10 +1,26 @@
 import re
+import json
+from pathlib import Path
 from typing import Iterator
 from .discovery import discover_metadata_batch
 from .exceptions import arXivConnectionError
 
 MAX_ARXIV_SEQ = 99999
 _LAST_ID_CACHE: dict[str, int] = {}
+
+def _is_absent(res, paper_id: str) -> bool:
+    """Only explicit evidence can establish that an ID is missing."""
+    return paper_id in getattr(res, "missing_confirmed", set())
+
+
+def _probe(paper_id, rate_limit_sec):
+    result = discover_metadata_batch([paper_id], rate_limit_sec=rate_limit_sec)
+    reason = getattr(result, "failed_ids", {}).get(paper_id, "")
+    if paper_id not in result.records_by_id and reason == "ID absent from feed; existence not confirmed":
+        from .discovery import confirm_missing_id
+        if confirm_missing_id(paper_id, rate_limit_sec=rate_limit_sec):
+            result.missing_confirmed.add(paper_id)
+    return result
 
 def normalize_yymm(month_str: str) -> str:
     """Normalize YYYY-MM or YYMM to YYMM."""
@@ -56,6 +72,15 @@ def find_last_id_of_month(
 ) -> int:
     """Find the last monthly ID by binary search; propagate request errors."""
     norm_yymm = normalize_yymm(yymm)
+    from .rate_limiter import rate_limiter
+    directory = rate_limiter.policy.directory
+    cache_path = Path(directory)/"month_ends"/(norm_yymm+".json") if directory is not None else None
+    if use_cache and cache_path is not None and cache_path.is_file():
+        evidence = json.loads(cache_path.read_text(encoding="utf-8"))
+        last = evidence.get("last_existing")
+        if (evidence.get("month") == norm_yymm and isinstance(last, int) and 1 <= last < MAX_ARXIV_SEQ
+                and evidence.get("next_absent") == last+1 and evidence.get("method") == "Atom and OAI boundary verification"):
+            _LAST_ID_CACHE[norm_yymm] = last
     if use_cache and norm_yymm in _LAST_ID_CACHE:
         return _LAST_ID_CACHE[norm_yymm]
 
@@ -64,12 +89,14 @@ def find_last_id_of_month(
 
     # Verify the lower bound.
     start_id = f"{norm_yymm}.{start_seq:05d}"
-    res_start = discover_metadata_batch([start_id], rate_limit_sec=rate_limit_sec)
+    res_start = _probe(start_id, rate_limit_sec)
     if start_id not in res_start.records_by_id:
-        if start_id in res_start.missing_confirmed:
+        if _is_absent(res_start, start_id):
             raise ValueError(f"ID {start_id} does not exist on arXiv.")
         raise arXivConnectionError(
-            f"Failed to verify {start_id} on arXiv due to network/API error.",
+            f"Failed to verify {start_id} on arXiv due to network/API error: {res_start.failed_ids.get(start_id)}",
+            timeout=20.0,
+            endpoint="http://export.arxiv.org/api/query",
             failed_ids=[start_id],
         )
 
@@ -80,18 +107,20 @@ def find_last_id_of_month(
     # Expand the upper bound up to MAX_ARXIV_SEQ.
     while high <= MAX_ARXIV_SEQ:
         probe_id = f"{norm_yymm}.{high:05d}"
-        res = discover_metadata_batch([probe_id], rate_limit_sec=rate_limit_sec)
+        res = _probe(probe_id, rate_limit_sec)
         if probe_id in res.records_by_id:
             last_found = high
             low = high
             if high == MAX_ARXIV_SEQ:
                 break
             high = min(high + 5000, MAX_ARXIV_SEQ)
-        elif probe_id in res.missing_confirmed:
+        elif _is_absent(res, probe_id):
             break
         else:
             raise arXivConnectionError(
-                f"Error checking upper bound {probe_id}: network/API error",
+                f"Error checking upper bound {probe_id}: network/API error: {res.failed_ids.get(probe_id)}",
+                timeout=20.0,
+                endpoint="http://export.arxiv.org/api/query",
                 failed_ids=[probe_id],
             )
 
@@ -99,22 +128,29 @@ def find_last_id_of_month(
     while low <= high:
         mid = (low + high) // 2
         arxiv_id = f"{norm_yymm}.{mid:05d}"
-        res = discover_metadata_batch([arxiv_id], rate_limit_sec=rate_limit_sec)
+        res = _probe(arxiv_id, rate_limit_sec)
 
         if arxiv_id in res.records_by_id:
             last_found = mid
             low = mid + 1
-        elif arxiv_id in res.missing_confirmed:
+        elif _is_absent(res, arxiv_id):
             high = mid - 1
         else:
             # A request error cannot determine which bound to move.
             raise arXivConnectionError(
-                f"Transient error probing {arxiv_id}, halting binary search safely.",
+                f"Transient error probing {arxiv_id}, halting binary search safely: {res.failed_ids.get(arxiv_id)}",
+                timeout=20.0,
+                endpoint="http://export.arxiv.org/api/query",
                 failed_ids=[arxiv_id],
             )
 
     if use_cache:
         _LAST_ID_CACHE[norm_yymm] = last_found
+        if cache_path is not None and last_found < MAX_ARXIV_SEQ:
+            from .profiler import _write_json_atomic
+            _write_json_atomic(str(cache_path), {"month": norm_yymm, "last_existing": last_found,
+                                                "next_absent": last_found+1,
+                                                "method": "Atom and OAI boundary verification"})
 
     return last_found
 

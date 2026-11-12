@@ -264,6 +264,18 @@ def scrape_references_for_paper(
             error_message=str(unavail),
         )
     except ReferenceScrapeError as err:
+        if unzipped_paper_dir:
+            local_records = _read_local_references(source_id, unzipped_paper_dir)
+            if local_records:
+                _request_stats["bib_fallbacks"] = _request_stats.get("bib_fallbacks", 0) + 1
+                return ReferenceResult(
+                    local_records,
+                    status="bib_fallback",
+                    source=_SOURCE_BIB,
+                    expected_count=len(local_records),
+                    received_count=len(local_records),
+                    request_stats=get_request_stats(),
+                )
         if raise_on_error:
             raise
         logger.warning("Lỗi scrape references cho bài %s: %s", source_id, err)
@@ -415,10 +427,13 @@ def _get_json(url: str, params: dict, source_id: str, rate_limit_sec: float,
         retry_after = None
         cause = None
         try:
-            if method == "POST":
-                response = session.post(url, params=params, json=json_body, headers=headers, timeout=_TIMEOUT)
-            else:
-                response = session.get(url, params=params, headers=headers, timeout=_TIMEOUT)
+            try:
+                if method == "POST":
+                    response = session.post(url, params=params, json=json_body, headers=headers, timeout=_TIMEOUT)
+                else:
+                    response = session.get(url, params=params, headers=headers, timeout=_TIMEOUT)
+            finally:
+                rate_limiter.mark_completed("semantic_scholar")
         except _TRANSIENT_ERRORS as exc:
             _count_request("network", method)
             problem, cause = f"lỗi mạng {type(exc).__name__}", exc

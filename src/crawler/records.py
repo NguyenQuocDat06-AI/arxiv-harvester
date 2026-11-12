@@ -8,7 +8,7 @@ from typing import Any, Iterable
 
 from .storage import resolve_paper_source_status
 
-SOURCE_TERMINAL = frozenset({"success", "pdf_only", "no_latex"})
+SOURCE_TERMINAL = frozenset({"success", "pdf_only", "no_latex", "not_found"})
 REFERENCE_TERMINAL = frozenset({"success", "empty", "not_indexed", "bib_fallback"})
 REFERENCE_REPLACE = frozenset({"success", "empty"})
 

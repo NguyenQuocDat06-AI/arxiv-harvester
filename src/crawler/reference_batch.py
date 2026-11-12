@@ -31,7 +31,7 @@ def _result(source_id: str, body: dict) -> s2.ReferenceResult:
 
 
 def scrape_references_batch(arxiv_ids: list[str], rate_limit_sec: float = 5.0,
-                             batch_size: int = 25) -> BatchReferences:
+                             batch_size: int = 50) -> BatchReferences:
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 500:
         raise ValueError("S2 batch_size must be between 1 and 500")
     if not math.isfinite(rate_limit_sec) or rate_limit_sec < 0:
@@ -73,13 +73,35 @@ def scrape_references_batch(arxiv_ids: list[str], rate_limit_sec: float = 5.0,
                     if key in indexed:
                         duplicate.add(key)
                     indexed[key] = item
+            for pos, key in enumerate(group):
+                if key not in indexed and key not in duplicate:
+                    item_at_pos = body[pos]
+                    if item_at_pos is None:
+                        indexed[key] = None
+                    elif isinstance(item_at_pos, dict):
+                        pos_ext = item_at_pos.get("externalIds") or {}
+                        pos_key = s2._normalize_arxiv_id(pos_ext.get("ArXiv")) if isinstance(pos_ext, dict) else None
+                        if pos_key is None or pos_key == key:
+                            indexed[key] = item_at_pos
+
         for position, key in enumerate(group):
             if failure:
                 result = s2.ReferenceResult([], status="api_error", source="none", error_message=failure)
-            elif key not in indexed or key in duplicate:
-                result = s2.ReferenceResult([], status="batch_lookup", error_message="Batch entry needs an individual lookup")
+            elif key in duplicate:
+                result = s2.ReferenceResult([], status="batch_lookup", error_message="Duplicate paper identity in batch")
+            elif key in indexed:
+                item = indexed[key]
+                if item is None:
+                    result = s2.ReferenceResult([], status="not_indexed", source="none",
+                                                expected_count=None, received_count=0,
+                                                error_message="Paper not indexed in Semantic Scholar (confirmed by batch)")
+                elif isinstance(item, dict):
+                    result = _result(key, item)
+                else:
+                    result = s2.ReferenceResult([], status="api_error", source="none",
+                                                error_message=f"Unexpected item type in batch: {type(item)}")
             else:
-                result = _result(key, indexed[key])
+                result = s2.ReferenceResult([], status="batch_lookup", error_message="Batch entry needs an individual lookup")
             # Attribute each shared HTTP call once, to the first paper in its group.
             result.request_metrics = delta if position == 0 else request_delta({}, {})
             result.request_group, result.request_group_size = group_id, len(group)
@@ -98,6 +120,20 @@ def scrape_references_batch(arxiv_ids: list[str], rate_limit_sec: float = 5.0,
 def complete_batch_result(source_id: str, result: s2.ReferenceResult,
                           unzipped_paper_dir: str | None, rate_limit_sec: float) -> s2.ReferenceResult:
     """Resolve only entries that the batch could not complete."""
+    if result.status in ("not_indexed", "api_error"):
+        if unzipped_paper_dir:
+            local_records = s2._read_local_references(source_id, unzipped_paper_dir)
+            if local_records:
+                s2._request_stats["bib_fallbacks"] = s2._request_stats.get("bib_fallbacks", 0) + 1
+                return s2.ReferenceResult(
+                    local_records,
+                    status="bib_fallback",
+                    source=s2._SOURCE_BIB,
+                    expected_count=len(local_records),
+                    received_count=len(local_records),
+                    request_stats=s2.get_request_stats(),
+                )
+        return result
     if result.status == "batch_lookup":
         return s2.scrape_references_for_paper(source_id, unzipped_paper_dir, rate_limit_sec)
     if result.status != "partial":
