@@ -891,7 +891,7 @@ def write_book(workspace: Path, output: Path, do_build: bool = False) -> Path:
     ## Mã nguồn nhóm arXiv Harvester
 
     - [Repository source chính (GitHub)]({SOURCE_REPO}/tree/main)
-    - [Phân công & đóng góp thành viên]({SOURCE_REPO}/blob/main/CONTRIBUTIONS.md)
+    - [Phân công & đóng góp thành viên]({SOURCE_REPO}/blob/main/README.md#team--contributors)
     - [Script dựng Book 25.000 bài]({SOURCE_REPO}/blob/main/tools/build_team_25000_book.py)
     """).strip() + "\n", encoding="utf-8")
 

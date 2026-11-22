@@ -52,8 +52,7 @@ flowchart LR
 arxiv-harvester/
 ├── .github/workflows/ci.yml        # Syntax, notebook JSON, package install & CLI smoke CI
 ├── configs/
-│   ├── parser_roots.json           # Verified TeX compilation root overrides
-│   └── submission_parser_roots_20261106.json
+│   └── parser_roots.json           # Verified TeX compilation root overrides
 ├── data/                           # Local data placeholders (raw/, shards/, processed/)
 ├── docs/                           # Analysis notebooks (01–08) for M1 & M2 stages
 ├── src/
@@ -62,7 +61,6 @@ arxiv-harvester/
 ├── tools/                          # Colab/Kaggle runners, 25k consolidator & Jupyter Book builders
 ├── colab_crawler.ipynb             # Google Colab M1 crawler runner (smoke / repair / full)
 ├── colab_parser_full.ipynb         # Google Colab M2 full parser runner
-├── colab_parser_submission.ipynb   # Google Colab parser snapshot runner
 ├── kaggle_crawler.ipynb            # Kaggle M1 crawler runner
 ├── pyproject.toml                  # Package metadata, dependencies & 7 CLI entrypoints
 └── requirements.txt                # Direct runtime dependencies
