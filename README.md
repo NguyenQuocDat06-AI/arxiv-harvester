@@ -1,264 +1,289 @@
-# arXiv Harvester - Milestone 1 và 2
+# arXiv Harvester
 
-Thu thập mọi version của paper trong dải ID được giao, giữ nguồn `.tex/.bib` và bibliography `.bbl` bổ trợ, lấy references và parse thành dữ liệu phân cấp đã chuẩn hóa/khử trùng.
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
+[![CI](https://github.com/NguyenQuocDat06-AI/arxiv-harvester/actions/workflows/ci.yml/badge.svg)](https://github.com/NguyenQuocDat06-AI/arxiv-harvester/actions/workflows/ci.yml)
+[![Jupyter Book Report](https://img.shields.io/badge/docs-Jupyter%20Book-orange?logo=jupyter&logoColor=white)](https://nguyenquocdat06-ai.github.io/arxiv-harvester-book/)
+[![Hugging Face Dataset](https://img.shields.io/badge/dataset-Hugging%20Face-yellow?logo=huggingface&logoColor=black)](https://huggingface.co/datasets/nquocdat06/arxiv-harvester-data)
 
-- Đặc tả: [M1 - Crawling](https://hcmus-cs-ta.github.io/lab-book/intro-ds/statement/crawling/), [M2 - Parsing](https://hcmus-cs-ta.github.io/lab-book/intro-ds/statement/parsing/).
-- Dataset đang dùng: [nquocdat06/arxiv-harvester-data](https://huggingface.co/datasets/nquocdat06/arxiv-harvester-data).
-- Báo cáo M1-M2: [Jupyter Book](https://nguyenquocdat06-ai.github.io/arxiv-harvester-book/) trong [repository báo cáo riêng](https://github.com/NguyenQuocDat06-AI/arxiv-harvester-book).
-- Đóng góp thành viên: [nhánh gốc, commit và cách đối chiếu](CONTRIBUTIONS.md). Nhánh chính và mặc định của repository source là `main`; `develop` dùng để tích hợp thay đổi.
-- [Checklist và hướng dẫn sửa](tasks/HF_DATASET_AUDIT_2026-10-30.md), [nhật ký thực hiện và bằng chứng](tasks/IMPLEMENTATION_PROGRESS_2026-11-01.md).
+Scalable, fault-tolerant arXiv multi-version corpus harvester, Semantic Scholar reference collector, and hierarchical LaTeX/BibTeX parser producing deduplicated, schema-validated Parquet datasets.
 
-Báo cáo chính thức nộp tại [Jupyter Book](https://nguyenquocdat06-ai.github.io/arxiv-harvester-book/) (URL cố định từ bản tiến độ 06/11 theo QA). Toàn bộ **25.000 bài báo / 41.498 version** của 5 thành viên (bao gồm lượt `--resume` M1 của `24120470` lên đủ 5.000 ID trên Google Colab CPU-only) đã được parse, khử trùng và kiểm chuẩn cấu trúc năm bảng (`structural_valid = True`, `elements = 15.006.000`, `hierarchy = 22.532.299`, `bibtex = 1.177.293`), đạt tổng thời gian đo trên **Google Colab CPU-only** là **18.692,09 giây** (`0,7477 giây/bài`, Peak RSS **845,34 MiB**, 3 bảng Parquet chuẩn **4,22 GB**). Bộ generator nằm ở `tools/build_team_25000_book.py`; bộ dựng trên snapshot 73 bài trước đó vẫn được giữ tại `tools/build_public_submission_book.py` và `tools/build_report.py`.
+---
 
-Nội dung Book dùng tiếng Việt cho chương trình Chuẩn, sinh động bảng và biểu đồ khi chạy `jupyter-book build ... --all -W` từ số liệu tổng hợp `report_summary.json` và ví dụ thực thi parser (không paste ảnh tĩnh hay đưa dữ liệu gốc/credential vào repo Book). Xem [tiến trình 06/11](tasks/REPORT_REVIEW_2026-11-06.md) và [điều chỉnh QA](tasks/QA_IMPLEMENTATION_2026-11-06.md).
+## Overview & Key Results
 
-Theo QA của giảng viên, mốc nộp link Book là mốc tiến độ; nhóm được tiếp tục cập nhật đến hạn Poster nhưng giữ nguyên URL. Nhóm học chương trình Chuẩn và dùng tiếng Việt. M3 dùng chung pipeline; mỗi thành viên trích output theo dải ID của mình để host trên Hugging Face cá nhân và chuẩn bị ít nhất 5 publication gán nhãn.
+`arxiv-harvester` implements an end-to-end two-stage data engineering pipeline across 25,000 arXiv publications:
 
-## 1. Cài đặt và kiểm tra
+1. **Stage 1 — Multi-Version Acquisition & Citation Harvesting (`src/crawler/`)**: Discovers arXiv publications across assigned ID ranges, reconstructs full version revision histories (`v1..vN`), downloads and extracts LaTeX/BibTeX source archives with HTTP Range resume support, and collects citation graphs via the Semantic Scholar (S2) batch API with local `.bib`/`.bbl` fallback and strict provenance tracking.
+2. **Stage 2 — Hierarchical LaTeX/BibTeX Parsing & Deduplication (`src/parser/`)**: Resolves compilation roots and nested TeX includes, builds versioned structural hierarchy trees (sections, paragraphs, lists, math, figures, tables), parses bibliographies (`.bib` and `.bbl`), normalizes citations and content, performs exact-content deduplication, and validates cross-table integrity across all five Parquet output tables.
 
-Dùng Python 3.10 trở lên trong môi trường riêng (`venv` hoặc `conda`). Cài thư viện và package từ gốc repository:
+### Verified Corpus Benchmarks (25,000 Papers — Google Colab CPU-Only)
+
+| Metric | Verified Result | Notes |
+|---|---:|---|
+| **Publications / Versions** | `25,000` / `41,498` | `38,554` verified TeX, `2,764` PDF-only/empty, `169` HTTP 404 (`0` cross-shard duplicates) |
+| **References (Working / Course)** | `976,351` / `456,149` | `0` orphan references; arXiv-keyed rows exported to course spec |
+| **Parser Coverage** | `85.66%` success / `97.34%` parsed | `33,025` full success + `4,503` partial on verified TeX; `0` missing versions |
+| **Structural Validation** | `structural_valid = True` | `errors = []` across all 5 M1–M2 tables (`arxiv-validate-project`) |
+| **Element Deduplication** | `23,099,589 → 15,006,000` (`-35.04%`) | Exact-content deduplication across multi-version documents |
+| **BibTeX Deduplication** | `1,834,650 → 1,177,293` (`-35.83%`) | Normalized per-paper citation catalog |
+| **Hierarchy Edges** | `22,532,299` | Acyclic, single-root trees verified per `(arxiv_id, version)` |
+| **Colab CPU Runtime** | `18,692.09 s` (`0.748 s/paper`) | 5 independent CPU sessions; Peak RSS `845.34 MiB`, weighted avg `240.00 MiB` |
+| **Final Output Footprint** | `4.22 GB` (`3.93 GiB`) | Snappy-compressed Parquet tables (`elements`, `hierarchy`, `bibtex`) |
+
+Published analysis and interactive visualizations are available in the **[Jupyter Book Report](https://nguyenquocdat06-ai.github.io/arxiv-harvester-book/)**, and datasets are hosted on **[Hugging Face](https://huggingface.co/datasets/nquocdat06/arxiv-harvester-data)**.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A["arXiv API & Source Archives<br/>Semantic Scholar Batch API"] --> B["Crawler & Rate-Limited Pipeline<br/>(src/crawler)"]
+    B --> C["Auditing, Retry & Shard Merge<br/>(validate, retry, reconcile, enrich)"]
+    C --> D["Hierarchical LaTeX/BibTeX Parser<br/>& Exact Deduplicator (src/parser)"]
+    D --> E["5-Table Parquet Validation<br/>& Jupyter Book Reports"]
+```
+
+---
+
+## Repository Structure
+
+```text
+arxiv-harvester/
+├── .github/workflows/ci.yml        # Syntax, notebook JSON, package install & CLI smoke CI
+├── configs/
+│   ├── parser_roots.json           # Verified TeX compilation root overrides
+│   └── submission_parser_roots_20261106.json
+├── data/                           # Local data placeholders (raw/, shards/, processed/)
+├── docs/                           # Analysis notebooks (01–08) for M1 & M2 stages
+├── src/
+│   ├── crawler/                    # Stage 1: discovery, downloader, S2 scraper, profiler, merge
+│   └── parser/                     # Stage 2: TeX gather/lexer, hierarchy, bibtex, dedup, validation
+├── tools/                          # Colab/Kaggle runners, 25k consolidator & Jupyter Book builders
+├── colab_crawler.ipynb             # Google Colab M1 crawler runner (smoke / repair / full)
+├── colab_parser_full.ipynb         # Google Colab M2 full parser runner
+├── colab_parser_submission.ipynb   # Google Colab parser snapshot runner
+├── kaggle_crawler.ipynb            # Kaggle M1 crawler runner
+├── pyproject.toml                  # Package metadata, dependencies & 7 CLI entrypoints
+└── requirements.txt                # Direct runtime dependencies
+```
+
+---
+
+## Installation
+
+**Prerequisites**: Python `3.10+` and an optional Semantic Scholar API key (`S2_API_KEY`) configured via environment variable or a local `.env` file (never committed).
 
 ```bash
-python -m pip install -r requirements.txt
-python -m pip install -e .
-python -m pip install -e ".[report]"   # tùy chọn, khi cần dựng Jupyter Book
+git clone https://github.com/NguyenQuocDat06-AI/arxiv-harvester.git
+cd arxiv-harvester
+
+python -m venv .venv
+source .venv/bin/activate
+
+pip install -r requirements.txt
+pip install -e .
+
+# Optional: install Jupyter Book dependencies to build HTML reports
+pip install -e ".[report]"
+```
+
+Verify the installation:
+
+```bash
 python -m compileall -q src tools
 arxiv-harvester --help
 arxiv-parser --help
 ```
 
-`.[report]` pin Jupyter Book 1.x cho cấu hình `_config.yml`/`_toc.yml` của bộ báo cáo này. Crawler và parser chỉ cần `requirements.txt` cùng `pip install -e .`; Colab không cần cài phần report. Key Semantic Scholar lấy từ biến môi trường `S2_API_KEY`, hoặc `.env` ở gốc repo khi chưa có biến môi trường. Notebook Colab nhận key qua ô nhập trực tiếp ở mục 2; log từng bước được hiển thị và lưu tại `RUN_DIR/crawler.log`.
+> **Windows note**: Set `PYTHONUTF8=1` or run `python -X utf8 -m ...` when redirecting console logs to preserve UTF-8 output.
 
-Trên Windows khi redirect log, dùng `python -X utf8 -m ...` hoặc đặt `PYTHONUTF8=1` để giữ tiếng Việt trong output.
+---
 
-Notebook Colab có ba chế độ: `smoke` chạy 5 bài trong thư mục riêng, `repair` bổ sung nguồn/references của checkpoint cũ, `full` tiếp tục toàn dải và xử lý lại phần thiếu. Bản thử tối ưu hiện mặc định `SOURCE_MODE="bundle"`: dùng ZIP và notebook ghim cùng SHA-256 vì source sửa chưa push. Nhánh chính vẫn là `main`; chỉ chuyển sang `github` sau khi cập nhật commit và checksum đúng runtime đã kiểm chứng. Không đưa `.env` hoặc corpus vào ZIP.
+## CLI Reference & Usage
 
-Pipeline ghi checkpoint nguồn sau khi giải nén, trước khi references hoàn tất. S2 dùng worker riêng; trạng thái `pending` trong lúc chạy nghĩa là nguồn đã lưu nhưng references đang chờ, chưa phải bài hoàn tất. Discovery lấy tối đa 100 ID mỗi request, độc lập lô xử lý.
+Installing the package exposes seven CLI commands (plus module-level utilities under `src/crawler` and `tools/`):
 
-Retry S2 nền dùng cùng worker S2 và chờ cooldown trong lúc arXiv tiếp tục tải. `--s2-background-retries 6` giới hạn số lần thử nền mỗi bài trong một lượt CLI; đặt 0 để tắt. Kết quả được cập nhật vào checkpoint, metrics nằm ở `reference_retry_metrics.jsonl`.
-
-CLI hỗ trợ `--resume --existing-only` để sửa các bài đã có mà không khám phá ID mới. Checkpoint legacy được sao lưu trước khi ghi tiếp; source tốt được giữ lại. Trạng thái `not_indexed`/`bib_fallback` được lưu rõ để báo cáo độ phủ, không đổi thành lỗi API hoặc tự nhận là kết quả S2 đầy đủ.
-
-S2 mặc định dùng `--s2-batch-size 50`: một POST cho nhóm bài cần references, không truy vấn lại bài đã hoàn tất. Kết quả được gắn theo ID bài nguồn và đối chiếu `referenceCount`; entry null được ghi `not_indexed`, entry thiếu được lấy thêm trang. Phản hồi quá lớn được tách thành nhóm nhỏ. Đặt `--s2-batch-size 1` để gọi từng bài. Bib fallback giữ provenance riêng và không được trình bày như kết quả S2 đầy đủ.
-
-Pacing S2 dùng `--s2-rate-limit-sec 5`, `--s2-max-attempts 3` và `--s2-cooldown-sec 60`, độc lập với arXiv. Khóa tách theo provider và được nhả khi ngủ, nên S2 chờ không giữ luồng arXiv. `Retry-After` của server được giữ; khi không có header thì dùng backoff tăng dần có jitter. Batch thất bại không tạo hàng loạt GET; `api_error`/`partial` vẫn cần retry.
-
-Notebook mặc định `S2_MAX_ATTEMPTS=1`. References còn lỗi giữ `api_error` hoặc `bib_pending` khi có Bib tạm; cả hai đều chưa hoàn tất. Sau pha nguồn, `--s2-drain-budget-sec 10800` cho phép lấy bù theo cooldown tối đa 3 giờ, trong ngân sách toàn lượt `--run-budget-sec 41400` (11,5 giờ). Chế độ này tiếp tục qua nhiều vòng, chỉ hỏi lại references chưa hoàn tất và không tải lại nguồn. Nếu hết thời gian hoặc cooldown tiếp theo không còn nằm trong cửa sổ cho phép, lưu checkpoint với `paused_time_budget` và lý do cụ thể. Request đang chạy được hoàn tất trước khi dừng. Đặt `--s2-drain-budget-sec 0` mới dùng giới hạn cũ `--s2-recovery-passes`/`--s2-recovery-max-wait-sec`. Thời gian chờ/thử lại nằm trong benchmark của run thật; không đổi pending thành thành công.
-
-Source gzip chứa HTML được ghi `no_latex` chỉ khi HTML đầy đủ và DOI trong tài liệu khớp DOI metadata. Đây là trường hợp nguồn không có TeX, không tạo file `.tex` giả. Trang lỗi, HTML thiếu định danh hoặc tệp gzip hỏng vẫn giữ trạng thái lỗi.
-
-Khi cần kiểm tra lại Bib fallback cũ không rõ provenance, dùng `--resume --recheck-bib-fallback` hoặc bật `RECHECK_BIB_FALLBACK` trong notebook. Tùy chọn ghi trạng thái pending mới, giữ part cũ và nguồn tốt. Không mặc định suy ra mọi Bib fallback đều do 429; `not_indexed` và Bib sau 404 vẫn là khoảng trống độ phủ S2 cần báo cáo.
-
-`--rate-state-dir` lưu cooldown theo provider/key qua các lượt chạy; mặc định ở `<output-dir>/_request_state`. Colab dùng chung `DATA_BASE_ROOT/network_state` cho smoke/repair/full. Giữ thư mục này khi restart. `--max-rate-wait-sec 180` giới hạn chờ inline từng request; lấy bù S2 có ngân sách riêng như trên. Vượt ngân sách chờ giữ checkpoint và ghi thời gian cần chờ vào stats. Chạy lại cùng lệnh/đường dẫn sau cooldown; mở tiến trình mới không xóa thời gian nghỉ còn lại.
-
-Khóa OS chặn tiến trình trùng dùng cùng network state trong một máy/runtime và tự nhả khi tiến trình thoát hoặc bị kill. File trạng thái có thể lưu trên Drive; khóa đặt ở ổ cục bộ để không phụ thuộc locking của FUSE. Khóa này không điều phối các máy/Colab VM độc lập: chỉ chạy một runtime với một S2 key và không ghi đồng thời vào cùng shard. Điều kiện phía server/IP hoặc chương trình khác dùng key vẫn có thể gây 429.
-
-`runs/<run_id>/http_diagnostics.jsonl` ghi response 429: Retry-After/rate-limit/request-id, phần đầu thông báo lỗi và fingerprint key. Key/token được che; không ghi request headers có xác thực. Chỉ gửi bản đã che key khi cần đối chiếu lỗi. Các CLI retry nguồn, enrich references và reconcile dates đều nhận `--rate-state-dir`; dùng cùng thư mục nếu cần cùng chính sách nghỉ.
-
-`--batch-size` điều khiển lô discovery; `--s2-batch-size` giới hạn số paper mỗi POST; `--checkpoint-every-papers 1` lưu từng paper độc lập với hai lô API. Stats có `s2_requests` và `by_method` ghi số GET/POST thực. Chi phí request dùng chung được ghi đúng một lần ở paper đầu nhóm; sidecar có `request_group`/`request_group_size` để đối chiếu. Thời gian batch được phân bổ vào paper metrics, không nhân thời gian request cho mọi paper.
-
-Metadata dùng `--rate-limit-sec 3`; tải full-text dùng `--source-rate-limit-sec 3`, mỗi lần một kết nối, theo [đề M1](https://hcmus-cs-ta.github.io/lab-book/intro-ds/statement/crawling/). CLI chặn nhịp dưới ba giây cho hai bước này. Giữ chung cooldown arXiv qua restart; không thêm đệm cố định chỉ vì một file lớn đã tải thành công. Server 429/Retry-After vẫn áp dụng đầy đủ. `runs/<run_id>/source_metrics.jsonl` tách thời gian chờ limiter, header, body và byte nhận, không nhầm với dung lượng nguồn sau giải nén.
-
-Tải nguồn có `--source-download-attempts 3`, `--source-read-timeout-sec 90` và `--source-max-seconds 180`. Ngân sách được kiểm tra giữa request/chunk; một lần đọc hoặc cooldown có thể kết thúc muộn hơn. File mới tải bằng một GET đầy đủ; resume bắt đầu ở đoạn 1 MiB, tăng 4 rồi 8 MiB khi đoạn trước hoàn tất trong 10 giây. Lỗi hoặc đoạn chậm làm giảm kích thước. HTTP 429 dừng lượt và giữ `.part`. Content-Range/Content-Length được kiểm tra trước khi công bố archive; đoạn thành công không tiêu hao số lần retry. ETA chưa gồm retry hoặc thời gian Colab bị ngắt.
-
-Colab mặc định `USE_LOCAL_WORKSPACE=True`: raw, giải nén, shard và log chạy trên `/content`; `network_state` tiếp tục lưu trên Drive. Full dùng batch 50, checkpoint 25 và backup 25; smoke dùng 5 bài với checkpoint từng bài. Mỗi lô đóng gói các nguồn đã commit và part mới, kiểm tra archive/checksum ở Drive rồi công bố `HEAD.json` sau cùng. Sao lưu lỗi làm crawler dừng; checkpoint Drive đã xác minh trước đó vẫn dùng được.
-
-`--max-inflight-papers 25` giới hạn hàng đợi xử lý nền; arXiv vẫn tải tuần tự, giải nén dùng tối đa 2 worker và S2 dùng một worker riêng. Checkpoint gom các bài đã xong thay vì chờ toàn bộ batch; khi Stop sẽ chờ tác vụ đang có và lưu kết quả đã hoàn tất. RAM được lấy mẫu mỗi 0,5 giây trên luồng riêng, quét đĩa mặc định mỗi 30 giây (`--disk-profile-interval-sec`) và tại mốc đầu/cuối. Peak đĩa là peak lấy mẫu; kích thước mỗi lần quét và lần cuối được tính từ file thật. Thời gian các pha chạy gối đầu không cộng lại thành wall time. [Nhật ký nâng cấp](tasks/SPEED_UPGRADE_PROGRESS_2026-11-12.md).
-
-Notebook mặc định `RUN_MODE="smoke"`. Mỗi thành viên chọn đúng `CURRENT_MEMBER`, chạy 5 bài đến hết validation rồi đổi sang `full` và chạy lại từ cell cấu hình. Khi có checkpoint, full tự thêm `--resume`, sửa phần thiếu rồi tiếp tục ID mới trên toàn dải; không bắt buộc repair riêng trước full. Full validation đối chiếu MSSV, dải ID, đủ 5.000 ID gồm bài lưu và ID đã xác nhận không tồn tại, ranh giới và các lỗ hổng. `repair` đạt chỉ xác nhận các bài hiện có, chưa xác nhận hoàn tất toàn dải. Chỉ validation đạt mới cập nhật course export hoặc upload bảng cuối.
-
-Full mặc định `AUTO_RESUME_ARXIV=True`, truyền `--auto-resume-rate-limit` xuống CLI. Khi arXiv trả 429, crawler ghi checkpoint/backup rồi chờ đúng deadline, báo tiến độ mỗi 15 giây và tự tiếp tục trong cùng tiến trình. Paper vừa bị giới hạn được đưa cuối hàng đợi sau cooldown. Có thể bấm Stop khi đang chờ; không reset cooldown hoặc tăng kết nối. CLI không có flag này vẫn kết thúc với `paused_rate_limit` như trước.
-
-Stats có `auto_rate_limit_resumes`, `auto_rate_limit_wait_sec` và `pipeline_passes`; metrics từng paper được giữ qua các lần tiếp tục. `processed_this_run` đếm ID duy nhất, `paper_attempts_this_run` đếm cả lần thử lại. Chờ dịch vụ không đảm bảo xong trước thời hạn. Nếu đã duyệt hết dải nhưng S2 còn lỗi, run vẫn báo phần thiếu và validation chưa đạt.
-
-Sau khi VM bị xóa, cell kiểm tra checkpoint tự khôi phục archive đã commit vào workspace trống. Khi chưa có backup, cell này sao chép và đối chiếu dữ liệu ở `raw/<MSSV>` và `shards/<MSSV>` cũ sang ổ cục bộ. Phần chưa commit sau lô gần nhất cần xử lý lại nếu mất VM. Giữ cả chuỗi archive, các file commit, `HEAD.json` và `network_state`; chỉ một runtime ghi vào một backup. Không sửa thủ công thư mục Drive cũ rồi mong bản backup tự cập nhật.
-
-Log/run metadata, HTTP diagnostics và mẫu tài nguyên được sao lưu vào `logs/<MSSV>/<run_id>` mỗi 60 giây, sau khi dừng và sau validation. File log chỉ nối thêm phần mới và kiểm tra phần vừa ghi; file đổi nội dung được chép nguyên tử. Cuối lượt kiểm tra lại checksum đầy đủ. Profiler ghi mẫu ngay trong lúc chạy; archive dữ liệu chỉ đóng gói file mẫu sau khi profiler kết thúc. Drive ghi lỗi hoặc SSD dưới ngưỡng 2 GiB làm notebook dừng crawler, giữ bản backup đã xác minh gần nhất. Hai bảng course export chỉ cập nhật khi validation đạt và bản sao có checksum đúng.
-
-Dữ liệu mới nằm trong archive ở `backups/<MSSV>`, thư mục raw/shard Drive cũ giữ làm đầu vào lịch sử. Giữ `HEAD.json` và toàn bộ archive/record của chuỗi, khôi phục bằng `prepare_local_workspace` trước khi đưa `raw/unzipped` vào M2. Gói Download của notebook không chứa corpus nguồn. Profiler ghi thời gian sao lưu dữ liệu trong pha `drive_backup`; `child_wall_sec` bao gồm cả lưu stats/đầu ra cuối. [Nhật ký kiểm tra notebook](tasks/COLAB_HANDOFF_AUDIT_2026-11-07.md).
-
-| MSSV | Thành viên | Dải ID |
+| Command | Entrypoint | Purpose |
 |---|---|---|
-| 24120282 | Nguyễn Quốc Đạt | `2412.18848` -> `2501.02641` |
-| 24120237 | Nguyễn Đình Tuấn | `2502.03235` -> `2502.08234` |
-| 24120438 | Trần Nguyên Tân | `2407.12839` -> `2407.17838` |
-| 24120470 | Dương Phan Minh Trí | `2406.17938` -> `2407.02838` |
-| 24120474 | Trịnh Vỹ Triết | `2406.12938` -> `2406.17937` |
+| `arxiv-harvester` | `crawler.main:main` | Discover IDs, download/extract TeX sources, scrape S2/BibTeX references |
+| `arxiv-audit-sources` | `crawler.validate_sources:main` | Audit extracted local sources and emit retry manifests |
+| `arxiv-retry-sources` | `crawler.retry_sources:main` | Execute controlled, range-resumable retries from audit manifests |
+| `arxiv-reconcile-dates` | `crawler.version_history:main` | Reconcile per-version creation dates via arXivRaw OAI-PMH or snapshots |
+| `arxiv-enrich-references` | `crawler.enrich_references:main` | Refresh missing reference metadata while preserving field provenance |
+| `arxiv-parser` | `parser.main:main` | Parse TeX/BibTeX revisions into deduplicated hierarchical Parquet tables |
+| `arxiv-validate-project` | `parser.validation:main` | Run out-of-core SQLite-backed structural & coverage checks across all 5 tables |
 
-## 2. Chạy Milestone 1
+### Stage 1 — Crawling & Reference Collection
 
-Ví dụ dải của 24120237:
-
-```bash
-arxiv-harvester --member-id 24120237 --start-month 2025-02 --start-id 3235 --end-month 2025-02 --end-id 8234 --raw-dir data/raw --output-dir data/shards/24120237 --export-course
-```
-
-Thêm `--resume` để chạy tiếp. Smoke test dùng `--max-papers 5` và **output directory riêng**. `--dry-run` chỉ discovery, ghi vào nhánh `_dry_run` và gắn nhãn, không trộn vào kết quả crawl thật. Ở repo root vẫn hỗ trợ `python -m src.crawler.main ...`.
-
-Các đầu ra:
-
-```text
-data/raw/
-  sources/                         # archive tạm
-  unzipped/<arxiv_id>/<version>/    # .tex/.bib, .bbl bổ trợ theo QA
-  manifests/<versioned_id>.json    # bằng chứng nguồn/PDF-only/no-TeX
-data/shards/<MSSV>/
-  publications.parquet
-  references.parquet
-  crawl_status.parquet             # status/counts/provenance truy vấn theo paper
-  _checkpoint/                    # batch journal, không commit Git
-  runs/<run_id>/
-    stats.json
-    paper_metrics.jsonl
-    resource_samples.jsonl
-  stats.json                       # bản tiện đọc của run mới nhất
-  course_export/
-    papers.parquet
-    references.parquet
-```
-
-Resume kiểm tra từng version và bước references; nguồn lỗi không làm mất publication. `succeeded` là paper có các nguồn đã xác nhận và references API hoàn tất/rỗng được xác nhận; `source_succeeded` đếm paper có mọi version TeX success. PDF-only/no-TeX không bị tính thành TeX success. Fallback/partial/API error vẫn được giữ và báo còn việc; `completed_with_errors` không có nghĩa corpus đã đủ.
-
-References working giữ cả tài liệu không có arXiv ID. Khi xuất course table mới lọc arXiv-keyed rows. Ngày lịch sử chưa biết giữ null; không gán ngày latest cho version giữa. Trường ngày S2 trong dữ liệu cũ có thể là publication date, cần provenance/xác minh trước khi diễn giải là ngày nộp arXiv.
-
-## 3. Audit và sửa dữ liệu đã thu thập
-
-Các công cụ mạng mặc định lập kế hoạch/đọc cache; cần cờ rõ ràng khi muốn gọi API. Chọn **output mới** để giữ dữ liệu đầu vào.
-
-### Kiểm tra corpus và tạo danh sách retry
+Run a full range crawl (example for shard `24120237`), exporting both working tables and the 6-column course tables:
 
 ```bash
-arxiv-audit-sources --publications data/shards --raw-dir data/raw --output data/audits/sources.parquet
-arxiv-retry-sources --manifest data/audits/sources.retry.jsonl --output-dir data/repaired_sources --limit 10
+arxiv-harvester \
+  --member-id 24120237 \
+  --start-month 2025-02 --start-id 3235 \
+  --end-month 2025-02 --end-id 8234 \
+  --raw-dir data/raw \
+  --output-dir data/shards/24120237 \
+  --export-course
 ```
 
-Sau khi xem kế hoạch, thêm `--execute` để tải bù đúng version. Retry có manifest và vẫn dùng pacing tối thiểu ba giây; không dùng thư mục rỗng làm bằng chứng PDF-only. Chạy lại vào cùng output repair sẽ giữ các sửa trước đó. Stats gốc không bị sao chép thành benchmark của lần sửa.
+Common operational flags:
 
-Retry xác minh manifest/file/size trước khi dùng lại nguồn, giới hạn bằng `--limit` số lượt tải mới. Có thể đặt `--read-timeout-sec 45 --download-attempts 4 --min-free-gb 4`; log JSONL và report lưu theo run. Tạo file `STOP` trong output repair để dừng sau version đang làm; giữ file này khi muốn hoãn tải và chỉ bỏ nó khi chủ động chạy tiếp. Lỗi mạng giữ phần archive đã tải để tiếp tục bằng HTTP Range đã kiểm tra offset.
+- `--max-papers 5`: Run a smoke test into a dedicated output directory.
+- `--dry-run`: Discover metadata only (writes to `_dry_run` without downloading sources or querying S2).
+- `--resume` / `--resume --existing-only`: Continue from batch checkpoints or repair missing parts of previously crawled papers without discovering new IDs.
+- `--recheck-bib-fallback`: Re-query S2 for rows that previously fell back to local `.bib` parsing.
+- `--auto-resume-rate-limit`: Persist checkpoints on HTTP 429, wait through server cooldowns, and resume automatically in-process.
 
-### Bổ sung ngày revision
+### Auditing, Repair & Shard Consolidation
 
-```bash
-arxiv-reconcile-dates --publications data/shards/24120237/publications.parquet --output data/repaired_dates/24120237/publications.parquet --cache-dir data/cache/version_history
-```
-
-Có snapshot JSONL thì thêm `--snapshot <duong_dan_snapshot>`. Muốn truy vấn arXivRaw cho phần thiếu thì thêm `--fetch-missing --limit 10` trước khi chạy phạm vi lớn. File `.history.json` đi cùng output ghi ngày đã bổ sung, nguồn và lỗi; không coi OAI datestamp là ngày submission.
-
-### Truy vấn lại và enrich references
+Network repair utilities default to dry-run planning; pass `--execute` or `--fetch-missing` to perform live requests into a **separate output directory**:
 
 ```bash
-arxiv-enrich-references --shard-dir data/shards/24120237 --output-dir data/enriched_references/24120237 --raw-dir data/raw --limit 10
-```
+# 1. Audit local sources and generate a retry manifest
+arxiv-audit-sources \
+  --publications data/shards \
+  --raw-dir data/raw \
+  --output data/audits/sources.parquet
 
-Thêm `--execute` để truy vấn citing papers; thêm `--enrich-targets` nếu muốn bổ sung metadata mục tiêu có cache. Enrich S2 ID cho một tài liệu fallback không tự xác nhận cạnh trích dẫn do API trả về. Tool giữ edge source và field provenance riêng, không tự dựng ngày nộp từ publication year/date.
+# 2. Retry failed or missing revisions safely
+arxiv-retry-sources \
+  --manifest data/audits/sources.retry.jsonl \
+  --output-dir data/repaired_sources \
+  --limit 10 \
+  --execute
 
-### Gộp và xuất chuẩn
+# 3. Reconcile missing revision dates from snapshot or arXivRaw OAI-PMH
+arxiv-reconcile-dates \
+  --publications data/shards/24120237/publications.parquet \
+  --output data/repaired_dates/24120237/publications.parquet \
+  --cache-dir data/cache/version_history
 
-```bash
+# 4. Enrich reference metadata with provenance tracking
+arxiv-enrich-references \
+  --shard-dir data/shards/24120237 \
+  --output-dir data/enriched_references/24120237 \
+  --raw-dir data/raw \
+  --limit 10 \
+  --execute
+
+# 5. Merge member shards and export normalized course tables
 python -m crawler.merge_shards --shards-dir data/shards --output-dir data/processed
-python -c "from crawler.storage import export_to_course_spec; export_to_course_spec('data/processed','data/course_export')"
+python -c "from crawler.storage import export_to_course_spec; export_to_course_spec('data/processed', 'data/course_export')"
 ```
 
-Nếu thiếu `stats.json` nhưng hai bảng working có thật, thêm `--allow-missing-stats` và kiểm tra `shards_without_stats` trong báo cáo. Runtime/RAM chưa biết là null, không phải 0. Không dùng `--skip-corrupted` để bỏ dữ liệu mà vẫn tuyên bố đủ dải ID. Khi chuyển shard đã sửa vào bộ dữ liệu chung, kiểm tra provenance/version/status rồi chạy lại validation.
+### Stage 2 — Hierarchical Parsing & Validation
 
-Stats của smoke/resume chỉ xử lý một phần shard được giữ trong `unmatched_run_stats`, tách khỏi metrics toàn shard. `stats_coverage` cho biết bao nhiêu shard có stats dùng được; các tỷ lệ nguồn từ metadata vẫn cần đối chiếu corpus bằng `validate_sources`.
-
-## 4. Chạy trên Google Colab
-
-Mở [colab_crawler.ipynb](colab_crawler.ipynb), chọn CPU và `CURRENT_MEMBER`; chạy tuần tự các cell. Mặc định nguồn/checkpoint làm việc trên SSD và được sao lưu theo lô vào Drive. Smoke dùng thư mục riêng. Nhập `S2_API_KEY` trực tiếp ở mục 2; `HF_KEY` chỉ đọc qua Secrets khi bật restore/upload Hub. Mỗi MSSV chạy một runtime; nhiều runtime dùng chung S2 key vẫn chịu chung quota, nên dùng key được cấp riêng hoặc chạy lần lượt các lượt dùng chung key.
-
-Nếu smoke kết thúc `completed_with_errors`, giữ `RUN_MODE="smoke"` và chạy lại cùng thư mục để bổ sung đúng phần thiếu; không tăng số bài hoặc xóa checkpoint. Chạy cell validation sau khi crawler kết thúc. Full/repair dùng lô 25, smoke gộp các bài trong mẫu; mặc định checkpoint vẫn ghi sau từng paper. Sau khi đổi chế độ/thành viên, chạy lại các cell cấu hình và Drive/đường dẫn; notebook chặn dùng đường dẫn của cấu hình cũ.
-
-Để chạy source mới, đưa code lên nhánh/commit GitHub được chọn trong notebook. Checkpoint trên Hub có thể chỉ chứa metadata; notebook kiểm tra nguồn tương ứng trước khi resume. Sidecar trạng thái và run metrics được giữ khi đồng bộ các phiên bản source mới.
-
-Benchmark chính thức phải chạy trên Colab CPU-only. Số đo trên Windows/local và smoke test không được trình bày như benchmark toàn dải. `runs/` giữ từng lần thực thi, bao gồm phạm vi đã làm và phần dùng lại; không chia thời gian run cuối cho số paper cộng dồn.
-
-QA cho phép benchmark qua nhiều phiên Colab. Giữ stats/log từng phiên; runtime đã gồm retry và delay. Tổng hợp M1 và M2 riêng:
+Parse all discovered publications and versions into deduplicated Parquet tables, supplying verified compilation root overrides via `--root-overrides` (so ambiguous multi-document archives resolve deterministically without altering raw source files):
 
 ```bash
-python -m src.crawler.benchmark_sessions --stats logs/run1/stats.json logs/run2/stats.json --final-output-dir data/processed --output build/benchmark_m1_sessions.json
+arxiv-parser \
+  --publications data/processed/publications.parquet \
+  --raw-dir data/raw \
+  --output-dir data/parsed \
+  --root-overrides configs/parser_roots.json \
+  --resume
 ```
 
-File `run_metadata.json`, nếu có, nằm cạnh stats và phải trùng run ID để lấy child wall. Công cụ loại bản sao cùng run, giữ metric chưa biết là null, tổng hợp RAM theo thời lượng và đánh dấu phiên chồng nhau. Số lượt xử lý có thể lặp paper; kiểm tra độ phủ ID/version và chất lượng nguồn riêng trên output hợp nhất.
-
-## 5. Milestone 2 - parser
+Validate all five M1 + M2 tables against the full publication catalog using streaming batch validation and an on-disk SQLite index:
 
 ```bash
-arxiv-parser --publications data/processed/publications.parquet --raw-dir data/raw --output-dir data/parsed
+arxiv-validate-project \
+  --course-dir data/course_export \
+  --parsed-dir data/parsed \
+  --publications data/processed/publications.parquet \
+  --output data/parsed/project_validation.json \
+  --require-full
 ```
 
-Ở repo root có thể dùng `python -m src.parser.main ...`. Input cũng có thể là thư mục shards; raw có thể là `raw/unzipped` chung hoặc `raw/<MSSV>/unzipped` như Colab. Thêm `--limit 5` vào **output riêng** cho smoke test. Root mơ hồ cần kiểm tra; `--preferred-root <relative.tex>` chỉ phù hợp phạm vi dùng cùng tên root. Với toàn corpus, cấu hình riêng từng paper/version:
+(`--require-full` exits `0` on full completion, `1` on structural errors, and `2` when coverage or status is incomplete.)
+
+### Benchmarking & Report Generation
+
+Summarize multi-session runtime and RSS/disk metrics, or build the Jupyter Book HTML report:
 
 ```bash
-arxiv-parser --publications data/processed/publications.parquet --raw-dir data/raw --output-dir data/parsed --root-overrides configs/parser_roots.json
-```
+# Aggregate benchmark metrics across multiple run sessions
+python -m crawler.benchmark_sessions \
+  --stats logs/run1/stats.json logs/run2/stats.json \
+  --final-output-dir data/processed \
+  --output build/benchmark_sessions.json
 
-Mapping có thể là `{"2502.03238": {"v1": "main.tex", "v2": "revised.tex"}}`. File [cấu hình có sẵn](configs/README.md) ghi root đã kiểm tra với metadata. Override được đưa vào fingerprint; thay root của một paper chỉ làm paper đó phải parse lại khi code/input khác vẫn khớp. Nguồn M1 giữ nguyên.
-
-```bash
-arxiv-parser --publications data/processed/publications.parquet --raw-dir data/raw --output-dir data/parsed --resume
-```
-
-Pipeline: compilation root/include -> occurrence hierarchy -> normalize/canonical cites -> exact content dedup -> Parquet. Có hỗ trợ BibTeX/bibitem, field union và mapping key theo version. Trường hợp thiếu nguồn, include động không resolve hoặc cú pháp chưa hỗ trợ được ghi lỗi/partial; parser không phải TeX engine đầy đủ.
-
-Theo QA, `.bbl` được giữ làm bibliography phụ trợ. Khi `.bib` thiếu/lỗi, parser chỉ dùng `.bbl` trùng compilation root hoặc tên bibliography được khai báo; chuyển bibitem đọc được thành bản ghi, giữ raw citation và bản gốc. Cú pháp chưa hỗ trợ hoặc nhiều ứng viên chưa phân giải được giữ diagnostic. Thay `.bbl` làm fingerprint thay đổi khi resume. Trường `ref_submission_date` được phép lấy `publicationDate` S2 hoặc ngày qua arXiv ID; bước enrich chỉ điền ngày thiếu và lưu provenance.
-
-Gathering dừng tại `\end{document}`/`\endinput`; font declarations không được che các `\bibitem`. Các macro zero-argument khai báo rõ `\begin`/`\end` của display math được nhận diện; citation keys được đổi cả trong inline/block math. Macro động có tham số vẫn cần kiểm tra diagnostics.
-
-```text
-data/parsed/
-  elements/*.parquet
-  hierarchy/*.parquet
-  bibtex/*.parquet
-  working/*.json                  # occurrence/source maps, keys, conflicts, before counts
-  checkpoint.json                 # hash input + code/config + các output
-  manifest.json                   # tình trạng mọi version, gồm empty/lỗi
-  runs/<run_id>/stats.json
-  runs/<run_id>/resource_samples.jsonl
-  stats.json
-```
-
-Resume chỉ dùng cache khi input/code/config và hashes đầu ra còn khớp. Nguồn không có TeX được xác nhận tạo empty record và không có elements giả; mất source không bị đổi thành empty hợp lệ. Số liệu M2 gồm coverage theo paper/version, counts trước/sau dedup và unresolved citations.
-
-Parser dừng trước paper mới hoặc validation nếu còn dưới `--min-free-gb` (mặc định 4 GiB), giữ checkpoint/đầu ra trước đó. Validation đọc Parquet theo batch, dùng index tạm trên đĩa và kiểm tra một graph/version mỗi lần; không nạp full text toàn corpus vào RAM. Có kiểm tra duplicate keys xuyên shard, node/parent, root và cycles.
-
-Kiểm tra liên kết cả năm bảng và coverage so với **toàn bộ** working M1:
-
-```bash
-arxiv-validate-project --course-dir data/course_export --parsed-dir data/parsed --publications data/processed/publications.parquet --output data/parsed/project_validation.json
-```
-
-`structural_valid` cho biết schema/khóa/liên kết hợp lệ; `processing_complete` chỉ xác nhận phủ đủ version với trạng thái success/empty, không thay thế audit nguồn, benchmark hoặc xác nhận nộp bài. Thêm `--require-full` để nhận exit code 2 nếu còn thiếu/partial/error; cấu trúc sai trả code 1. Chạy lại validation sau mỗi lần parser tạo run mới để báo cáo không dùng kết quả kiểm tra cũ.
-
-### Chạy M2 toàn nhóm trên Google Colab CPU-only & gộp 25.000 bài
-
-- Notebook full cho 5 thành viên: [colab_parser_full.ipynb](colab_parser_full.ipynb), điều phối qua [tools/m2_colab_runner.py](tools/m2_colab_runner.py) (chỉ chạy trên runtime Google Colab CPU-only, kiểm tra SHA-256 chuỗi archive M1, parse cold 5.000 bài/thành viên, kiểm chuẩn và đồng bộ output batches + `m1_tables/` + `resource_samples.jsonl` về Google Drive).
-- Resume M1 trên Colab CPU cho `24120470`: [tools/m1_colab_tri_resume.py](tools/m1_colab_tri_resume.py) (không chép `.env`/`S2_API_KEY` sang Colab).
-- Gộp và kiểm chuẩn toàn cục 25.000 bài chéo 5 thành viên: [tools/m2_team_consolidator.py](tools/m2_team_consolidator.py) (gộp M1 via `src.crawler.merge_shards`, kiểm tra không trùng lặp `.parquet` chéo thành viên, tính thống kê M2 hợp nhất, chạy `src.parser.validation` toàn bộ 5 bảng và tổng hợp benchmark nhiều phiên qua `src.crawler.benchmark_sessions`).
-
-## 6. Build Jupyter Book M1-M2
-
-Bản báo cáo 25.000 bài hoàn chỉnh (tiếng Việt, dựng HTML chuẩn `--all -W`):
-
-```bash
-python tools/extract_book_aggregates_colab.py   # trích xuất chỉ số tổng hợp trên Colab
+# Build the 25,000-paper report from aggregated Colab metrics
 python tools/build_team_25000_book.py --output build/m2_book_staging --build
-```
 
-Hoặc dùng trực tiếp tám notebook trong `docs/` với working tables cục bộ (`ARXIV_M1_DATA_DIR`, `ARXIV_M2_DATA_DIR`):
-
-```bash
+# Or build directly from local M1/M2 tables
 python tools/build_report.py --output build/book_source --m1-dir data/processed --m2-dir data/parsed --build
 ```
 
-HTML nằm ở `build/m2_book_staging/_build/html/index.html` (hoặc `build/book_source/_build/html/index.html`). Workflow Pages thực thi lại toàn bộ notebook và sinh bảng/biểu đồ trực tiếp từ `report_summary.json` và ví dụ parser; dữ liệu gốc, bảng mã paper, working Parquet, checkpoint và `.env` không đưa lên repository công khai.
+---
 
-## 7. Kiểm tra và bằng chứng
+## Output Layout & Data Schema
 
-```bash
-python -m compileall -q src tools
+### Directory Structure
+
+```text
+data/
+├── raw/
+│   ├── sources/                         # Temporary downloaded archives
+│   ├── unzipped/<arxiv_id>/<version>/   # Extracted .tex, .bib, and auxiliary .bbl files
+│   └── manifests/<versioned_id>.json    # Per-version source audit & PDF-only/no-LaTeX evidence
+├── shards/<member_id>/
+│   ├── publications.parquet             # Working M1 publication & per-version metadata
+│   ├── references.parquet               # Working M1 citations (S2 + BibTeX fallback)
+│   ├── crawl_status.parquet             # Per-paper status, counts & request provenance
+│   ├── course_export/
+│   │   ├── papers.parquet               # Normalized 6-column M1 papers table
+│   │   └── references.parquet           # Normalized 6-column arXiv-keyed references table
+│   └── runs/<run_id>/                   # stats.json, paper_metrics.jsonl, resource_samples.jsonl
+└── parsed/
+    ├── elements/*.parquet               # Deduplicated document structural elements
+    ├── hierarchy/*.parquet              # Version-scoped parent-child tree edges
+    ├── bibtex/*.parquet                 # Normalized per-paper bibliography entries
+    ├── checkpoint.json                  # Input/code/config/output SHA-256 checkpoint
+    ├── manifest.json                    # Parse status for every version (including empty/errors)
+    └── project_validation.json          # Cross-table validation report
 ```
 
-CI kiểm tra cú pháp, cấu trúc notebook, cài đặt package và các lệnh CLI. Các kết quả chạy thật, phạm vi chưa thực hiện và từng tệp đã sửa được cập nhật ở [nhật ký tiến trình](tasks/IMPLEMENTATION_PROGRESS_2026-11-01.md).
+### Five-Table Parquet Schema
 
-Việc tiếp theo cho 5 thành viên và thứ tự chạy dữ liệu ở [bản phân công cập nhật 04/11](tasks/TEAM_HANDOFF_2026-11-02.md); tình trạng tích hợp ở [tiến trình 04/11](tasks/IMPLEMENTATION_PROGRESS_2026-11-04.md).
+| Stage | Table | Primary Key / Scope | Core Columns |
+|---|---|---|---|
+| **M1** | `papers.parquet` | `arxiv_id` | `arxiv_id`, `title`, `authors`, `submission_date`, `revised_dates`, `venue` |
+| **M1** | `references.parquet` | `(arxiv_id, ref_arxiv_id)` | `arxiv_id`, `ref_arxiv_id`, `ref_title`, `ref_authors`, `ref_submission_date`, `ref_s2_id` |
+| **M2** | `elements/*.parquet` | `element_id` | `element_id`, `arxiv_id`, `kind` (dict), `content` |
+| **M2** | `hierarchy/*.parquet` | `(arxiv_id, version, element_id, parent_id)` | `arxiv_id`, `version`, `element_id`, `parent_id` |
+| **M2** | `bibtex/*.parquet` | `(arxiv_id, citation_key)` | `arxiv_id`, `citation_key`, `entry_type` (dict), `title`, `authors`, `year`, `doi`, `journal`, `url` |
+
+---
+
+## Cloud Execution (Google Colab & Kaggle)
+
+The repository includes self-contained notebooks and orchestrators designed for ephemeral CPU runtimes:
+
+- **`colab_crawler.ipynb`**: Supports `smoke` (5-paper verification), `repair` (missing sources/references), and `full` modes. Stages raw/shard I/O on fast local `/content` SSD (`USE_LOCAL_WORKSPACE=True`), runs incremental Drive backups with SHA-256 verified `HEAD.json` archive chains, and stops cleanly before disk exhaustion (`2 GiB` floor).
+- **`colab_parser_full.ipynb` & `tools/m2_colab_runner.py`**: Verifies M1 archive chains, runs cold 5,000-paper/member CPU parsing, validates outputs, and syncs parsed batches, `m1_tables/`, and `resource_samples.jsonl` back to Google Drive.
+- **`tools/m2_team_consolidator.py`**: Merges all 5 member shards, checks cross-shard `.parquet` uniqueness, runs full 5-table `src.parser.validation`, and summarizes multi-session CPU/RSS benchmarks via `src.crawler.benchmark_sessions`.
+- **`kaggle_crawler.ipynb`**: Alternative Kaggle runtime crawler.
+
+---
+
+## Engineering Highlights
+
+- **Provider-Isolated Rate Limiting & Cooldown Persistence**: Enforces arXiv politeness pacing (`>=3.0 s` between metadata/source requests on a single connection) independently from Semantic Scholar batching (`--s2-batch-size 50`, `5 s` pacing). Cooldown deadlines persist across restarts in `--rate-state-dir` with OS-level local file locks and full `Retry-After` compliance.
+- **Fault-Tolerant Resumption & Range Downloads**: Supports HTTP `Content-Range` `.part` resumption with adaptive chunk sizing, per-paper bounded background queues (`--max-inflight-papers 25`), atomic `.tmp` Parquet swaps, and `--min-free-gb` disk guards.
+- **Strict Provenance & Zero-Fabrication Guarantees**: Distinguishes `not_indexed`, `api_error`, `bib_fallback`, `no_latex` (verified HTML with matching DOI), and `.bbl` auxiliary bibliographies. Missing submission dates and broken TeX archives are never fabricated into synthetic successes.
+- **Memory-Bounded Out-of-Core Validation**: `arxiv-validate-project` streams Parquet shards in batches backed by an on-disk SQLite index, validating one `(arxiv_id, version)` tree at a time so full 25,000-paper validation completes safely within 12 GiB Colab RAM.
+
+---
+
+## Team & Contributors
+
+| Member | Student ID | GitHub | Assigned arXiv ID Range | Core Ownership |
+|---|---|---|---|---|
+| Nguyễn Quốc Đạt | `24120282` | [@NguyenQuocDat06-AI](https://github.com/NguyenQuocDat06-AI) | `2412.18848` → `2501.02641` | Discovery, version history, request policy & integration |
+| Nguyễn Đình Tuấn | `24120237` | [@tuan0306](https://github.com/tuan0306) | `2502.03235` → `2502.08234` | Source downloader, range-resumable retry, source audit & backup |
+| Trần Nguyên Tân | `24120438` | [@nguyentan10052006-cmyk](https://github.com/nguyentan10052006-cmyk) | `2407.12839` → `2407.17838` | Semantic Scholar batching, reference retry, enrichment & provenance |
+| Dương Phan Minh Trí | `24120470` | [@takryudor](https://github.com/takryudor) | `2406.17938` → `2407.02838` | Storage schema, shard merging, LaTeX/BibTeX parser & 5-table validation |
+| Trịnh Vỹ Triết | `24120474` | [@AIVIETNAM-AIO-Triet-Descartes](https://github.com/AIVIETNAM-AIO-Triet-Descartes) | `2406.12938` → `2406.17937` | CLI runner, Colab/Kaggle orchestration, resource profiling & Jupyter Book reports |
