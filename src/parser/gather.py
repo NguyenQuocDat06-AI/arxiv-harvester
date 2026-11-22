@@ -2,7 +2,13 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
-from .latex import commands, strip_comments
+import re
+from .latex import commands, group, strip_comments
+from .normalize import normalize
+
+_DOC_CLASS_RE = re.compile(r"\\document(?:class|style)\b")
+_TITLE_RE = re.compile(r"\\title\s*(?:\[[^\]]*\]\s*)?\{")
+_WORD_RE = re.compile(r"\w+")
 
 
 @dataclass
@@ -13,6 +19,7 @@ class Gathered:
     source_map: list[dict]
     diagnostics: list[str] = field(default_factory=list)
     bibliography_files: list[str] = field(default_factory=list)
+    root_selection: str = "unique_candidate"
 
 
 def read_text(path: Path) -> str:
@@ -25,24 +32,83 @@ def read_text(path: Path) -> str:
     raise ValueError(f"Cannot decode {path}")
 
 
-def find_root(version_dir: str | Path, preferred: str | None = None) -> Path:
+def _extract_title(text: str) -> str:
+    try:
+        title = next((c.args[0] for c in commands(text) if c.name == "title" and c.args), "")
+        if title:
+            return title
+    except ValueError:
+        pass
+    match = _TITLE_RE.search(text)
+    if match:
+        try:
+            title, _ = group(text, match.end() - 1)
+            return title
+        except ValueError:
+            return ""
+    return ""
+
+
+def _title_tokens(raw: str) -> list[str]:
+    if not raw:
+        return []
+    cleaned = raw.replace("\\\\", " ").replace("~", " ")
+    try:
+        cleaned = normalize(cleaned)
+    except ValueError:
+        pass
+    return _WORD_RE.findall(cleaned.casefold())
+
+
+def _is_root_file(path: Path) -> bool:
+    text = strip_comments(read_text(path))
+    try:
+        return any(c.name in {"documentclass", "documentstyle"} for c in commands(text))
+    except ValueError:
+        return bool(_DOC_CLASS_RE.search(text))
+
+
+def _select_root(version_dir: str | Path, preferred: str | None = None,
+                 expected_title: str | None = None) -> tuple[Path, str]:
     directory = Path(version_dir).resolve()
-    def is_root(path):
-        return any(c.name in {"documentclass", "documentstyle"} for c in commands(strip_comments(read_text(path))))
     if preferred:
         chosen = (directory / preferred).resolve()
-        if not chosen.is_relative_to(directory) or not chosen.is_file() or not is_root(chosen):
+        if not chosen.is_relative_to(directory) or not chosen.is_file() or not _is_root_file(chosen):
             raise ValueError("Configured TeX root is invalid")
-        return chosen
-    roots = [p for p in sorted(directory.rglob("*")) if p.is_file() and p.suffix.lower() == ".tex" and is_root(p)]
-    if len(roots) != 1:
-        raise ValueError(f"Expected one compilation root, found {len(roots)}: {[p.name for p in roots]}")
-    return roots[0]
+        return chosen, "configured"
+    roots = [p for p in sorted(directory.rglob("*")) if p.is_file() and p.suffix.lower() == ".tex" and _is_root_file(p)]
+    if len(roots) == 1:
+        return roots[0], "unique_candidate"
+    if len(roots) > 1 and expected_title:
+        exp_tokens = _title_tokens(expected_title)
+        if exp_tokens:
+            cand_tokens_map = {p: _title_tokens(_extract_title(strip_comments(read_text(p)))) for p in roots}
+            exact = [p for p in roots if cand_tokens_map[p] == exp_tokens]
+            if len(exact) == 1:
+                return exact[0], "title_match"
+            if len(exact) > 1:
+                top_level = [p for p in exact if p.parent == directory]
+                if len(top_level) == 1:
+                    return top_level[0], "title_match_top_level"
+            if len(exp_tokens) >= 4:
+                exp_set = set(exp_tokens)
+                scores = sorted(
+                    ((len(exp_set & set(cand_tokens_map[p])) / len(exp_set), p) for p in roots if cand_tokens_map[p]),
+                    key=lambda item: item[0],
+                    reverse=True,
+                )
+                if scores and scores[0][0] >= 0.70 and (len(scores) == 1 or scores[1][0] < 0.30):
+                    return scores[0][1], "title_similarity_unique"
+    raise ValueError(f"Expected one compilation root, found {len(roots)}: {[p.name for p in roots]}")
 
 
-def gather(version_dir: str | Path, preferred_root: str | None = None) -> Gathered:
+def find_root(version_dir: str | Path, preferred: str | None = None, expected_title: str | None = None) -> Path:
+    return _select_root(version_dir, preferred, expected_title)[0]
+
+
+def gather(version_dir: str | Path, preferred_root: str | None = None, expected_title: str | None = None) -> Gathered:
     directory = Path(version_dir).resolve()
-    root = find_root(directory, preferred_root)
+    root, root_selection = _select_root(directory, preferred_root, expected_title)
     files, source_map, diagnostics = [], [], []
     offset = 0
     finished_document = False
@@ -103,4 +169,4 @@ def gather(version_dir: str | Path, preferred_root: str | None = None) -> Gather
         append(text[cursor:], cursor)
         return "".join(pieces)
     text = expand(root, [])
-    return Gathered(root.relative_to(directory).as_posix(), text, files, source_map, diagnostics)
+    return Gathered(root.relative_to(directory).as_posix(), text, files, source_map, diagnostics, root_selection=root_selection)

@@ -105,7 +105,7 @@ def process_publication(paper: dict, raw: Path, preferred_root: str | dict | Non
         else:
             try:
                 selected_root = preferred_root.get(version["version"]) if isinstance(preferred_root, dict) else preferred_root
-                gathered = gather(directory, selected_root)
+                gathered = gather(directory, selected_root, expected_title=paper.get("title"))
                 tree = parse_hierarchy(gathered.text)
                 bibliography, bib_errors = extract_entries(gathered, directory, number)
                 trees[number] = tree
@@ -113,7 +113,7 @@ def process_publication(paper: dict, raw: Path, preferred_root: str | dict | Non
                 gathering[number] = {"root": gathered.root, "files": gathered.files, "source_map": gathered.source_map,
                                      "bibliography_files": gathered.bibliography_files,
                                      "cited_keys": sorted(cited_keys(gathered.text) - {"*"})}
-                manifest.update({"root": gathered.root, "root_selection": "configured" if selected_root else "unique_candidate",
+                manifest.update({"root": gathered.root, "root_selection": gathered.root_selection,
                                  "files": gathered.files, "bibliography_files": gathered.bibliography_files,
                                  "elements_before": len(tree.nodes),
                                  "counts_measured": True,
@@ -186,8 +186,12 @@ def run(publications: str, raw_dir: str, output_dir: str, resume=False, limit: i
                   min_free_gb=min_free_gb, unused_root_overrides=sorted(set(overrides) - set(papers)))
     profiler.start()
     manifests = []
+    total_papers = len(papers)
+    checkpoint_dirty = 0
+    last_checkpoint_at = time.perf_counter()
+    last_progress_at = time.perf_counter()
     try:
-        for identifier, paper in papers.items():
+        for index, (identifier, paper) in enumerate(papers.items(), 1):
             root = raw_root(raw, identifier, members.get(identifier))
             selected_root = overrides.get(identifier, preferred_root)
             if isinstance(selected_root, dict) and preferred_root:
@@ -201,6 +205,10 @@ def run(publications: str, raw_dir: str, output_dir: str, resume=False, limit: i
                 record = json.loads((output / "working" / (key + ".json")).read_text(encoding="utf-8"))
                 manifests.extend(record["manifests"])
                 report["reused"] += 1
+                now = time.perf_counter()
+                if (now - last_progress_at) >= 15.0 or index == total_papers:
+                    print(f"[parser] {index}/{total_papers} | processed={report['processed_this_run']} reused={report['reused']} | last={identifier} (cached)", flush=True)
+                    last_progress_at = now
                 continue
             started = time.perf_counter()
             if shutil.disk_usage(output).free < min_free_gb * 1024**3:
@@ -229,12 +237,24 @@ def run(publications: str, raw_dir: str, output_dir: str, resume=False, limit: i
                 write_json(str(working), {"arxiv_id": identifier, "fingerprint": content_hash,
                                           "manifests": result["manifests"], **result["working"]})
                 paths.append(working)
+            elapsed_pub = time.perf_counter() - started
             checkpoint["completed"][identifier] = {"fingerprint": content_hash,
                                                     "files": {p.relative_to(output).as_posix(): file_hash(p) for p in paths},
-                                                    "elapsed_sec": time.perf_counter() - started}
-            write_json(str(checkpoint_path), checkpoint)
+                                                    "elapsed_sec": elapsed_pub}
+            checkpoint_dirty += 1
             manifests.extend(result["manifests"])
             report["processed_this_run"] += 1
+            now = time.perf_counter()
+            if checkpoint_dirty >= 25 or (now - last_checkpoint_at) >= 15.0 or index == total_papers:
+                write_json(str(checkpoint_path), checkpoint)
+                checkpoint_dirty = 0
+                last_checkpoint_at = now
+            if (now - last_progress_at) >= 15.0 or elapsed_pub >= 5.0 or index == 1 or index == total_papers or (report["processed_this_run"] % 25 == 0):
+                print(f"[parser] {index}/{total_papers} | processed={report['processed_this_run']} reused={report['reused']} | last={identifier} ({elapsed_pub:.2f}s)", flush=True)
+                last_progress_at = now
+        if checkpoint_dirty > 0:
+            write_json(str(checkpoint_path), checkpoint)
+            checkpoint_dirty = 0
         with profiler.phase("validation"):
             if shutil.disk_usage(output).free < min_free_gb * 1024**3:
                 raise OSError("Not enough free disk for the validation index; checkpoint retained")
@@ -250,6 +270,8 @@ def run(publications: str, raw_dir: str, output_dir: str, resume=False, limit: i
         report.update(status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed", error=repr(error))
         raise
     finally:
+        if checkpoint_dirty > 0:
+            write_json(str(checkpoint_path), checkpoint)
         stats = profiler.stop_and_export(str(run_dir / "stats.json"), extra=report)
         stats["avg_sec_per_processed_publication"] = stats["runtime_sec"] / report["processed_this_run"] if report["processed_this_run"] else None
         write_json(str(run_dir / "stats.json"), stats)

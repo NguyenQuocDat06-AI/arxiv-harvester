@@ -8,34 +8,42 @@ CITES = {"cite", "citep", "citet", "citeauthor", "citeyear", "citealt", "citealp
          "autocite", "parencite", "textcite", "footcite", "nocite"}
 WRAPPERS = {"textbf", "textit", "emph", "textrm", "textsf", "texttt", "textsc", "underline", "mbox", "caption", "footnote", "thanks"}
 DROP = {"centering", "midrule", "toprule", "bottomrule", "hline", "vspace", "hspace", "label", "small", "footnotesize", "normalsize", "noindent", "bibliographystyle"}
+_TOKEN_RE = re.compile(r"\\([A-Za-z@]+|[^\s])\*?")
+_MATH_TEXT_RE = re.compile(r"\\(?:text|textrm|mbox)\s*\{(?:[^{}]|\{[^{}]*\})*\}")
+_WS_RE = re.compile(r"\s+")
+_MATH_OP_RE = re.compile(r"\s*([=+*/^_&])\s*")
 
 
 def _citation(command, mapping: dict) -> str:
-    keys = list(dict.fromkeys(mapping.get(key.strip(), key.strip()) for key in command.args[-1].split(",")))
+    keys = list(dict.fromkeys(
+        mapping.get(cleaned, cleaned)
+        for raw_key in command.args[-1].split(",")
+        if (cleaned := raw_key.strip().strip("{}").strip())
+    ))
     return ("\\" + command.name + ("*" if command.star else "")
             + "".join("[" + option + "]" for option in command.options) + "{" + ",".join(keys) + "}")
 
 
 def _math_citations(text: str, mapping: dict) -> str:
-    if not mapping:
+    if not mapping or "\\" not in text:
         return text
     pieces, cursor, index = [], 0, 0
-    while index < len(text):
-        if text[index] != "\\":
-            index += 1
-            continue
-        literal = literal_end(text, index)
+    while True:
+        pos = text.find("\\", index)
+        if pos < 0:
+            break
+        literal = literal_end(text, pos)
         if literal is not None:
             index = literal
             continue
-        token = re.match(r"\\([A-Za-z@]+|[^\s])\*?", text[index:])
-        command = command_at(text, index) if token and token[1] in CITES else None
+        token = _TOKEN_RE.match(text, pos)
+        command = command_at(text, pos) if token and token[1] in CITES else None
         if command and command.args:
-            pieces.extend((text[cursor:index], _citation(command, mapping)))
+            pieces.extend((text[cursor:pos], _citation(command, mapping)))
             cursor = index = command.end
         else:
             # Preserve math syntax inside nested arguments.
-            index += token.end() if token else 1
+            index = token.end() if token else pos + 1
     pieces.append(text[cursor:])
     return "".join(pieces)
 
@@ -45,9 +53,9 @@ def normalize_math(body: str) -> str:
     def shield(match):
         protected.append(match.group())
         return f"MATHPROTECTEDTOKEN{len(protected)-1}END"
-    body = re.sub(r"\\(?:text|textrm|mbox)\s*\{(?:[^{}]|\{[^{}]*\})*\}", shield, body)
-    body = re.sub(r"\s+", " ", body).strip()
-    body = re.sub(r"\s*([=+*/^_&])\s*", r"\1", body)
+    body = _MATH_TEXT_RE.sub(shield, body)
+    body = _WS_RE.sub(" ", body).strip()
+    body = _MATH_OP_RE.sub(r"\1", body)
     for index, text in enumerate(protected):
         body = body.replace(f"MATHPROTECTEDTOKEN{index}END", text)
     return body
@@ -99,7 +107,7 @@ def normalize(text: str, cite_mapping: dict[str, str] | None = None, kind: str |
             # Remove grouping braces from prose.
             output.append(text[index] if text[index] not in "{}" else "")
             index += 1
-    result = re.sub(r"\s+", " ", unicodedata.normalize("NFC", "".join(output))).strip()
+    result = _WS_RE.sub(" ", unicodedata.normalize("NFC", "".join(output))).strip()
     for index, value in enumerate(protected):
         result = result.replace(f"LATEXPROTECTEDTOKEN{index}END", value)
     return result

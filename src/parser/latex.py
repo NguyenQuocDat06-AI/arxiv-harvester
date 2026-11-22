@@ -33,70 +33,99 @@ def group(text: str, start: int, opening="{", closing="}") -> tuple[str, int]:
     raise ValueError("Unclosed TeX group")
 
 
+_VERB_RE = re.compile(r"\\verb\*?([^A-Za-z\s])")
+_VERBATIM_BEGIN_RE = re.compile(r"\\begin\s*\{(verbatim\*?|lstlisting|minted)\}")
+_COMMENT_OR_BS_RE = re.compile(r"[\\%]")
+_CMD_RE = re.compile(r"\\([A-Za-z@]+|[^\s])(?P<star>\*)?")
+_ALIAS_RE = re.compile(r"\\([A-Za-z@]+)")
+_DECLARATIONS = frozenset({
+    "small", "footnotesize", "normalsize", "scriptsize", "tiny", "large", "Large", "LARGE",
+    "huge", "Huge", "frenchspacing", "bfseries", "mdseries", "itshape", "upshape", "slshape",
+    "scshape", "rmfamily", "sffamily", "ttfamily", "normalfont", "bf", "it", "rm", "sf", "tt",
+})
+_OPTIONAL_COMMANDS = frozenset({
+    "begin", "documentclass", "documentstyle", "usepackage", "RequirePackage", "includegraphics",
+    "include", "input", "item", "newcommand", "renewcommand", "providecommand", "newtheorem",
+    "title", "author", "chapter", "section", "subsection", "subsubsection", "paragraph", "subparagraph",
+    "cite", "citep", "citet", "citealt", "citealp", "citeauthor", "citeyear", "citeyearpar",
+    "autocite", "parencite", "textcite", "footcite", "nocite", "bibitem",
+})
+_ARG_COUNTS = {
+    "newcommand": 2, "renewcommand": 2, "providecommand": 2, "href": 2, "frac": 2,
+    "dfrac": 2, "tfrac": 2, "documentclass": 1, "item": 0, "appendix": 0,
+    "maketitle": 0, "newblock": 0, "centering": 0, "midrule": 0, "toprule": 0,
+    "bottomrule": 0, "printbibliography": 0,
+}
+_SENT_PATTERNS = (
+    (re.compile(r"https?://[^\s{}<>]+", flags=re.I), True),
+    (re.compile(r"\b(?:e\.g\.|i\.e\.|et\s+al\.|Fig\.|Eq\.|Dr\.|Mr\.|Ms\.|Prof\.|etc\.)", flags=re.I), False),
+    (re.compile(r"(?<=\d)\.(?=\d)"), False),
+    (re.compile(r"\b[A-Z]\.(?=\s*[A-Z])"), False),
+)
+
+
 def literal_end(text: str, start: int) -> int | None:
-    match = re.match(r"\\verb\*?([^A-Za-z\s])", text[start:])
+    match = _VERB_RE.match(text, start)
     if match:
         delimiter = match.group(1)
-        end = text.find(delimiter, start + match.end())
+        end = text.find(delimiter, match.end())
         return len(text) if end < 0 else end + 1
-    match = re.match(r"\\begin\s*\{(verbatim\*?|lstlisting|minted)\}", text[start:])
+    match = _VERBATIM_BEGIN_RE.match(text, start)
     if match:
         closing = "\\end{" + match.group(1) + "}"
-        end = text.find(closing, start + match.end())
+        end = text.find(closing, match.end())
         return len(text) if end < 0 else end + len(closing)
     return None
 
 
 def strip_comments(text: str) -> str:
-    output, index = [], 0
-    while index < len(text):
-        if text[index] == "\\":
-            end = literal_end(text, index)
+    if "%" not in text:
+        return text
+    output, index, length = [], 0, len(text)
+    while index < length:
+        match = _COMMENT_OR_BS_RE.search(text, index)
+        if not match:
+            output.append(text[index:])
+            break
+        pos = match.start()
+        if pos > index:
+            output.append(text[index:pos])
+        if text[pos] == "\\":
+            end = literal_end(text, pos)
             if end is not None:
-                output.append(text[index:end])
+                output.append(text[pos:end])
                 index = end
-                continue
-            output.append(text[index:index + 2])
-            index += 2
-        elif text[index] == "%":
-            end = text.find("\n", index)
-            end = len(text) if end < 0 else end
-            output.append(" " * (end - index))
-            index = end
+            else:
+                output.append(text[pos:pos + 2])
+                index = pos + 2
         else:
-            output.append(text[index])
-            index += 1
+            end = text.find("\n", pos)
+            end = length if end < 0 else end
+            output.append(" " * (end - pos))
+            index = end
     return "".join(output)
 
 
 def command_at(text: str, start: int) -> Command | None:
-    match = re.match(r"\\([A-Za-z@]+|[^\s])(?P<star>\*)?", text[start:])
+    match = _CMD_RE.match(text, start)
     if not match:
         return None
     name = match.group(1)
-    cursor = end = start + match.end()
+    cursor = end = match.end()
     args, options = [], []
-    declarations = {"small", "footnotesize", "normalsize", "scriptsize", "tiny", "large", "Large", "LARGE",
-                    "huge", "Huge", "frenchspacing", "bfseries", "mdseries", "itshape", "upshape", "slshape",
-                    "scshape", "rmfamily", "sffamily", "ttfamily", "normalfont", "bf", "it", "rm", "sf", "tt"}
-    if name in declarations:
+    if name in _DECLARATIONS:
         return Command(name, start, end, [], [], bool(match.group("star")))
-    optional_commands = {"begin", "documentclass", "documentstyle", "usepackage", "RequirePackage", "includegraphics",
-                         "include", "input", "item", "newcommand", "renewcommand", "providecommand", "newtheorem",
-                         "title", "author", "chapter", "section", "subsection", "subsubsection", "paragraph", "subparagraph",
-                         "cite", "citep", "citet", "citealt", "citealp", "citeauthor", "citeyear", "citeyearpar",
-                         "autocite", "parencite", "textcite", "footcite", "nocite", "bibitem"}
-    count = {"newcommand": 2, "renewcommand": 2, "providecommand": 2, "href": 2, "frac": 2,
-             "dfrac": 2, "tfrac": 2, "documentclass": 1, "item": 0, "appendix": 0,
-             "maketitle": 0, "newblock": 0, "centering": 0, "midrule": 0, "toprule": 0,
-             "bottomrule": 0, "printbibliography": 0}.get(name, 1)
+    count = _ARG_COUNTS.get(name, 1)
     while cursor < len(text):
         while cursor < len(text) and text[cursor].isspace():
             cursor += 1
-        if cursor < len(text) and text[cursor] == "[" and name in optional_commands:
-            value, cursor = group(text, cursor, "[", "]")
-            options.append(value)
-            end = cursor
+        if cursor < len(text) and text[cursor] == "[" and name in _OPTIONAL_COMMANDS:
+            try:
+                value, cursor = group(text, cursor, "[", "]")
+                options.append(value)
+                end = cursor
+            except ValueError:
+                break
         elif cursor < len(text) and text[cursor] == "{" and len(args) < count:
             value, cursor = group(text, cursor)
             args.append(value)
@@ -106,34 +135,34 @@ def command_at(text: str, start: int) -> Command | None:
     return Command(name, start, end, args, options, bool(match.group("star")))
 
 
-def commands(text: str):
-    index = 0
-    while index < len(text):
-        if text[index] != "\\":
-            index += 1
-            continue
-        end = literal_end(text, index)
+def commands(text: str, start: int = 0):
+    index = start
+    while True:
+        pos = text.find("\\", index)
+        if pos < 0:
+            break
+        end = literal_end(text, pos)
         if end is not None:
             index = end
             continue
-        command = command_at(text, index)
+        command = command_at(text, pos)
         if command:
             yield command
-            index = max(index + 1, command.end)
+            index = max(pos + 1, command.end)
         else:
-            index += 1
+            index = pos + 1
 
 
 def environment_end(text: str, start: int, name: str) -> tuple[int, int]:
     depth = 1
-    for command in commands(text[start:]):
+    for command in commands(text, start=start):
         if command.args and command.args[0] == name:
             if command.name == "begin":
                 depth += 1
             elif command.name == "end":
                 depth -= 1
                 if depth == 0:
-                    return start + command.start, start + command.end
+                    return command.start, command.end
     raise ValueError(f"Unclosed environment {name}")
 
 
@@ -161,18 +190,20 @@ def simple_math_aliases(text: str) -> dict[str, list[str]]:
 
 
 def math_at(text: str, start: int, aliases: dict | None = None) -> tuple[int, str, bool] | None:
-    if aliases and text.startswith("\\", start):
-        match = re.match(r"\\([A-Za-z@]+)", text[start:])
+    if start >= len(text) or text[start] not in ("$", "\\"):
+        return None
+    if aliases and text[start] == "\\":
+        match = _ALIAS_RE.match(text, start)
         if match and match[1] in aliases:
-            body_start = start + match.end()
+            body_start = match.end()
             depth = 1
-            for command in commands(text[body_start:]):
+            for command in commands(text, start=body_start):
                 if command.name == match[1]:
                     depth += 1
                 elif command.name in aliases[match[1]]:
                     depth -= 1
                     if depth == 0:
-                        body_end = body_start + command.start
+                        body_end = command.start
                         return body_end + 1 + len(command.name), text[body_start:body_end], True
             raise ValueError(f"Unclosed declared math wrapper: {match[1]}")
     for opening, closing, block in (("$$", "$$", True), (r"\[", r"\]", True), (r"\(", r"\)", False), ("$", "$", False)):
@@ -195,17 +226,16 @@ def sentences(text: str) -> list[str]:
     protected = [False] * len(text)
     index = 0
     while index < len(text):
-        math = math_at(text, index)
+        math = math_at(text, index) if text[index] in ("$", "\\") else None
         command = command_at(text, index) if text[index] == "\\" else None
         end = math[0] if math else command.end if command else index + 1
         if math or command:
             protected[index:end] = [True] * (end - index)
         index = end
-    patterns = (r"https?://[^\s{}<>]+", r"\b(?:e\.g\.|i\.e\.|et\s+al\.|Fig\.|Eq\.|Dr\.|Mr\.|Ms\.|Prof\.|etc\.)", r"(?<=\d)\.(?=\d)", r"\b[A-Z]\.(?=\s*[A-Z])")
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, flags=re.I if "https" in pattern or "et" in pattern else 0):
+    for pattern, is_https in _SENT_PATTERNS:
+        for match in pattern.finditer(text):
             end = match.end()
-            if pattern.startswith("https"):
+            if is_https:
                 end = match.start() + len(match.group().rstrip(".,!?;:"))
             protected[match.start():end] = [True] * (end - match.start())
     output, begin = [], 0

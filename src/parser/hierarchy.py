@@ -24,8 +24,16 @@ class Hierarchy:
 
 
 LEVELS = {"chapter": 1, "section": 2, "subsection": 3, "subsubsection": 4, "paragraph": 5, "subparagraph": 6}
-LISTS = {"itemize", "enumerate", "description"}
+LISTS = {
+    "itemize", "enumerate", "description",
+    "itemize*", "enumerate*", "description*",
+    "compactitem", "compactenum", "compactdesc",
+    "inparaenum", "inparaitem", "asparaenum", "asparaitem",
+    "list", "trivlist",
+}
 LAYOUT_ENVIRONMENTS = {"sloppypar", "center", "flushleft", "flushright", "spacing", "onehalfspace", "doublespace", "singlespace", "small", "footnotesize"}
+_BLANK_LINE_RE = re.compile(r"\n\s*\n")
+_REF_HEADING_RE = re.compile(r"\s*(references|bibliography|literature cited)\s*", flags=re.I)
 
 
 def _paragraph_spans(text: str, aliases: dict):
@@ -51,10 +59,10 @@ def _paragraph_spans(text: str, aliases: dict):
         elif text[index] == "}":
             depth = max(0, depth - 1)
         elif text[index] == "\n" and depth == 0:
-            separator = re.match(r"\n\s*\n", text[index:])
+            separator = _BLANK_LINE_RE.match(text, index)
             if separator:
                 yield start, index
-                index += separator.end()
+                index = separator.end()
                 start = index
                 continue
         index += 1
@@ -133,7 +141,7 @@ def parse_hierarchy(text: str) -> Hierarchy:
             heading = command.args[0] if command.args else ""
             if skip_level is not None and level <= skip_level:
                 skip_level = None
-            if re.fullmatch(r"\s*(references|bibliography|literature cited)\s*", heading, flags=re.I):
+            if _REF_HEADING_RE.fullmatch(heading):
                 skip_level = level
             if skip_level is None:
                 while len(headings) > 1 and headings[-1][0] >= level:
