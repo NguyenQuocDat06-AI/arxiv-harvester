@@ -10,3 +10,7 @@ psutil
 tqdm
 matplotlib
 seaborn
+scipy
+scikit-learn
+lightgbm
+rapidfuzz

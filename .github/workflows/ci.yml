@@ -1,8 +1,9 @@
-name: Check crawler and parser
+name: Check crawler, parser and matcher
 
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -19,7 +20,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Check Python syntax
-        run: python -m compileall -q src
+        run: python -m compileall -q src tools
       - name: Check notebook JSON
         run: |
           python - <<'PY'
@@ -39,3 +40,4 @@ jobs:
           arxiv-parser --help
           arxiv-audit-sources --help
           arxiv-validate-project --help
+          arxiv-matcher --help

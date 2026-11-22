@@ -2,121 +2,134 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![CI](https://github.com/NguyenQuocDat06-AI/arxiv-harvester/actions/workflows/ci.yml/badge.svg)](https://github.com/NguyenQuocDat06-AI/arxiv-harvester/actions/workflows/ci.yml)
-[![Jupyter Book Report](https://img.shields.io/badge/docs-Jupyter%20Book-orange?logo=jupyter&logoColor=white)](https://nguyenquocdat06-ai.github.io/arxiv-harvester-book/)
-[![Hugging Face Dataset](https://img.shields.io/badge/dataset-Hugging%20Face-yellow?logo=huggingface&logoColor=black)](https://huggingface.co/datasets/nquocdat06/arxiv-harvester-data)
+[![Báo cáo Jupyter Book](https://img.shields.io/badge/b%C3%A1o%20c%C3%A1o-Jupyter%20Book-orange?logo=jupyter&logoColor=white)](https://nguyenquocdat06-ai.github.io/arxiv-harvester-book/)
+[![Hugging Face Dataset](https://img.shields.io/badge/d%E1%BB%AF%20li%E1%BB%87u-Hugging%20Face%20(6%20b%E1%BA%A3ng)-yellow?logo=huggingface&logoColor=black)](https://huggingface.co/datasets/nquocdat06/arxiv-harvester-data)
 
-Scalable, fault-tolerant arXiv multi-version corpus harvester, Semantic Scholar reference collector, and hierarchical LaTeX/BibTeX parser producing deduplicated, schema-validated Parquet datasets.
-
----
-
-## Overview & Key Results
-
-`arxiv-harvester` implements an end-to-end two-stage data engineering pipeline across 25,000 arXiv publications:
-
-1. **Stage 1 — Multi-Version Acquisition & Citation Harvesting (`src/crawler/`)**: Discovers arXiv publications across assigned ID ranges, reconstructs full version revision histories (`v1..vN`), downloads and extracts LaTeX/BibTeX source archives with HTTP Range resume support, and collects citation graphs via the Semantic Scholar (S2) batch API with local `.bib`/`.bbl` fallback and strict provenance tracking.
-2. **Stage 2 — Hierarchical LaTeX/BibTeX Parsing & Deduplication (`src/parser/`)**: Resolves compilation roots and nested TeX includes, builds versioned structural hierarchy trees (sections, paragraphs, lists, math, figures, tables), parses bibliographies (`.bib` and `.bbl`), normalizes citations and content, performs exact-content deduplication, and validates cross-table integrity across all five Parquet output tables.
-
-### Verified Corpus Benchmarks (25,000 Papers — Google Colab CPU-Only)
-
-| Metric | Verified Result | Notes |
-|---|---:|---|
-| **Publications / Versions** | `25,000` / `41,498` | `38,554` verified TeX, `2,764` PDF-only/empty, `169` HTTP 404 (`0` cross-shard duplicates) |
-| **References (Working / Course)** | `976,351` / `456,149` | `0` orphan references; arXiv-keyed rows exported to course spec |
-| **Parser Coverage** | `85.66%` success / `97.34%` parsed | `33,025` full success + `4,503` partial on verified TeX; `0` missing versions |
-| **Structural Validation** | `structural_valid = True` | `errors = []` across all 5 M1–M2 tables (`arxiv-validate-project`) |
-| **Element Deduplication** | `23,099,589 → 15,006,000` (`-35.04%`) | Exact-content deduplication across multi-version documents |
-| **BibTeX Deduplication** | `1,834,650 → 1,177,293` (`-35.83%`) | Normalized per-paper citation catalog |
-| **Hierarchy Edges** | `22,532,299` | Acyclic, single-root trees verified per `(arxiv_id, version)` |
-| **Colab CPU Runtime** | `18,692.09 s` (`0.748 s/paper`) | 5 independent CPU sessions; Peak RSS `845.34 MiB`, weighted avg `240.00 MiB` |
-| **Final Output Footprint** | `4.22 GB` (`3.93 GiB`) | Snappy-compressed Parquet tables (`elements`, `hierarchy`, `bibtex`) |
-
-Published analysis and interactive visualizations are available in the **[Jupyter Book Report](https://nguyenquocdat06-ai.github.io/arxiv-harvester-book/)**, and datasets are hosted on **[Hugging Face](https://huggingface.co/datasets/nquocdat06/arxiv-harvester-data)**.
+Hệ thống thu thập đa phiên bản bài báo arXiv, phân tích cấu trúc LaTeX/BibTeX phân cấp có khử trùng và khớp tài liệu tham khảo bằng học máy cổ điển (Milestone 1 → Milestone 3), xuất bản thành bộ dữ liệu **6 bảng Parquet phân mảnh chuẩn Hugging Face** trên quy mô **25.000 bài báo**.
 
 ---
 
-## Architecture
+## Tổng quan & Kết quả đạt được
+
+Dự án triển khai trọn vẹn pipeline dữ liệu học thuật qua ba giai đoạn tích lũy trên cùng một kho mã nguồn:
+
+1. **Milestone 1 — Thu thập đa phiên bản & trích dẫn (`src/crawler/`)**: Khám phá toàn bộ dải arXiv ID được giao của 5 thành viên, truy xuất đầy đủ mọi phiên bản (`v1..vN`), tải và lọc sạch mã nguồn `.tex`/`.bib` (giữ `.bbl` bổ trợ, loại ảnh nhị phân khi giải nén) cùng metadata trích dẫn từ Semantic Scholar API có lưu nguồn gốc (*provenance*).
+2. **Milestone 2 — Phân tích cấu trúc phân cấp & khử trùng (`src/parser/`)**: Tự động xác định compilation root và đường dẫn `\input`/`\include`, dựng cây phân cấp theo từng phiên bản (`document → section → ... → sentence / math / figure / list`), chuẩn hóa LaTeX & công thức toán, chuyển `\bibitem` sang BibTeX, khử trùng 2 tầng xuyên phiên bản (hợp nhất trường + đổi tên `\cite{}`) và kiểm chuẩn toàn vẹn 5 bảng bằng SQLite ngoài bộ nhớ.
+3. **Milestone 3 — Khớp tài liệu tham khảo (`src/matching/`)**: Xây dựng tập nhãn chuẩn (Manual + Automatic) theo quy tắc từng thành viên, trích xuất **25 đặc trưng cổ điển** (kết hợp **4 đặc trưng ngữ cảnh cây phân cấp M2**, không dùng LLM hay mô hình pretrained), huấn luyện so sánh 4 mô hình xếp hạng/phân loại cổ điển, đánh giá theo **MRR@5** và đóng gói trọn bộ **6 bảng Parquet** lên Hugging Face.
+
+### Bảng tổng hợp kết quả thực nghiệm (25.000 bài báo — Google Colab CPU-only)
+
+| Giai đoạn | Chỉ tiêu | Kết quả xác minh | Ghi chú |
+|---|---|---:|---|
+| **M1** | Số bài báo / phiên bản | `25.000` / `41.498` | `38.554` TeX xác minh, `2.764` PDF-only/rỗng, `169` HTTP 404 (`0` trùng chéo thành viên) |
+| **M1** | Trích dẫn (Working / Course) | `976.351` / `456.149` | `0` trích dẫn mồ côi; bảng `references` chuẩn giữ các trích dẫn có `ref_arxiv_id` |
+| **M2** | Độ phủ parse & cấu trúc | `85,66%` success / `97,34%` parsed | `33.025` thành công + `4.503` bán phần trên TeX; `structural_valid = True`, `0` thiếu version |
+| **M2** | Khử trùng 2 tầng | Elements `-35,04%` / BibTeX `-35,83%` | Elements `23,10M → 15,01M`; BibTeX `1,83M → 1,18M`; Hierarchy `22,53M` cạnh |
+| **M2** | Hiệu năng Colab CPU-only | `18.692,09s` (`0,7477s/bài`) | 5 phiên độc lập (`reused = 0`); Peak RSS `845,34 MiB`, TB trọng số `240,00 MiB` |
+| **M3** | Quy mô gán nhãn (`k = 5`) | `3.022` bài / `162.469` mục | `25` bài Manual (`1.150` mục) + `2.997` bài Auto (`12,0%` > ngưỡng `10%`, `161.319` mục) |
+| **M3** | Kết quả Test **MRR@5** | **`0,6907`** *(Test-Manual `0,8885`)* | `LightGBM Ranker`: `100,0%` Recall@1 & Recall@5 trên toàn bộ `373` mục có đích arXiv |
+| **HF** | Bộ dữ liệu 6 bảng Parquet | `38` shards / `3,92 GiB` | Đã xuất bản công khai tại [nquocdat06/arxiv-harvester-data](https://huggingface.co/datasets/nquocdat06/arxiv-harvester-data) (`valid = True`) |
+
+- **Báo cáo phân tích M1–M2 (Jupyter Book):** [nguyenquocdat06-ai.github.io/arxiv-harvester-book](https://nguyenquocdat06-ai.github.io/arxiv-harvester-book/)
+- **Bộ dữ liệu công khai 6 bảng (Hugging Face):** [huggingface.co/datasets/nquocdat06/arxiv-harvester-data](https://huggingface.co/datasets/nquocdat06/arxiv-harvester-data)
+
+---
+
+## Kiến trúc hệ thống
 
 ```mermaid
 flowchart LR
-    A["arXiv API & Source Archives<br/>Semantic Scholar Batch API"] --> B["Crawler & Rate-Limited Pipeline<br/>(src/crawler)"]
-    B --> C["Auditing, Retry & Shard Merge<br/>(validate, retry, reconcile, enrich)"]
-    C --> D["Hierarchical LaTeX/BibTeX Parser<br/>& Exact Deduplicator (src/parser)"]
-    D --> E["5-Table Parquet Validation<br/>& Jupyter Book Reports"]
+    A["arXiv API & Source Tarballs<br/>Semantic Scholar Batch API"] --> B["Milestone 1: Crawler<br/>& Rate-Limited Pipeline<br/>(src/crawler)"]
+    B --> C["Audit, Retry, Reconcile<br/>& Merge Shards"]
+    C --> D["Milestone 2: LaTeX/BibTeX<br/>Hierarchy Parser & Dedup<br/>(src/parser)"]
+    D --> E["Milestone 3: Labeling,<br/>25 Features & Ranking<br/>(src/matching)"]
+    E --> F["Hugging Face 6-Table<br/>Sharded Parquet & Poster A2"]
 ```
 
 ---
 
-## Repository Structure
+## Cấu trúc mã nguồn
 
 ```text
 arxiv-harvester/
-├── .github/workflows/ci.yml        # Syntax, notebook JSON, package install & CLI smoke CI
+├── .github/workflows/ci.yml        # CI kiểm tra cú pháp, notebook JSON, cài đặt & CLI
 ├── configs/
-│   └── parser_roots.json           # Verified TeX compilation root overrides
-├── data/                           # Local data placeholders (raw/, shards/, processed/)
-├── docs/                           # Analysis notebooks (01–08) for M1 & M2 stages
+│   └── parser_roots.json           # Cấu hình override compilation root đã kiểm chứng
+├── data/                           # Khung thư mục dữ liệu cục bộ (không commit dữ liệu thô)
+├── docs/                           # 8 notebook phân tích kỹ thuật M1 & M2 (01–08)
 ├── src/
-│   ├── crawler/                    # Stage 1: discovery, downloader, S2 scraper, profiler, merge
-│   └── parser/                     # Stage 2: TeX gather/lexer, hierarchy, bibtex, dedup, validation
-├── tools/                          # Colab/Kaggle runners, 25k consolidator & Jupyter Book builders
-├── colab_crawler.ipynb             # Google Colab M1 crawler runner (smoke / repair / full)
-├── colab_parser_full.ipynb         # Google Colab M2 full parser runner
-├── kaggle_crawler.ipynb            # Kaggle M1 crawler runner
-├── pyproject.toml                  # Package metadata, dependencies & 7 CLI entrypoints
-└── requirements.txt                # Direct runtime dependencies
+│   ├── crawler/                    # Milestone 1: discovery, downloader, S2 batch, profiler, merge
+│   ├── parser/                     # Milestone 2: TeX gather/lexer, hierarchy, bibtex, dedup, validation
+│   └── matching/                   # Milestone 3: cleaning, labeling, 25 features, ranking, pipeline
+├── tools/
+│   ├── build_report.py             # Dựng Jupyter Book từ dữ liệu M1/M2 cục bộ
+│   ├── build_team_25000_book.py    # Dựng Jupyter Book 25.000 bài hoàn chỉnh
+│   ├── extract_book_aggregates_colab.py
+│   ├── m1_colab_tri_resume.py      # Resume M1 cho 24120470 trên Colab CPU
+│   ├── m2_colab_runner.py          # Điều phối parse M2 trên Colab CPU
+│   ├── m2_team_consolidator.py     # Gộp & kiểm chuẩn 5 thành viên (25.000 bài)
+│   ├── package_hf_dataset.py       # Đóng gói & kiểm chuẩn 6 bảng Parquet phân mảnh cho Hugging Face
+│   └── generate_poster.py          # Sinh 4 biểu đồ 300-DPI & Poster khổ đứng A2 (.pptx)
+├── colab_crawler.ipynb             # Notebook Colab chạy M1 (smoke / repair / full)
+├── colab_parser_full.ipynb         # Notebook Colab chạy M2 full
+├── kaggle_crawler.ipynb            # Notebook Kaggle chạy M1
+├── pyproject.toml                  # Khai báo package, phụ thuộc & 8 lệnh CLI
+└── requirements.txt                # Danh sách thư viện trực tiếp
 ```
 
 ---
 
-## Installation
+## Cài đặt môi trường
 
-**Prerequisites**: Python `3.10+` and an optional Semantic Scholar API key (`S2_API_KEY`) configured via environment variable or a local `.env` file (never committed).
+**Yêu cầu:** Python `>= 3.10`. Tùy chọn khóa `S2_API_KEY` (cho Semantic Scholar ở M1) khai báo qua biến môi trường hoặc file `.env` cục bộ (không đưa lên Git).
 
 ```bash
 git clone https://github.com/NguyenQuocDat06-AI/arxiv-harvester.git
 cd arxiv-harvester
 
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
 pip install -r requirements.txt
 pip install -e .
 
-# Optional: install Jupyter Book dependencies to build HTML reports
-pip install -e ".[report]"
+# Tùy chọn mở rộng theo nhu cầu:
+pip install -e ".[report]"  # Dựng báo cáo Jupyter Book 1.x
+pip install -e ".[poster]"  # Sinh file Poster A2 (.pptx)
 ```
 
-Verify the installation:
+Kiểm tra nhanh sau khi cài đặt:
 
 ```bash
 python -m compileall -q src tools
 arxiv-harvester --help
 arxiv-parser --help
+arxiv-matcher --help
 ```
 
-> **Windows note**: Set `PYTHONUTF8=1` or run `python -X utf8 -m ...` when redirecting console logs to preserve UTF-8 output.
+> **Lưu ý trên Windows:** Đặt `PYTHONUTF8=1` hoặc chạy `python -X utf8 -m ...` khi ghi log để giữ nguyên tiếng Việt có dấu.
 
 ---
 
-## CLI Reference & Usage
+## Hướng dẫn sử dụng & Danh mục 8 lệnh CLI
 
-Installing the package exposes seven CLI commands (plus module-level utilities under `src/crawler` and `tools/`):
+Sau khi cài `pip install -e .`, hệ thống cung cấp 8 lệnh CLI độc lập:
 
-| Command | Entrypoint | Purpose |
+| Lệnh CLI | Entrypoint | Chức năng chính |
 |---|---|---|
-| `arxiv-harvester` | `crawler.main:main` | Discover IDs, download/extract TeX sources, scrape S2/BibTeX references |
-| `arxiv-audit-sources` | `crawler.validate_sources:main` | Audit extracted local sources and emit retry manifests |
-| `arxiv-retry-sources` | `crawler.retry_sources:main` | Execute controlled, range-resumable retries from audit manifests |
-| `arxiv-reconcile-dates` | `crawler.version_history:main` | Reconcile per-version creation dates via arXivRaw OAI-PMH or snapshots |
-| `arxiv-enrich-references` | `crawler.enrich_references:main` | Refresh missing reference metadata while preserving field provenance |
-| `arxiv-parser` | `parser.main:main` | Parse TeX/BibTeX revisions into deduplicated hierarchical Parquet tables |
-| `arxiv-validate-project` | `parser.validation:main` | Run out-of-core SQLite-backed structural & coverage checks across all 5 tables |
+| `arxiv-harvester` | `crawler.main:main` | Thu thập metadata, mã nguồn đa phiên bản và references S2/BibTeX (M1) |
+| `arxiv-audit-sources` | `crawler.validate_sources:main` | Kiểm kê tính toàn vẹn mã nguồn cục bộ và sinh manifest retry |
+| `arxiv-retry-sources` | `crawler.retry_sources:main` | Tải bù các phiên bản lỗi có hỗ trợ HTTP Range resume |
+| `arxiv-reconcile-dates` | `crawler.version_history:main` | Đối soát ngày nộp các phiên bản qua arXivRaw OAI-PMH hoặc snapshot |
+| `arxiv-enrich-references` | `crawler.enrich_references:main` | Bổ sung metadata trích dẫn còn thiếu, giữ rõ nguồn gốc trường |
+| `arxiv-parser` | `parser.main:main` | Phân tích LaTeX/BibTeX phân cấp và khử trùng 2 tầng sang Parquet (M2) |
+| `arxiv-validate-project` | `parser.validation:main` | Kiểm chuẩn toàn vẹn 5 bảng M1–M2 bằng SQLite ngoài bộ nhớ |
+| `arxiv-matcher` | `matching.pipeline:main` | Chạy trọn bộ pipeline M3 (gán nhãn, trích đặc trưng, xếp hạng MRR@5, xuất `predictions`) |
 
-### Stage 1 — Crawling & Reference Collection
-
-Run a full range crawl (example for shard `24120237`), exporting both working tables and the 6-column course tables:
+### 1. Chạy Milestone 1 (Thu thập & gộp shard)
 
 ```bash
+# Thu thập dải bài mẫu (thêm --max-papers 5 cho smoke test, --resume để chạy tiếp)
 arxiv-harvester \
   --member-id 24120237 \
   --start-month 2025-02 --start-id 3235 \
@@ -124,56 +137,17 @@ arxiv-harvester \
   --raw-dir data/raw \
   --output-dir data/shards/24120237 \
   --export-course
-```
 
-Common operational flags:
+# Kiểm kê & sửa nguồn (thêm --execute khi thực sự gọi mạng)
+arxiv-audit-sources --publications data/shards --raw-dir data/raw --output data/audits/sources.parquet
+arxiv-retry-sources --manifest data/audits/sources.retry.jsonl --output-dir data/repaired_sources --limit 10 --execute
 
-- `--max-papers 5`: Run a smoke test into a dedicated output directory.
-- `--dry-run`: Discover metadata only (writes to `_dry_run` without downloading sources or querying S2).
-- `--resume` / `--resume --existing-only`: Continue from batch checkpoints or repair missing parts of previously crawled papers without discovering new IDs.
-- `--recheck-bib-fallback`: Re-query S2 for rows that previously fell back to local `.bib` parsing.
-- `--auto-resume-rate-limit`: Persist checkpoints on HTTP 429, wait through server cooldowns, and resume automatically in-process.
-
-### Auditing, Repair & Shard Consolidation
-
-Network repair utilities default to dry-run planning; pass `--execute` or `--fetch-missing` to perform live requests into a **separate output directory**:
-
-```bash
-# 1. Audit local sources and generate a retry manifest
-arxiv-audit-sources \
-  --publications data/shards \
-  --raw-dir data/raw \
-  --output data/audits/sources.parquet
-
-# 2. Retry failed or missing revisions safely
-arxiv-retry-sources \
-  --manifest data/audits/sources.retry.jsonl \
-  --output-dir data/repaired_sources \
-  --limit 10 \
-  --execute
-
-# 3. Reconcile missing revision dates from snapshot or arXivRaw OAI-PMH
-arxiv-reconcile-dates \
-  --publications data/shards/24120237/publications.parquet \
-  --output data/repaired_dates/24120237/publications.parquet \
-  --cache-dir data/cache/version_history
-
-# 4. Enrich reference metadata with provenance tracking
-arxiv-enrich-references \
-  --shard-dir data/shards/24120237 \
-  --output-dir data/enriched_references/24120237 \
-  --raw-dir data/raw \
-  --limit 10 \
-  --execute
-
-# 5. Merge member shards and export normalized course tables
+# Gộp 5 shard thành viên và xuất 2 bảng chuẩn M1 (papers, references)
 python -m crawler.merge_shards --shards-dir data/shards --output-dir data/processed
 python -c "from crawler.storage import export_to_course_spec; export_to_course_spec('data/processed', 'data/course_export')"
 ```
 
-### Stage 2 — Hierarchical Parsing & Validation
-
-Parse all discovered publications and versions into deduplicated Parquet tables, supplying verified compilation root overrides via `--root-overrides` (so ambiguous multi-document archives resolve deterministically without altering raw source files):
+### 2. Chạy Milestone 2 (Phân tích phân cấp & kiểm chuẩn 5 bảng)
 
 ```bash
 arxiv-parser \
@@ -182,11 +156,7 @@ arxiv-parser \
   --output-dir data/parsed \
   --root-overrides configs/parser_roots.json \
   --resume
-```
 
-Validate all five M1 + M2 tables against the full publication catalog using streaming batch validation and an on-disk SQLite index:
-
-```bash
 arxiv-validate-project \
   --course-dir data/course_export \
   --parsed-dir data/parsed \
@@ -195,93 +165,145 @@ arxiv-validate-project \
   --require-full
 ```
 
-(`--require-full` exits `0` on full completion, `1` on structural errors, and `2` when coverage or status is incomplete.)
-
-### Benchmarking & Report Generation
-
-Summarize multi-session runtime and RSS/disk metrics, or build the Jupyter Book HTML report:
+### 3. Chạy Milestone 3 (Khớp trích dẫn & xuất bảng `predictions`)
 
 ```bash
-# Aggregate benchmark metrics across multiple run sessions
-python -m crawler.benchmark_sessions \
-  --stats logs/run1/stats.json logs/run2/stats.json \
-  --final-output-dir data/processed \
-  --output build/benchmark_sessions.json
+arxiv-matcher \
+  --papers data/course_export/papers.parquet \
+  --references data/course_export/references.parquet \
+  --parsed-dir data/parsed \
+  --output-dir build/m3_outputs \
+  --auto-fraction 0.12 \
+  --seed 42
+```
 
-# Build the 25,000-paper report from aggregated Colab metrics
-python tools/build_team_25000_book.py --output build/m2_book_staging --build
+*(Tùy chọn `--manual-labels <duong_dan.jsonl>` cho phép nạp trực tiếp tệp nhãn thủ công đã rà soát.)*
 
-# Or build directly from local M1/M2 tables
-python tools/build_report.py --output build/book_source --m1-dir data/processed --m2-dir data/parsed --build
+### 4. Đóng gói 6 bảng Hugging Face & dựng Poster A2
+
+```bash
+# Đóng gói & kiểm chuẩn 6 bảng Parquet phân mảnh + YAML Dataset Card
+python tools/package_hf_dataset.py \
+  --course-dir data/course_export \
+  --parsed-dir data/parsed \
+  --predictions-dir build/m3_outputs/predictions \
+  --output-dir build/hf_dataset_staging
+
+# Sinh 4 biểu đồ 300-DPI và Poster 1 trang khổ đứng A2 (420mm x 594mm)
+python tools/generate_poster.py \
+  --m2-summary build/m2_workspace/team_25000/consolidation_summary.json \
+  --m3-workspace build/m3_workspace \
+  --output build/poster/arXiv_Harvester_Poster_A2.pptx
 ```
 
 ---
 
-## Output Layout & Data Schema
+## Tài liệu hóa Milestone 3 (Gán nhãn, Đặc trưng & Đánh giá MRR@5)
 
-### Directory Structure
+### 1. Quy trình gán nhãn & Định dạng nhãn (Label Format)
 
-```text
-data/
-├── raw/
-│   ├── sources/                         # Temporary downloaded archives
-│   ├── unzipped/<arxiv_id>/<version>/   # Extracted .tex, .bib, and auxiliary .bbl files
-│   └── manifests/<versioned_id>.json    # Per-version source audit & PDF-only/no-LaTeX evidence
-├── shards/<member_id>/
-│   ├── publications.parquet             # Working M1 publication & per-version metadata
-│   ├── references.parquet               # Working M1 citations (S2 + BibTeX fallback)
-│   ├── crawl_status.parquet             # Per-paper status, counts & request provenance
-│   ├── course_export/
-│   │   ├── papers.parquet               # Normalized 6-column M1 papers table
-│   │   └── references.parquet           # Normalized 6-column arXiv-keyed references table
-│   └── runs/<run_id>/                   # stats.json, paper_metrics.jsonl, resource_samples.jsonl
-└── parsed/
-    ├── elements/*.parquet               # Deduplicated document structural elements
-    ├── hierarchy/*.parquet              # Version-scoped parent-child tree edges
-    ├── bibtex/*.parquet                 # Normalized per-paper bibliography entries
-    ├── checkpoint.json                  # Input/code/config/output SHA-256 checkpoint
-    ├── manifest.json                    # Parse status for every version (including empty/errors)
-    └── project_validation.json          # Cross-table validation report
+Bài toán khớp được định nghĩa trong nội bộ từng bài báo `arxiv_id`: với $m$ mục BibTeX chuẩn hóa từ M2 (`bibtex`) và $n$ tài liệu tham khảo có `ref_arxiv_id` từ M1 (`references`), không gian ứng viên là ma trận nhị phân $m \times n$ trong đó mỗi mục BibTeX có tối đa **1 nhãn dương** (đúng `ref_arxiv_id` tương ứng) hoặc là **hàng âm toàn phần** (`groundtruth_arxiv_id = null`) khi tài liệu trích dẫn không có bản arXiv trong tập crawled references.
+
+- **Tập gán nhãn thủ công (Manual Pool):** Chọn đúng **5 bài báo / thành viên** (**25 bài** cho nhóm `k = 5`), mỗi bài đạt chuẩn **≥ 20 mục BibTeX** và **≥ 20 arXiv references**, tổng cộng **1.150 mục BibTeX** (`1.003` mục có đích arXiv, `147` mục âm toàn phần — vượt xa ngưỡng tối thiểu `100 × 5 = 500` mục).
+- **Tập gán nhãn tự động (Automatic Pool):** Áp dụng bộ ghép heuristic cổ điển (`regex` trích arXiv ID + tương đồng tiêu đề chuẩn hóa + trùng họ tác giả + đối chiếu năm, kiểm soát khoảng cách top-1 vs top-2) lên **2.997 bài báo** (`12,0%` của `24.975` bài còn lại > ngưỡng bắt buộc `10% = 2.498` bài, phân bổ cân đối 599–600 bài/thành viên), gán nhãn toàn bộ **161.319 mục BibTeX** (`58.535` mục dương).
+- **Chia tập chống rò rỉ theo `arxiv_id` (đúng quy tắc theo từng thành viên `k = 5`):**
+  - **Test set:** `5` bài Manual + `5` bài Auto (`1 + 1` mỗi thành viên) → **10 bài / 540 mục** (`260` Manual, `280` Auto; `373` mục có đích, `167` hàng âm toàn phần).
+  - **Validation set:** `5` bài Manual + `5` bài Auto (`1 + 1` mỗi thành viên) → **10 bài / 414 mục** (`217` Manual, `197` Auto; `277` mục có đích).
+  - **Training set:** `15` bài Manual + `2.987` bài Auto → **3.002 bài / 161.515 mục** (`58.888` mục có đích). Bộ `TfidfVectorizer` chỉ được `fit` duy nhất trên tập **Train**.
+
+**Định dạng lưu nhãn thủ công nội bộ (`manual_labels.jsonl`):** Mỗi dòng là một bản ghi JSON đại diện cho một mục `(arxiv_id, citation_key)` kèm bằng chứng đối chiếu để kiểm tra minh bạch:
+
+```json
+{
+  "arxiv_id": "2406.14092",
+  "member_id": "24120474",
+  "citation_key": "vaswani2017attention",
+  "groundtruth_arxiv_id": "1706.03762",
+  "match_reason": "exact_normalized_title",
+  "confidence": 0.99,
+  "bib_title": "Attention Is All You Need",
+  "bib_authors": ["Vaswani, Ashish", "Shazeer, Noam"],
+  "bib_year": 2017,
+  "ref_title": "Attention is All you Need",
+  "ref_authors": ["Ashish Vaswani", "Noam Shazeer"],
+  "ref_year": 2017
+}
 ```
 
-### Five-Table Parquet Schema
+### 2. Kỹ thuật đặc trưng (25 đặc trưng cổ điển — kèm ngữ cảnh cây Hierarchy M2)
 
-| Stage | Table | Primary Key / Scope | Core Columns |
-|---|---|---|---|
-| **M1** | `papers.parquet` | `arxiv_id` | `arxiv_id`, `title`, `authors`, `submission_date`, `revised_dates`, `venue` |
-| **M1** | `references.parquet` | `(arxiv_id, ref_arxiv_id)` | `arxiv_id`, `ref_arxiv_id`, `ref_title`, `ref_authors`, `ref_submission_date`, `ref_s2_id` |
-| **M2** | `elements/*.parquet` | `element_id` | `element_id`, `arxiv_id`, `kind` (dict), `content` |
-| **M2** | `hierarchy/*.parquet` | `(arxiv_id, version, element_id, parent_id)` | `arxiv_id`, `version`, `element_id`, `parent_id` |
-| **M2** | `bibtex/*.parquet` | `(arxiv_id, citation_key)` | `arxiv_id`, `citation_key`, `entry_type` (dict), `title`, `authors`, `year`, `doi`, `journal`, `url` |
+Toàn bộ mô hình sử dụng **100% đặc trưng và thuật toán học máy cổ điển** (không dùng LLM hay pretrained transformer) nhằm đảm bảo chấm đúng nhóm tiêu chuẩn, tốc độ suy luận nhanh và khả năng diễn giải rõ ràng trên `5.802.835` cặp ứng viên:
+
+| Nhóm đặc trưng | Số lượng | Danh sách đặc trưng | Cơ sở & động lực thiết kế |
+|---|---:|---|---|
+| **1. Tương đồng tiêu đề** | 7 | `title_exact_norm`, `title_token_jaccard`, `title_token_dice`, `title_containment_bib_in_ref`, `title_rapidfuzz_ratio`, `title_tfidf_cosine`, `title_len_ratio` | Bắt cả khớp nguyên văn sau bỏ macro LaTeX lẫn lỗi chính tả, tiêu đề rút gọn và trọng số thuật ngữ hiếm qua TF-IDF (1–2 gram fit trên Train). |
+| **2. Khớp tác giả** | 5 | `first_author_surname_match`, `author_surname_jaccard`, `author_surname_recall`, `author_initial_surname_match`, `author_count_diff` | Tách cấu trúc `(họ, chữ đầu tên)` chịu được khác biệt định dạng `"Last, First"` vs `"First Last"` và rút gọn `"et al."` trong `.bbl`. |
+| **3. Thời gian & định danh** | 5 | `arxiv_id_exact_match`, `year_exact_match`, `year_abs_diff`, `year_diff_signed`, `cite_key_author_year_hit` | Khai thác tín hiệu chính xác gần tuyệt đối khi URL/DOI chứa arXiv ID, mô hình hóa độ trễ +0/+1 năm giữa bản preprint arXiv và bản hội nghị (`year_diff_signed`), cùng quy ước đặt tên `citation_key` (vd. `he2016deep`). |
+| **4. Tương đối trong pool** | 4 | `title_tfidf_margin_to_best`, `title_tfidf_rank_inv`, `author_jaccard_margin_to_best`, `pool_size_log` | So sánh ứng viên $j$ với ứng viên tốt nhất trong cùng hàng $m \times n$ giúp mô hình tách biệt rõ điểm thật với nhiễu nền dù độ dài tiêu đề thay đổi. |
+| **5. Ngữ cảnh cây Hierarchy M2** | 4 | `hier_cite_count`, `hier_in_intro_or_related`, `hier_context_title_tfidf_cosine`, `hier_context_author_hit` | Khai thác trực tiếp bảng `elements` & `hierarchy` từ M2 (trên `160.946` citation keys): đo tần suất `\cite{}` trong toàn bài, kiểm tra vị trí mục cha (*Introduction / Related Work*) và đối chiếu câu trích dẫn thực tế với tiêu đề/họ tác giả ứng viên khi trường BibTeX bị khuyết. |
+
+**Phân tích độ quan trọng đặc trưng (LightGBM Ranker):** Các đặc trưng mang tính phân tách mạnh nhất là `author_jaccard_margin_to_best` (`16,7%`), `year_diff_signed` (`13,3%`), `title_tfidf_margin_to_best` (`13,3%`), `title_token_dice` (`10,0%`), `title_len_ratio` (`6,7%`), `arxiv_id_exact_match` (`6,7%`) và đặc trưng từ cây M2 `hier_cite_count` (`3,3%`).
+
+### 3. So sánh 4 mô hình cổ điển & Nghiên cứu loại bỏ đặc trưng (Ablation Study)
+
+Đánh giá bằng công thức chuẩn của đề:
+
+$$\text{MRR@5} = \frac{1}{|Q|} \sum_{i=1}^{|Q|} \frac{1}{\text{rank}_i}$$
+
+trong đó $|Q|$ là toàn bộ số mục BibTeX được gán nhãn trong tập kiểm tra (mục không có đích arXiv hoặc đích không nằm trong Top-5 nhận điểm `0`).
+
+| Mô hình (Cổ điển) | Valid MRR@5 (`\|Q\|=414`) | Test MRR@5 (`\|Q\|=540`) | Test-Manual MRR@5 (`\|Q\|=260`) | Test-Auto MRR@5 (`\|Q\|=280`) | Test Positive-only MRR@5 (`n=373`) | Test Recall@1 | Test Recall@5 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Heuristic Baseline | `0,6691` | `0,6907` | `0,8885` | `0,5071` | `1,0000` | `100,0%` | `100,0%` |
+| Logistic Regression | `0,6691` | `0,6907` | `0,8885` | `0,5071` | `1,0000` | `100,0%` | `100,0%` |
+| Random Forest | `0,6691` | `0,6907` | `0,8885` | `0,5071` | `1,0000` | `100,0%` | `100,0%` |
+| **LightGBM Ranker (`lambdarank`)** *(chọn)* | **`0,6691`** | **`0,6907`** | **`0,8885`** | **`0,5071`** | **`1,0000`** | **`100,0%`** | **`100,0%`** |
+
+- **Ablation Study (LightGBM Ranker):** Cả 3 cấu hình `A1` (17 đặc trưng metadata cơ bản), `A2` (+4 đặc trưng tương đối pool = 21) và `A3` (+4 đặc trưng ngữ cảnh Hierarchy M2 = 25) đều đạt **Test MRR@5 = `0,6907`** (`100,0%` Recall@1 trên `373/373` mục có đích); bổ sung nhóm tương đối pool và Hierarchy M2 giúp LightGBM đạt NDCG@5 = `1,0000` trên Validation ngay vòng boosting đầu tiên (chỉ 30 nút rẽ nhánh).
+- **Giải thích phân tích lỗi & trần MRR@5:** Trên tập Test gồm `540` mục BibTeX, có `167` mục (`30,9%`) là tài liệu không có bản preprint trên arXiv (sách giáo khoa, tạp chí đóng, kỷ yếu không đẩy arXiv) nên tạo hàng âm toàn phần — đây chính là **trần lý thuyết tự nhiên** khiến MRR@5 tính trên toàn bộ $|Q|$ đạt `373 / 540 = 0,690741` (tương tự: `231 / 260 = 0,8885` trên Test-Manual và `142 / 280 = 0,5071` trên Test-Auto), trong khi độ chính xác xếp hạng hạng 1 trên các mục có đích arXiv đạt **100%** trên cả Validation và Test (và `99,98%–99,998%` trên `58.888` mục dương của tập Train).
 
 ---
 
-## Cloud Execution (Google Colab & Kaggle)
+## Bộ dữ liệu 6 bảng Parquet trên Hugging Face
 
-The repository includes self-contained notebooks and orchestrators designed for ephemeral CPU runtimes:
+Bộ dữ liệu đã được đóng gói phẳng, nén Snappy, không dùng custom loading script và xuất bản công khai tại **[nquocdat06/arxiv-harvester-data](https://huggingface.co/datasets/nquocdat06/arxiv-harvester-data)**:
 
-- **`colab_crawler.ipynb`**: Supports `smoke` (5-paper verification), `repair` (missing sources/references), and `full` modes. Stages raw/shard I/O on fast local `/content` SSD (`USE_LOCAL_WORKSPACE=True`), runs incremental Drive backups with SHA-256 verified `HEAD.json` archive chains, and stops cleanly before disk exhaustion (`2 GiB` floor).
-- **`colab_parser_full.ipynb` & `tools/m2_colab_runner.py`**: Verifies M1 archive chains, runs cold 5,000-paper/member CPU parsing, validates outputs, and syncs parsed batches, `m1_tables/`, and `resource_samples.jsonl` back to Google Drive.
-- **`tools/m2_team_consolidator.py`**: Merges all 5 member shards, checks cross-shard `.parquet` uniqueness, runs full 5-table `src.parser.validation`, and summarizes multi-session CPU/RSS benchmarks via `src.crawler.benchmark_sessions`.
-- **`kaggle_crawler.ipynb`**: Alternative Kaggle runtime crawler.
+| Giai đoạn | Bảng (`config_name`) | Đường dẫn trong repo HF | Số shards | Số dòng | Dung lượng | Các cột chính |
+|---|---|---|---:|---:|---:|---|
+| **M1** | `papers` | `data/papers/*.parquet` | 1 | `25.000` | `3,52 MiB` | `arxiv_id`, `title`, `authors[]`, `submission_date`, `revised_dates[]`, `venue` |
+| **M1** | `references` | `data/references/*.parquet` | 1 | `456.149` | `74,23 MiB` | `arxiv_id`, `ref_arxiv_id`, `ref_title`, `ref_authors[]`, `ref_submission_date`, `ref_s2_id` |
+| **M2** | `elements` | `data/elements/*.parquet` | 16 | `15.006.000` | `2.443,69 MiB` | `element_id`, `arxiv_id`, `kind` (dict), `content` |
+| **M2** | `hierarchy` | `data/hierarchy/*.parquet` | 16 | `22.532.299` | `1.301,81 MiB` | `arxiv_id`, `version`, `element_id`, `parent_id` |
+| **M2** | `bibtex` | `data/bibtex/*.parquet` | 3 | `1.177.293` | `185,30 MiB` | `arxiv_id`, `citation_key`, `entry_type` (dict), `title`, `authors[]`, `year`, `doi`, `journal`, `url` |
+| **M3** | `predictions` | `data/predictions/*.parquet` | 1 | `162.469` | `4,06 MiB` | `arxiv_id`, `partition` (dict), `citation_key`, `groundtruth_arxiv_id`, `cand_1..cand_5` |
+
+Tải nhanh bằng thư viện `datasets`:
+
+```python
+from datasets import load_dataset
+
+papers = load_dataset("nquocdat06/arxiv-harvester-data", name="papers", split="train")
+predictions = load_dataset("nquocdat06/arxiv-harvester-data", name="predictions", split="train")
+```
 
 ---
 
-## Engineering Highlights
+## Điểm nổi bật kỹ thuật & Thực thi đám mây
 
-- **Provider-Isolated Rate Limiting & Cooldown Persistence**: Enforces arXiv politeness pacing (`>=3.0 s` between metadata/source requests on a single connection) independently from Semantic Scholar batching (`--s2-batch-size 50`, `5 s` pacing). Cooldown deadlines persist across restarts in `--rate-state-dir` with OS-level local file locks and full `Retry-After` compliance.
-- **Fault-Tolerant Resumption & Range Downloads**: Supports HTTP `Content-Range` `.part` resumption with adaptive chunk sizing, per-paper bounded background queues (`--max-inflight-papers 25`), atomic `.tmp` Parquet swaps, and `--min-free-gb` disk guards.
-- **Strict Provenance & Zero-Fabrication Guarantees**: Distinguishes `not_indexed`, `api_error`, `bib_fallback`, `no_latex` (verified HTML with matching DOI), and `.bbl` auxiliary bibliographies. Missing submission dates and broken TeX archives are never fabricated into synthetic successes.
-- **Memory-Bounded Out-of-Core Validation**: `arxiv-validate-project` streams Parquet shards in batches backed by an on-disk SQLite index, validating one `(arxiv_id, version)` tree at a time so full 25,000-paper validation completes safely within 12 GiB Colab RAM.
+- **Tuân thủ giới hạn truy cập độc lập theo nhà cung cấp:** Khóa nhịp arXiv (`≥ 3,0s`/request, 1 kết nối tuần tự) tách rời hoàn toàn khỏi lô Semantic Scholar (`--s2-batch-size 50`, `5s`/request); cooldown lưu bền vững qua `--rate-state-dir` kèm khóa tệp mức hệ điều hành và tuân thủ `Retry-After`.
+- **Khôi phục bền vững & chạy trên Google Colab CPU-only:** `colab_crawler.ipynb` hỗ trợ 3 chế độ (`smoke`/`repair`/`full`), làm việc trên SSD `/content` và sao lưu từng lô lên Drive có kiểm chứng SHA-256 chuỗi `HEAD.json`; `colab_parser_full.ipynb` & `tools/m2_colab_runner.py` parse toàn bộ 25.000 bài cold với Peak RSS `< 850 MiB`; `arxiv-matcher` & `tools/package_hf_dataset.py` chạy trọn bộ M3 & đóng gói 6 bảng Parquet với Peak RSS `~2,7 GiB`.
+- **Minh bạch nguồn gốc dữ liệu (Provenance):** Phân biệt rõ `not_indexed`, `api_error`, `bib_fallback`, `no_latex` và `.bbl` bổ trợ; tuyệt đối không tự bịa ngày nộp còn thiếu hay tệp `.tex` giả.
 
 ---
 
-## Team & Contributors
+<a id="team--contributors"></a>
 
-| Member | Student ID | GitHub | Assigned arXiv ID Range | Core Ownership |
+## Nhóm thực hiện & Đóng góp
+
+| Thành viên | MSSV | GitHub | Dải arXiv ID phụ trách | Mảng triển khai chính |
 |---|---|---|---|---|
-| Nguyễn Quốc Đạt | `24120282` | [@NguyenQuocDat06-AI](https://github.com/NguyenQuocDat06-AI) | `2412.18848` → `2501.02641` | Discovery, version history, request policy & integration |
-| Nguyễn Đình Tuấn | `24120237` | [@tuan0306](https://github.com/tuan0306) | `2502.03235` → `2502.08234` | Source downloader, range-resumable retry, source audit & backup |
-| Trần Nguyên Tân | `24120438` | [@nguyentan10052006-cmyk](https://github.com/nguyentan10052006-cmyk) | `2407.12839` → `2407.17838` | Semantic Scholar batching, reference retry, enrichment & provenance |
-| Dương Phan Minh Trí | `24120470` | [@takryudor](https://github.com/takryudor) | `2406.17938` → `2407.02838` | Storage schema, shard merging, LaTeX/BibTeX parser & 5-table validation |
-| Trịnh Vỹ Triết | `24120474` | [@AIVIETNAM-AIO-Triet-Descartes](https://github.com/AIVIETNAM-AIO-Triet-Descartes) | `2406.12938` → `2406.17937` | CLI runner, Colab/Kaggle orchestration, resource profiling & Jupyter Book reports |
+| Nguyễn Quốc Đạt | `24120282` | [@NguyenQuocDat06-AI](https://github.com/NguyenQuocDat06-AI) | `2412.18848` → `2501.02641` | Discovery, lịch sử phiên bản, request policy, tích hợp CI & tài liệu |
+| Nguyễn Đình Tuấn | `24120237` | [@tuan0306](https://github.com/tuan0306) | `2502.03235` → `2502.08234` | Tải mã nguồn, HTTP Range resume/retry, kiểm kê nguồn, backup & mô hình M3 |
+| Trần Nguyên Tân | `24120438` | [@nguyentan10052006-cmyk](https://github.com/nguyentan10052006-cmyk) | `2407.12839` → `2407.17838` | S2 batching, reference retry/enrich, provenance, tiền xử lý & gán nhãn M3 |
+| Dương Phan Minh Trí | `24120470` | [@takryudor](https://github.com/takryudor) | `2406.17938` → `2407.02838` | Schema Parquet, gộp shard, parser LaTeX/BibTeX, kiểm chuẩn 5 bảng & đặc trưng M3 |
+| Trịnh Vỹ Triết | `24120474` | [@AIVIETNAM-AIO-Triet-Descartes](https://github.com/AIVIETNAM-AIO-Triet-Descartes) | `2406.12938` → `2406.17937` | CLI runner, điều phối Colab/Kaggle, profiler, Jupyter Book, đóng gói HF & Poster A2 |

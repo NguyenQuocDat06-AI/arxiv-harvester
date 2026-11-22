@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arxiv-harvester"
-version = "0.2.0"
-description = "arXiv crawling and hierarchical parsing - Milestones 1 and 2"
+version = "0.3.0"
+description = "arXiv multi-version crawling, hierarchical LaTeX/BibTeX parsing, and reference matching (Milestones 1-3)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -19,11 +19,17 @@ dependencies = [
     "tqdm",
     "matplotlib",
     "seaborn",
+    "scipy",
+    "scikit-learn",
+    "lightgbm",
+    "rapidfuzz",
 ]
 
 [project.optional-dependencies]
 dev = ["nbformat>=5"]
 report = ["jupyter-book>=1,<2", "nbformat>=5", "nbclient>=0.8"]
+poster = ["python-pptx>=1.0"]
+hub = ["huggingface-hub>=0.24"]
 
 [project.scripts]
 arxiv-harvester = "crawler.main:main"
@@ -33,6 +39,7 @@ arxiv-audit-sources = "crawler.validate_sources:main"
 arxiv-retry-sources = "crawler.retry_sources:main"
 arxiv-reconcile-dates = "crawler.version_history:main"
 arxiv-enrich-references = "crawler.enrich_references:main"
+arxiv-matcher = "matching.pipeline:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
