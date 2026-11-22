@@ -116,7 +116,9 @@ def retry_sources(manifest: str, output_dir: str, execute=False, limit: int | No
                     try:
                         result = download_and_clean_source(row["arxiv_id"] + row["version"],
                                                           str(raw / "sources"), str(raw / "unzipped"), rate_limit_sec=source_rate_limit_sec,
-                                                          max_attempts=download_attempts, read_timeout_sec=read_timeout_sec)
+                                                          max_attempts=download_attempts, read_timeout_sec=read_timeout_sec,
+                                                          **({"expected_doi": records[row["arxiv_id"]]["doi"]}
+                                                             if records[row["arxiv_id"]].get("doi") else {}))
                     except Exception as error:
                         result = {"status":"error", "error_message":str(error)}
                     report["executed"] += 1

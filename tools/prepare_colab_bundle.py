@@ -32,10 +32,19 @@ def build_bundle(output: str | Path) -> dict:
         if path.is_symlink() or not allowed_path(name):
             raise ValueError("Unsupported source path: " + name)
         contents[name] = path.read_bytes()
-    base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    if (ROOT / ".git").exists():
+        try:
+            base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+        except (OSError, subprocess.CalledProcessError):
+            base = None
+    else:
+        base = None
+    file_hashes = {name: hashlib.sha256(data).hexdigest() for name, data in sorted(contents.items())}
+    snapshot_sha256 = hashlib.sha256(json.dumps(file_hashes, sort_keys=True).encode("utf-8")).hexdigest()
     manifest = {"format_version": 1, "runtime_protocol": 1, "source_base_commit": base,
+                "source_snapshot_sha256": snapshot_sha256,
                 "includes_local_changes": True,
-                "files": {name: hashlib.sha256(data).hexdigest() for name, data in sorted(contents.items())}}
+                "files": file_hashes}
     target = Path(output).resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -43,7 +52,8 @@ def build_bundle(output: str | Path) -> dict:
             archive.writestr(name, data)
         archive.writestr("bundle_manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     return {"path": str(target), "sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
-            "files": len(contents), "bytes": target.stat().st_size, "source_base_commit": base}
+            "files": len(contents), "bytes": target.stat().st_size, "source_base_commit": base,
+            "source_snapshot_sha256": snapshot_sha256}
 
 
 def install_bundle(archive_path: str | Path, target_root: str | Path, expected_sha256: str) -> tuple[Path, dict]:

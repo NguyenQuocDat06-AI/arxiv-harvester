@@ -56,6 +56,10 @@ class ReferenceScrapeError(CrawlerError):
     """Lỗi mạng, API hoặc dữ liệu trích dẫn."""
 
 
+class ReferenceDataError(ReferenceScrapeError):
+    """The provider response is inconsistent with the requested paper."""
+
+
 class PaperNotFoundError(ReferenceScrapeError):
     """S2 trả 404; caller có thể thử nguồn BibTeX local."""
 
@@ -82,6 +86,7 @@ class ReferenceResult(list):
 
     success/empty/partial: kết quả S2 đầy đủ, rỗng hoặc thiếu.
     bib_fallback/not_indexed: S2 trả 404, có hoặc thiếu BibTeX dự phòng.
+    bib_pending: BibTeX tạm trong lúc truy vấn S2 còn lỗi, cần lấy bù.
     unavailable/api_error: S2 trả rỗng bất thường hoặc truy vấn thất bại.
     """
 
@@ -97,6 +102,10 @@ class ReferenceResult(list):
         request_metrics: dict | None = None,
         request_group: str | None = None,
         request_group_size: int = 1,
+        raw_count: int | None = None,
+        pagination_exhausted: bool = False,
+        lookup_required: bool = False,
+        provider_data_error: bool = False,
     ) -> None:
         super().__init__(records or [])
         self.status = status
@@ -108,12 +117,25 @@ class ReferenceResult(list):
         self.request_metrics = request_metrics
         self.request_group = request_group
         self.request_group_size = request_group_size
+        self.raw_count = raw_count
+        self.pagination_exhausted = pagination_exhausted
+        self.lookup_required = lookup_required
+        self.provider_data_error = provider_data_error
+
 
     def __repr__(self) -> str:
         return (
             f"ReferenceResult(len={len(self)}, status={self.status!r}, "
             f"source={self.source!r}, expected={self.expected_count}, received={self.received_count})"
         )
+
+
+class ReferencePageList(list):
+    """Raw API rows with pagination evidence."""
+    def __init__(self, rows, exhausted=True, error=None):
+        super().__init__(rows)
+        self.pagination_exhausted = exhausted
+        self.error_message = error
 
 
 # Cấu hình gọi Semantic Scholar
@@ -227,6 +249,10 @@ def scrape_references_for_paper(
             expected_count=expected_count,
             received_count=len(records),
             request_stats=get_request_stats(),
+            raw_count=len(refs),
+            pagination_exhausted=getattr(refs, "pagination_exhausted", False),
+            error_message=(getattr(refs, "error_message", None) or
+                           ("S2 pagination exhausted before referenceCount" if status == "partial" else None)),
         )
     except PaperNotFoundError as not_found:
         local_records = _read_local_references(source_id, unzipped_paper_dir)
@@ -239,6 +265,7 @@ def scrape_references_for_paper(
                 expected_count=len(local_records),
                 received_count=len(local_records),
                 request_stats=get_request_stats(),
+                error_message=str(not_found),
             )
         if raise_on_error:
             raise PaperNotFoundError(f"{not_found}; không có .bib dùng được trong thư mục nguồn") from not_found
@@ -262,22 +289,25 @@ def scrape_references_for_paper(
             received_count=0,
             request_stats=get_request_stats(),
             error_message=str(unavail),
+            provider_data_error=True,
         )
     except ReferenceScrapeError as err:
+        if raise_on_error:
+            raise
         if unzipped_paper_dir:
             local_records = _read_local_references(source_id, unzipped_paper_dir)
             if local_records:
                 _request_stats["bib_fallbacks"] = _request_stats.get("bib_fallbacks", 0) + 1
                 return ReferenceResult(
                     local_records,
-                    status="bib_fallback",
+                    status="bib_pending",
                     source=_SOURCE_BIB,
                     expected_count=len(local_records),
                     received_count=len(local_records),
                     request_stats=get_request_stats(),
+                    error_message=str(err),
+                    provider_data_error=isinstance(err, ReferenceDataError),
                 )
-        if raise_on_error:
-            raise
         logger.warning("Lỗi scrape references cho bài %s: %s", source_id, err)
         return ReferenceResult(
             [],
@@ -287,6 +317,7 @@ def scrape_references_for_paper(
             received_count=0,
             request_stats=get_request_stats(),
             error_message=str(err),
+            provider_data_error=isinstance(err, ReferenceDataError),
         )
 
 
@@ -404,12 +435,17 @@ def _backoff_seconds(attempt: int, retry_after: float | None) -> float:
     return min(delay, _MAX_WAIT_SEC)
 
 
+def reference_cooldown_remaining() -> float:
+    return max(0.0, _cooldown_until-time.monotonic(),
+               rate_limiter.policy.snapshot("semantic_scholar")["remaining_sec"])
+
+
 def _get_json(url: str, params: dict, source_id: str, rate_limit_sec: float,
               method: str = "GET", json_body: dict | None = None) -> object:
     global _cooldown_until
     remaining = _cooldown_until - time.monotonic()
     if _MAX_ATTEMPTS == 1:
-        remaining = max(remaining, rate_limiter.policy.snapshot("semantic_scholar")["remaining_sec"])
+        remaining = reference_cooldown_remaining()
     if remaining > 0:
         _request_stats["deferred_queries"] += 1
         raise SemanticScholarRateLimitError(
@@ -523,15 +559,15 @@ def _fetch_s2_references(source_id: str, rate_limit_sec: float) -> tuple[list[di
     external = body.get("externalIds") if isinstance(body, dict) else None
     returned_id = external.get("ArXiv") if isinstance(external, dict) else None
     if returned_id is not None and _normalize_arxiv_id(returned_id) != source_id:
-        raise ReferenceScrapeError(f"S2 trả ID bài nguồn khác yêu cầu {source_id}")
+        raise ReferenceDataError(f"S2 trả ID bài nguồn khác yêu cầu {source_id}")
     refs = body.get("references") if isinstance(body, dict) else None
     if not isinstance(refs, list):
-        raise ReferenceScrapeError(f"S2 trả dữ liệu sai hình dạng cho bài {source_id}: thiếu danh sách references")
+        raise ReferenceDataError(f"S2 trả dữ liệu sai hình dạng cho bài {source_id}: thiếu danh sách references")
 
     total = body.get("referenceCount")
     known_total = isinstance(total, int) and not isinstance(total, bool)
     if known_total and (total < 0 or (total == 0 and refs)):
-        raise ReferenceScrapeError(f"S2 trả referenceCount mâu thuẫn với references của bài {source_id}")
+        raise ReferenceDataError(f"S2 trả referenceCount mâu thuẫn với references của bài {source_id}")
 
     if known_total and total == 0:
         _request_stats["empty_refs"] = _request_stats.get("empty_refs", 0) + 1
@@ -541,9 +577,17 @@ def _fetch_s2_references(source_id: str, rate_limit_sec: float) -> tuple[list[di
         return refs, "success", total
 
     # Lấy đủ trang nếu kết quả đầu bị cắt bớt.
-    paged = _fetch_s2_pages(f"{paper_url}/references", source_id, rate_limit_sec)
+    try:
+        paged = _fetch_s2_pages(f"{paper_url}/references", source_id, rate_limit_sec)
+    except ReferenceScrapeError as error:
+        if not refs:
+            raise
+        return ReferencePageList(refs, exhausted=False, error=str(error)), "partial", total if known_total else None
     if len(paged) < len(refs):
-        paged = refs
+        paged = ReferencePageList(refs, exhausted=getattr(paged, "pagination_exhausted", False),
+                                  error=getattr(paged, "error_message", None))
+    if getattr(paged, "error_message", None):
+        return paged, "partial", total if known_total else None
 
     if known_total and len(paged) < total:
         if not paged:
@@ -567,6 +611,10 @@ def _fetch_s2_pages(url: str, source_id: str, rate_limit_sec: float) -> list[dic
             page = _get_json(url, params, source_id, rate_limit_sec)
         except PaperNotFoundError as exc:
             raise ReferenceScrapeError(f"Trang offset={offset} của bài {source_id} trả 404 dù bài tồn tại") from exc
+        except ReferenceScrapeError as error:
+            if not refs:
+                raise
+            return ReferencePageList(refs, exhausted=False, error=str(error))
 
         data = page.get("data") if isinstance(page, dict) else None
         if not isinstance(data, list):
@@ -580,7 +628,7 @@ def _fetch_s2_pages(url: str, source_id: str, rate_limit_sec: float) -> list[dic
 
         next_offset = page.get("next")
         if next_offset is None:
-            return refs
+            return ReferencePageList(refs)
 
         if not isinstance(next_offset, int) or isinstance(next_offset, bool) or next_offset <= offset or not data:
             raise ReferenceScrapeError(

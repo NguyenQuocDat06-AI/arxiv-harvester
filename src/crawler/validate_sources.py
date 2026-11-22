@@ -8,6 +8,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 from .records import base_id
+from .path_safety import resolved_is_relative_to
 from .source_downloader import ALLOWLIST_EXTENSIONS, get_dir_size_bytes
 from .storage import _write_parquet_atomic
 from .profiler import _write_json_atomic
@@ -25,7 +26,7 @@ def check_source_version(raw_dir: str | Path, identifier: str, version: dict) ->
     if not re.fullmatch(r"v[1-9]\d*", tag):
         raise ValueError("Invalid version tag")
     directory = raw / "unzipped" / identifier.replace("/", "_") / tag
-    if not directory.resolve().is_relative_to((raw / "unzipped").resolve()):
+    if not resolved_is_relative_to(directory.resolve(), (raw / "unzipped").resolve()):
         raise ValueError("Source folder escapes corpus root")
     entries = list(directory.rglob("*")) if directory.is_dir() else []
     regular = [p for p in entries if p.is_file() and not p.is_symlink()]

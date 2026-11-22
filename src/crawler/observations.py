@@ -15,6 +15,12 @@ CRAWL_STATUS_SCHEMA = pa.schema([
     pa.field("http_status_counts", pa.string()), pa.field("error_message", pa.string()),
     pa.field("updated_at", pa.string()), pa.field("reference_update", pa.string()),
     pa.field("request_group", pa.string()), pa.field("request_group_size", pa.int64()),
+    pa.field("raw_count", pa.int64()), pa.field("pagination_exhausted", pa.bool_()),
+    pa.field("lookup_required", pa.bool_()), pa.field("reference_retry_at", pa.float64()),
+    pa.field("last_attempt_status", pa.string()), pa.field("last_attempt_error", pa.string()),
+    pa.field("last_attempt_at", pa.string()),
+    pa.field("provider_data_error", pa.bool_()),
+    pa.field("last_network_attempt_at", pa.string()),
 ])
 
 

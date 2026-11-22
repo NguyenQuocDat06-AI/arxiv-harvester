@@ -30,7 +30,9 @@ def runtime_info() -> dict:
                          "persistent_cooldown", "http_diagnostics", "segmented_resume",
                          "source_pacing", "adaptive_ranges", "drive_batch_backup", "auto_rate_resume",
                          "durable_run_artifacts", "assignment_validation", "bounded_pipeline",
-                         "incremental_run_mirror", "independent_provider_wait", "exact_disk_samples"]}
+                         "incremental_run_mirror", "independent_provider_wait", "exact_disk_samples",
+                         "background_reference_retry", "timed_reference_drain", "verified_html_source",
+                         "reference_evidence_retention", "reference_gap_backoff", "targeted_reference_retry"]}
 
 
 def checkpoint_plan(shard_dir: str | Path, raw_dir: str | Path, member_id: str, id_range: dict) -> dict:
@@ -136,6 +138,9 @@ def validate_run(shard_dir: str | Path, raw_dir: str | Path, export_dir: str | P
     stats = json.loads(required[3].read_text(encoding="utf-8"))
     if stats.get("status") == "paused_rate_limit":
         result.update(paused_rate_limit=True, retry_after_sec=stats.get("retry_after_sec"), rate_limits=stats.get("rate_limits", {}))
+    if stats.get("status") == "paused_time_budget":
+        result.update(paused_time_budget=True, stop_reason=stats.get("stop_reason"),
+                      retry_after_sec=stats.get("retry_after_sec"), rate_limits=stats.get("rate_limits", {}))
     pubs, refs = publications.to_pylist(), references.to_pylist()
     ids = [row["id"] for row in pubs]
     if not publications.schema.equals(PUBLICATIONS_SCHEMA, check_metadata=False):
@@ -164,6 +169,10 @@ def validate_run(shard_dir: str | Path, raw_dir: str | Path, export_dir: str | P
     if len(by_id) != len(observations) or set(by_id) != set(ids):
         errors.append("Reference statuses do not cover working papers uniquely")
     statuses = Counter(row.get("reference_status", "unknown") for row in observations)
+    exhausted_gaps = [row["arxiv_id"] for row in observations
+                      if row.get("reference_status") == "partial" and row.get("pagination_exhausted")]
+    if exhausted_gaps:
+        warnings.append(f"{len(exhausted_gaps)} papers exhausted S2 pagination below referenceCount; preserve this provider gap")
     if set(statuses) - REFERENCE_TERMINAL:
         errors.append("Reference requests remain unresolved")
     ref_counts = Counter(row["arxiv_id"] for row in refs)
@@ -191,6 +200,7 @@ def validate_run(shard_dir: str | Path, raw_dir: str | Path, export_dir: str | P
     result.update(ready_for_full=not errors, papers=len(pubs), working_references=len(refs),
                   course_export=course_check, source_audit=source_audit,
                   reference_statuses=dict(statuses), missing_version_dates=dates_missing,
+                  reference_provider_gap_ids=exhausted_gaps,
                   assignment_coverage=coverage,
                   input_hashes={str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest() for p in required})
     _write_json_atomic(str(output / "validation.json"), result)

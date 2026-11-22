@@ -27,7 +27,7 @@ def _result(source_id: str, body: dict) -> s2.ReferenceResult:
     except s2.ReferenceScrapeError as error:
         return s2.ReferenceResult([], status="batch_lookup", error_message=str(error))
     status = "empty" if count == 0 else "success" if len(raw) >= count else "partial"
-    return s2.ReferenceResult(records, status=status, expected_count=count)
+    return s2.ReferenceResult(records, status=status, expected_count=count, raw_count=len(raw))
 
 
 def scrape_references_batch(arxiv_ids: list[str], rate_limit_sec: float = 5.0,
@@ -127,15 +127,18 @@ def complete_batch_result(source_id: str, result: s2.ReferenceResult,
                 s2._request_stats["bib_fallbacks"] = s2._request_stats.get("bib_fallbacks", 0) + 1
                 return s2.ReferenceResult(
                     local_records,
-                    status="bib_fallback",
+                    status="bib_pending" if result.status == "api_error" else "bib_fallback",
                     source=s2._SOURCE_BIB,
                     expected_count=len(local_records),
                     received_count=len(local_records),
                     request_stats=s2.get_request_stats(),
+                    error_message=result.error_message,
                 )
         return result
     if result.status == "batch_lookup":
-        return s2.scrape_references_for_paper(source_id, unzipped_paper_dir, rate_limit_sec)
+        resolved = s2.scrape_references_for_paper(source_id, unzipped_paper_dir, rate_limit_sec)
+        resolved.lookup_required = True
+        return resolved
     if result.status != "partial":
         return result
     try:
@@ -145,6 +148,10 @@ def complete_batch_result(source_id: str, result: s2.ReferenceResult,
         result.error_message = str(error)
         return result
     if len(raw) >= result.expected_count:
-        return s2.ReferenceResult(records, status="success", expected_count=result.expected_count)
+        return s2.ReferenceResult(records, status="success", expected_count=result.expected_count,
+                                  raw_count=len(raw), pagination_exhausted=True)
     return s2.ReferenceResult(s2._dedupe([*result, *records]), status="partial", expected_count=result.expected_count,
-                               error_message="S2 pagination returned fewer references than referenceCount")
+                               raw_count=max(result.raw_count or 0, len(raw)),
+                               pagination_exhausted=getattr(raw, "pagination_exhausted", False),
+                               error_message=(getattr(raw, "error_message", None) or
+                                              "S2 pagination returned fewer references than referenceCount"))

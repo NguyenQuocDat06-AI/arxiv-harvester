@@ -3,6 +3,7 @@
 import concurrent.futures
 import contextlib
 import gzip
+import hashlib
 import http.client
 import logging
 import math
@@ -26,6 +27,7 @@ from requests.adapters import HTTPAdapter
 from .rate_limiter import rate_limiter
 from .profiler import resource_checkpoint, _write_json_atomic
 from .request_policy import CooldownDeferred
+from .path_safety import resolved_is_relative_to
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +237,7 @@ def _safe_extract_tar(
 
         relative_parts = [part for part in parts if part not in ("", ".")]
         target = (dest_dir / Path(*relative_parts)).resolve()
-        if not target.is_relative_to(root):
+        if not resolved_is_relative_to(target, root):
             raise ValueError(f"Thành viên thoát khỏi thư mục đích: {member.name!r}")
 
         normalized = target.relative_to(root).as_posix()
@@ -288,25 +290,47 @@ def _extract_single_gz(
     dest_dir: Path,
     safe_name: str,
     max_output_bytes: int = 500 * 1024 * 1024,
+    expected_doi: str | None = None,
+    format_info: dict | None = None,
 ) -> tuple[int, int]:
     """Giải nén tệp gzip đơn lẻ (.gz) thành file .tex nguồn."""
     dest_dir.mkdir(parents=True, exist_ok=True)
-    target_tex = dest_dir / f"{safe_name}.tex"
     written = 0
-
-    with gzip.open(archive_path, "rb") as gz_in, target_tex.open("wb") as out_f:
-        while True:
-            chunk = gz_in.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            if written == 0 and chunk.lstrip().startswith(b"%PDF-"):
-                raise _PDFSource("gzip contains PDF")
-            if written == 0 and not any(marker in chunk for marker in (b"\\documentclass", b"\\begin", b"\\input", b"\\section", b"\\def", b"\\documentstyle")):
-                raise ValueError("Gzip không chứa nguồn TeX nhận diện được")
-            written += len(chunk)
-            if written > max_output_bytes:
-                raise ValueError(f"Gzip giải nén vượt giới hạn {max_output_bytes} byte")
-            out_f.write(chunk)
+    with gzip.open(archive_path, "rb") as gz_in:
+        first = gz_in.read(CHUNK_SIZE)
+        if first.lstrip().startswith(b"%PDF-"):
+            raise _PDFSource("gzip contains PDF")
+        html_source = bool(re.match(br'\s*(?:<!doctype\s+html[^>]*>\s*)?<html\b', first, re.I))
+        doi = re.sub(r'^https?://(?:dx\.)?doi\.org/', '', expected_doi or '', flags=re.I).strip()
+        if html_source:
+            text = first.decode('utf-8', errors='replace')
+            title = re.search(r'<title\b[^>]*>(.*?)</title>', text, re.I | re.S)
+            matched = bool(doi and re.search(r'https?://(?:dx\.)?doi\.org/'+re.escape(doi)+r'''(?=["'\s<>])''', text, re.I))
+            if (not matched or title is None or re.search(
+                    r'(?i)access denied|too many requests|captcha|just a moment|\b(?:403|404|429|500|503)\b', title[1])):
+                raise ValueError('HTML source identity does not match publication DOI')
+        target = dest_dir / (safe_name+('.html' if html_source else '.tex'))
+        digest = hashlib.sha256()
+        tail, found_tex = b'', False
+        markers = (b'\\documentclass', b'\\begin', b'\\input', b'\\section', b'\\def', b'\\documentstyle')
+        with target.open('wb') as out_f:
+            chunk = first
+            while chunk:
+                found_tex = found_tex or any(marker in tail[-32:]+chunk for marker in markers)
+                written += len(chunk)
+                if written > max_output_bytes:
+                    raise ValueError(f'Gzip giải nén vượt giới hạn {max_output_bytes} byte')
+                digest.update(chunk)
+                out_f.write(chunk)
+                tail = (tail+chunk)[-8192:]
+                chunk = gz_in.read(CHUNK_SIZE)
+        if html_source:
+            if b'</html>' not in tail.lower():
+                raise ValueError('Incomplete HTML source')
+            if format_info is not None:
+                format_info.update(source_format='html', matched_doi=doi, payload_sha256=digest.hexdigest())
+        elif not found_tex:
+            raise ValueError('Gzip không chứa nguồn TeX nhận diện được')
 
     return written, written
 
@@ -370,6 +394,10 @@ def _download_stream(
     partial_path = dest_path.with_name(dest_path.name + ".part")
     details = diagnostics if diagnostics is not None else {}
     details.update(source_url=url, attempts=0, deferred_heavy=False)
+    timings = details.setdefault("network_metrics", {"limiter_wait_sec": 0.0, "request_sec": 0.0,
+                                                   "headers_sec": 0.0, "body_sec": 0.0,
+                                                   "received_bytes": 0, "write_sec": 0.0,
+                                                   "chunks": 0, "events": []})
     started = time.monotonic()
     deadline = started + max_elapsed_sec
     attempt = 1
@@ -378,11 +406,14 @@ def _download_stream(
     heavy_interruptions = 0
 
     while attempt <= max_retries:
+        wait_started = time.monotonic()
         try:
             rate_limiter.wait("arxiv", interval=max(1.0, rate_limit_sec))
         except CooldownDeferred as error:
             details.update(error_message=str(error), rate_limited=True, retry_after_sec=error.retry_after)
             return 0
+        finally:
+            timings["limiter_wait_sec"] += time.monotonic() - wait_started
         request_headers = {"Accept-Encoding": "identity"}
 
         offset = partial_path.stat().st_size if partial_path.exists() else 0
@@ -399,6 +430,8 @@ def _download_stream(
             details["attempts"] = attempt
             details["requests"] = details.get("requests", 0) + 1
             request_started = time.monotonic()
+            event = {"started_at_unix": time.time(), "offset": offset}
+            timings["events"].append(event)
             retry_delay = None
             clean_completion = False
             try:
@@ -408,6 +441,8 @@ def _download_stream(
                     timeout=(min(15.0, remaining), min(read_timeout_sec, remaining)),
                     headers=request_headers,
                 ) as response:
+                    event["headers_sec"] = time.monotonic() - request_started
+                    event["status"] = response.status_code
                     details["http_status"] = response.status_code
                     if response.status_code == 429:
                         delay = rate_limiter.policy.limited("arxiv", response, floor=ARXIV_COOLDOWN_FLOOR_SEC)
@@ -489,6 +524,7 @@ def _download_stream(
                             for chunk in stream_iter:
                                 if not chunk:
                                     continue
+                                timings["received_bytes"] += len(chunk)
                                 # Phát hiện sớm PDF-only
                                 if downloaded == 0 and (chunk.startswith(b"%PDF-") or b"%PDF-" in chunk[:16]):
                                     early_pdf = True
@@ -497,7 +533,10 @@ def _download_stream(
                                 downloaded += len(chunk)
                                 if downloaded > max_download_bytes:
                                     raise ValueError(f"Dung lượng tải vượt quá giới hạn {max_download_bytes} byte")
+                                write_started = time.monotonic()
                                 f_out.write(chunk)
+                                timings["write_sec"] += time.monotonic()-write_started
+                                timings["chunks"] += 1
                                 details["bytes_downloaded"] = downloaded
                                 if time.monotonic() >= next_progress:
                                     logger.info("Đang tải %s: %.1f MiB", url, downloaded / 1024**2)
@@ -529,14 +568,15 @@ def _download_stream(
                             partial_path.replace(dest_path)
                         rate_limiter.policy.succeeded("arxiv")
                         details.update(bytes_downloaded=downloaded, error_message=None)
-                        if downloaded >= 25 * 1024 * 1024 or details.get("requests", 0) > 1:
-                            if hasattr(rate_limiter, "mark_heavy_completed"):
-                                rate_limiter.mark_heavy_completed("arxiv", padding_sec=1.5)
-                            else:
-                                rate_limiter._last_called["arxiv"] = time.monotonic() + 1.5
                         clean_completion = True
                         return 200
             finally:
+                event["request_sec"] = time.monotonic() - request_started
+                headers_sec = event.get("headers_sec", event["request_sec"])
+                event["body_sec"] = max(0.0, event["request_sec"] - headers_sec)
+                timings["request_sec"] += event["request_sec"]
+                timings["headers_sec"] += headers_sec
+                timings["body_sec"] += event["body_sec"]
                 if not clean_completion:
                     rate_limiter.mark_completed("arxiv")
 
@@ -644,6 +684,7 @@ def extract_and_clean_archive(
     remove_archive: bool | None = None,
     unzipped_dir: str | Path | None = None,
     start_time: float | None = None,
+    expected_doi: str | None = None,
 ) -> dict:
     """Giải nén và dọn dẹp archive nguồn bài báo arXiv sang thư mục version."""
     archive_path = Path(archive_path)
@@ -704,6 +745,7 @@ def extract_and_clean_archive(
     size_before_bytes = 0
     size_after_bytes = 0
     extracted_ok = False
+    format_info = {}
 
     try:
         try:
@@ -715,7 +757,9 @@ def extract_and_clean_archive(
 
         if not extracted_ok:
             if header_bytes.startswith(b"\x1f\x8b"):
-                size_before_bytes, size_after_bytes = _extract_single_gz(archive_path, staging_dir, f"{safe_base_id}{ver}")
+                size_before_bytes, size_after_bytes = _extract_single_gz(
+                    archive_path, staging_dir, f"{safe_base_id}{ver}",
+                    expected_doi=expected_doi, format_info=format_info)
                 extracted_ok = True
             else:
                 with archive_path.open("rb") as sf:
@@ -784,7 +828,7 @@ def extract_and_clean_archive(
         status = "success"
 
     # Chỉ thay nguồn cũ sau khi staging hợp lệ.
-    if not final_version_dir.resolve().is_relative_to(unzipped_path.resolve()):
+    if not resolved_is_relative_to(final_version_dir.resolve(), unzipped_path.resolve()):
         raise ValueError("Thư mục version thoát ngoài corpus")
     previous_tex = False
     if final_version_dir.exists():
@@ -815,7 +859,7 @@ def extract_and_clean_archive(
             os.replace(backup_dir, final_version_dir)
         raise
     if backup_dir.exists():
-        if not backup_dir.resolve().is_relative_to(unzipped_path.resolve()) or backup_dir.is_symlink():
+        if not resolved_is_relative_to(backup_dir.resolve(), unzipped_path.resolve()) or backup_dir.is_symlink():
             raise ValueError("Backup source path escapes corpus")
         try:
             shutil.rmtree(backup_dir)
@@ -828,6 +872,7 @@ def extract_and_clean_archive(
     elapsed_sec = round(time.perf_counter() - t0, 3)
 
     return {
+        **format_info,
         "arxiv_id": base_id,
         "version_id": versioned_id,
         "status": status,
@@ -878,6 +923,8 @@ def _finalize_version_extraction(
     valid_endpoint: str,
     sources_dir: str | Path,
     validated_id: str,
+    network_metrics: dict | None = None,
+    expected_doi: str | None = None,
 ) -> dict:
     with _get_article_lock(validated_id):
         res = extract_and_clean_archive(
@@ -888,8 +935,10 @@ def _finalize_version_extraction(
             remove_archive=remove_archive,
             unzipped_dir=unzipped_path,
             start_time=start_time,
+            expected_doi=expected_doi,
         )
         res.update(source_url=url, deferred_heavy=False)
+        res["network_metrics"] = network_metrics
         return _write_version_manifest_and_scan_bbl(res, sources_dir, valid_endpoint)
 
 
@@ -908,6 +957,7 @@ def _download_and_clean_source_impl(
     source_endpoint: str = DEFAULT_SOURCE_ENDPOINT,
     allow_defer_heavy: bool = True,
     async_extract: bool = False,
+    expected_doi: str | None = None,
 ) -> dict:
     """Tải và giải nén mã nguồn của một phiên bản bài báo arXiv từ export.arxiv.org/{endpoint}/."""
     raw_id, _ = _validate_arxiv_id(arxiv_id)
@@ -950,6 +1000,7 @@ def _download_and_clean_source_impl(
 
     if http_status == 404:
         return {
+            **download_details,
             "arxiv_id": base_id,
             "version_id": versioned_id,
             "status": "not_found",
@@ -966,6 +1017,7 @@ def _download_and_clean_source_impl(
         if remove_archive and archive_path.exists():
             archive_path.unlink(missing_ok=True)
         return {
+            **download_details,
             "arxiv_id": base_id,
             "version_id": versioned_id,
             "status": "pdf_only",
@@ -1005,8 +1057,11 @@ def _download_and_clean_source_impl(
             valid_endpoint=valid_endpoint,
             sources_dir=sources_dir,
             validated_id=raw_id,
+            network_metrics=download_details.get("network_metrics"),
+            expected_doi=expected_doi,
         )
         return {
+            "network_metrics": download_details.get("network_metrics"),
             "status": "extracting",
             "_extract_future": future,
             "arxiv_id": base_id,
@@ -1026,9 +1081,11 @@ def _download_and_clean_source_impl(
             remove_archive=remove_archive,
             unzipped_dir=unzipped_path,
             start_time=start_time,
+            expected_doi=expected_doi,
         )
         res = future.result()
         res.update(source_url=url, deferred_heavy=False)
+        res["network_metrics"] = download_details.get("network_metrics")
         return res
 
     res = extract_and_clean_archive(
@@ -1039,8 +1096,10 @@ def _download_and_clean_source_impl(
         remove_archive=remove_archive,
         unzipped_dir=unzipped_path,
         start_time=start_time,
+        expected_doi=expected_doi,
     )
     res.update(source_url=url, deferred_heavy=False)
+    res["network_metrics"] = download_details.get("network_metrics")
     return res
 
 
@@ -1063,6 +1122,7 @@ def download_and_clean_source(
     source_endpoint: str = DEFAULT_SOURCE_ENDPOINT,
     allow_defer_heavy: bool = True,
     async_extract: bool = False,
+    expected_doi: str | None = None,
 ) -> dict:
     """Tải, giải nén và lọc nguồn của một version arXiv."""
     validated_id, _ = _validate_arxiv_id(arxiv_id)
@@ -1097,6 +1157,7 @@ def download_and_clean_source(
             source_endpoint=valid_endpoint,
             allow_defer_heavy=allow_defer_heavy,
             async_extract=async_extract,
+            **({"expected_doi": expected_doi} if expected_doi else {}),
         )
         if result.get("status") == "extracting":
             return result

@@ -15,6 +15,7 @@ import uuid
 
 from .profiler import _write_json_atomic
 from .request_policy import LocalMutex
+from .path_safety import resolved_is_relative_to
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ def walk(root):
 
 
 def remove_inside(root, path):
-    if not path.resolve().is_relative_to(root.resolve()) or path.resolve() == root.resolve():
+    if not resolved_is_relative_to(path.resolve(), root.resolve(), allow_equal=False):
         raise ValueError("Backup removal escapes staging")
     if path.is_symlink() or path.is_file():
         path.unlink()
@@ -60,7 +61,7 @@ def remove_inside(root, path):
 class CheckpointBackup:
     def __init__(self, raw_dir, shard_dir, backup_dir):
         self.raw, self.shard, self.directory = map(lambda p: Path(p).resolve(), (raw_dir, shard_dir, backup_dir))
-        if any(self.directory.is_relative_to(p) or p.is_relative_to(self.directory) for p in (self.raw, self.shard)):
+        if any(resolved_is_relative_to(self.directory, p) or resolved_is_relative_to(p, self.directory) for p in (self.raw, self.shard)):
             raise ValueError("Backup directory must be outside raw/shard")
         self.directory.mkdir(parents=True, exist_ok=True)
         self.staging_directory = self.shard / ".drive_backup_staging"
