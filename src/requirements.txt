@@ -1,0 +1,2 @@
+# Khớp cấu trúc src/requirements.txt theo sơ đồ chuẩn trong đề bài; tham chiếu thẳng danh sách phụ thuộc gốc.
+-r ../requirements.txt

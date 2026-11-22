@@ -56,11 +56,12 @@ arxiv-harvester/
 ├── configs/
 │   └── parser_roots.json           # Cấu hình override compilation root đã kiểm chứng
 ├── data/                           # Khung thư mục dữ liệu cục bộ (không commit dữ liệu thô)
-├── docs/                           # 8 notebook phân tích kỹ thuật M1 & M2 (01–08)
+├── docs/                           # 9 notebook phân tích kỹ thuật M1, M2 & M3 (01–09)
 ├── src/
+│   ├── requirements.txt            # Ánh xạ danh sách phụ thuộc theo chuẩn sơ đồ đề bài
 │   ├── crawler/                    # Milestone 1: discovery, downloader, S2 batch, profiler, merge
 │   ├── parser/                     # Milestone 2: TeX gather/lexer, hierarchy, bibtex, dedup, validation
-│   └── matching/                   # Milestone 3: cleaning, labeling, 25 features, ranking, pipeline
+│   └── matching/                   # Milestone 3: cleaning, labeling, 25 features, ranking, EDA & stress-test
 ├── tools/
 │   ├── build_report.py             # Dựng Jupyter Book từ dữ liệu M1/M2 cục bộ
 │   ├── build_team_25000_book.py    # Dựng Jupyter Book 25.000 bài hoàn chỉnh
@@ -90,7 +91,7 @@ cd arxiv-harvester
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
-pip install -r requirements.txt
+pip install -r requirements.txt   # Hoặc: pip install -r src/requirements.txt
 pip install -e .
 
 # Tùy chọn mở rộng theo nhu cầu:
@@ -242,9 +243,18 @@ Toàn bộ mô hình sử dụng **100% đặc trưng và thuật toán học m�
 | **4. Tương đối trong pool** | 4 | `title_tfidf_margin_to_best`, `title_tfidf_rank_inv`, `author_jaccard_margin_to_best`, `pool_size_log` | So sánh ứng viên $j$ với ứng viên tốt nhất trong cùng hàng $m \times n$ giúp mô hình tách biệt rõ điểm thật với nhiễu nền dù độ dài tiêu đề thay đổi. |
 | **5. Ngữ cảnh cây Hierarchy M2** | 4 | `hier_cite_count`, `hier_in_intro_or_related`, `hier_context_title_tfidf_cosine`, `hier_context_author_hit` | Khai thác trực tiếp bảng `elements` & `hierarchy` từ M2 (trên `160.946` citation keys): đo tần suất `\cite{}` trong toàn bài, kiểm tra vị trí mục cha (*Introduction / Related Work*) và đối chiếu câu trích dẫn thực tế với tiêu đề/họ tác giả ứng viên khi trường BibTeX bị khuyết. |
 
-**Phân tích độ quan trọng đặc trưng (LightGBM Ranker):** Các đặc trưng mang tính phân tách mạnh nhất là `author_jaccard_margin_to_best` (`16,7%`), `year_diff_signed` (`13,3%`), `title_tfidf_margin_to_best` (`13,3%`), `title_token_dice` (`10,0%`), `title_len_ratio` (`6,7%`), `arxiv_id_exact_match` (`6,7%`) và đặc trưng từ cây M2 `hier_cite_count` (`3,3%`).
+**Phân tích dữ liệu định lượng biện giải đặc trưng (EDA trên `535` bài / `29.309` mục BibTeX / `1.115.447` cặp thật — xem chi tiết tại [`docs/09_m3_feature_eda_and_matching.ipynb`](docs/09_m3_feature_eda_and_matching.ipynb)):**
 
-### 3. So sánh 4 mô hình cổ điển & Nghiên cứu loại bỏ đặc trưng (Ablation Study)
+- **Khuyết metadata trong `.bib`/`.bbl`:** `70,78%` mục BibTeX thiếu `doi`, `88,99%` thiếu `url`, chỉ **`10,11%`** mang sẵn arXiv ID tường minh (`arxiv_id_exact_match` đạt `100%` precision với `0,00%` false positive nhưng chỉ phủ `19,37%` cặp dương); `23,79%` cặp dương bị lệch số lượng tác giả (trung bình lệch `4,89` tác giả do rút gọn `"et al."`) → chứng minh bắt buộc phải kết hợp khớp mờ tiêu đề và `author_surname_recall`.
+- **Phân bố bất đối xứng của độ trễ năm (`bib_year − ref_year`, `n = 10.516` cặp dương):** `0 năm` chiếm **`64,28%`** (`6.760`), **`+1 năm`** (preprint arXiv năm $t$ xuất bản hội nghị/tạp chí năm $t+1$) chiếm **`28,81%`** (`3.030`), `+2 năm` chiếm `3,97%` (`418`), trong khi `-1 năm` chỉ **`0,30%`** (`32` — thấp hơn **`95 lần`** so với `+1 năm`) → giải thích trực tiếp vai trò của `year_diff_signed` bên cạnh `year_abs_diff`.
+- **Sức phân tách đơn biến (ROC-AUC) của 5 nhóm đặc trưng trên `1.115.447` cặp ứng viên:**
+  - *Tiêu đề:* `title_token_jaccard` (`0,9957`), `title_token_dice` (`0,9957`), `title_tfidf_cosine` (`0,9953`, pos `0,987` vs neg `0,030`), `title_rapidfuzz_ratio` (`0,9942`).
+  - *Tác giả:* `author_surname_recall` (`0,9913`, pos `0,976` vs neg `0,033`), `author_surname_jaccard` (`0,9910`), `first_author_surname_match` (`0,9830`).
+  - *Thời gian & Định danh:* `cite_key_author_year_hit` (`0,8870`, pos `0,680` vs neg `0,071`), `year_abs_diff` (`0,8728`, pos `0,86 năm` vs neg `7,46 năm`), `year_exact_match` (`0,7604`).
+  - *Tương đối trong Pool:* `title_tfidf_rank_inv` (`0,9881`, pos `0,994` vs neg `0,092`), `title_tfidf_margin_to_best` (`0,8729`, chiếm `87,3%` LightGBM Gain trên dữ liệu sạch), `author_jaccard_margin_to_best` (`0,8174`).
+  - *Ngữ cảnh cây Hierarchy M2 (`98,05%` mục giải được `\cite{}` từ bảng `elements`/`hierarchy`):* **`hier_context_author_hit` đạt `ROC-AUC = 0,7825`** (`63,88%` cặp dương xuất hiện họ tác giả đầu ngay trong câu trích dẫn so với chỉ `7,39%` cặp âm — **cao gấp `8,6×`**), **`hier_context_title_tfidf_cosine` đạt `ROC-AUC = 0,7165`** (pos `0,100` vs neg `0,041` — **cao gấp `2,4×`**), và `hier_in_intro_or_related` đạt `66,09%` trên cặp dương vs `56,38%` trên cặp âm.
+
+### 3. So sánh 4 mô hình cổ điển, Stress-Test `.bbl` & 5-Fold Manual CV
 
 Đánh giá bằng công thức chuẩn của đề:
 
@@ -252,15 +262,32 @@ $$\text{MRR@5} = \frac{1}{|Q|} \sum_{i=1}^{|Q|} \frac{1}{\text{rank}_i}$$
 
 trong đó $|Q|$ là toàn bộ số mục BibTeX được gán nhãn trong tập kiểm tra (mục không có đích arXiv hoặc đích không nằm trong Top-5 nhận điểm `0`).
 
-| Mô hình (Cổ điển) | Valid MRR@5 (`\|Q\|=414`) | Test MRR@5 (`\|Q\|=540`) | Test-Manual MRR@5 (`\|Q\|=260`) | Test-Auto MRR@5 (`\|Q\|=280`) | Test Positive-only MRR@5 (`n=373`) | Test Recall@1 | Test Recall@5 |
+#### A. Kết quả trên tập đánh giá chính thức (Test `|Q| = 540`, `373` mục có đích, `167` hàng âm toàn phần)
+
+| Mô hình (Cổ điển) | Valid MRR@5 (`\|Q\|=414`) | Test MRR@5 (`\|Q\|=540`) | Test-Manual (`\|Q\|=260`) | Test-Auto (`\|Q\|=280`) | Test Positive-only (`n=373`) | Test Recall@1 | Test Recall@5 |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | Heuristic Baseline | `0,6691` | `0,6907` | `0,8885` | `0,5071` | `1,0000` | `100,0%` | `100,0%` |
 | Logistic Regression | `0,6691` | `0,6907` | `0,8885` | `0,5071` | `1,0000` | `100,0%` | `100,0%` |
 | Random Forest | `0,6691` | `0,6907` | `0,8885` | `0,5071` | `1,0000` | `100,0%` | `100,0%` |
 | **LightGBM Ranker (`lambdarank`)** *(chọn)* | **`0,6691`** | **`0,6907`** | **`0,8885`** | **`0,5071`** | **`1,0000`** | **`100,0%`** | **`100,0%`** |
 
-- **Ablation Study (LightGBM Ranker):** Cả 3 cấu hình `A1` (17 đặc trưng metadata cơ bản), `A2` (+4 đặc trưng tương đối pool = 21) và `A3` (+4 đặc trưng ngữ cảnh Hierarchy M2 = 25) đều đạt **Test MRR@5 = `0,6907`** (`100,0%` Recall@1 trên `373/373` mục có đích); bổ sung nhóm tương đối pool và Hierarchy M2 giúp LightGBM đạt NDCG@5 = `1,0000` trên Validation ngay vòng boosting đầu tiên (chỉ 30 nút rẽ nhánh).
-- **Giải thích phân tích lỗi & trần MRR@5:** Trên tập Test gồm `540` mục BibTeX, có `167` mục (`30,9%`) là tài liệu không có bản preprint trên arXiv (sách giáo khoa, tạp chí đóng, kỷ yếu không đẩy arXiv) nên tạo hàng âm toàn phần — đây chính là **trần lý thuyết tự nhiên** khiến MRR@5 tính trên toàn bộ $|Q|$ đạt `373 / 540 = 0,690741` (tương tự: `231 / 260 = 0,8885` trên Test-Manual và `142 / 280 = 0,5071` trên Test-Auto), trong khi độ chính xác xếp hạng hạng 1 trên các mục có đích arXiv đạt **100%** trên cả Validation và Test (và `99,98%–99,998%` trên `58.888` mục dương của tập Train).
+#### B. Kiểm định áp lực `.bbl` nhiễu/khuyết & 5-Fold Cross-Validation trên 25 bài Manual (`1.150` mục / `1.003` dương)
+
+Để phân tách rõ năng lực mô hình và đóng góp của từng nhóm đặc trưng khi tập Test sạch cùng chạm trần `373/540 = 0,6907`, nhóm thực hiện thêm **Stress-Test** (chạy qua `python -m matching.analysis`, không thay đổi tập `predictions` chuẩn) trên các kịch bản `.bbl` thực tế: **S2** (rút gọn 60% tiêu đề + ẩn arXiv ID + giữ họ tác giả đầu) và **S3** (mất hoàn toàn tiêu đề & arXiv ID, buộc phục hồi qua tác giả + năm + `citation_key` + Pool + **Hierarchy M2**):
+
+| Mô hình / Cấu hình Ablation | Test S2 MRR@5 *(Pos R@1)* | Test S3 MRR@5 *(Pos R@1)* | 5-Fold CV S0 MRR@5 *(R@1)* | 5-Fold CV S2 MRR@5 *(R@1)* | 5-Fold CV S3 MRR@5 *(R@1)* |
+|---|---:|---:|---:|---:|---:|
+| Heuristic Baseline | `0,6738` *(95,7%)* | `0,6086` *(81,0%)* | `0,8717 ± 0,0115` *(99,9%)* | `0,8273 ± 0,0242` *(91,7%)* | `0,7734 ± 0,0190` *(81,4%)* |
+| Logistic Regression | `0,6849` *(98,4%)* | `0,6787` *(96,8%)* | `0,8721 ± 0,0109` *(100,0%)* | `0,8692 ± 0,0110` *(99,3%)* | `0,8463 ± 0,0162` *(94,6%)* |
+| Random Forest | **`0,6898`** *(99,7%)* | `0,6756` *(96,0%)* | `0,8721 ± 0,0109` *(100,0%)* | **`0,8693 ± 0,0124`** *(99,4%)* | `0,8524 ± 0,0140` *(96,0%)* |
+| **LightGBM Ranker (`A3` đủ 25 đặc trưng)** | `0,6889` *(99,5%)* | **`0,6802`** *(97,3%)* | **`0,8721 ± 0,0109`** *(100,0%)* | `0,8685 ± 0,0117` *(99,3%)* | **`0,8530 ± 0,0163`** *(96,1%)* |
+| *Ablation `A1` (17 đặc trưng Metadata cơ bản)* | `0,6889` *(99,5%)* | `0,6790` *(97,1%)* | `0,8721 ± 0,0109` *(100,0%)* | `0,8679 ± 0,0108` *(99,1%)* | `0,8485 ± 0,0188` *(95,5%)* |
+| *Ablation `A2` (+4 đặc trưng Pool = 21)* | `0,6880` *(99,2%)* | `0,6764` *(96,5%)* | `0,8721 ± 0,0109` *(100,0%)* | `0,8689 ± 0,0130` *(99,4%)* | `0,8489 ± 0,0157` *(95,3%)* |
+
+- **Phân tích kết quả:**
+  1. **Trần lý thuyết trên Test sạch:** Trong `540` mục Test có `167` mục (`30,9%`) là tài liệu không có bản arXiv (sách, tạp chí đóng) → trần tự nhiên `373 / 540 = 0,690741` (`Test-Manual = 231/260 = 0,8885`, `Test-Auto = 142/280 = 0,5071`).
+  2. **Học máy cổ điển vượt trội Heuristic:** Ngay trên `25` bài Manual sạch (`5-Fold CV S0`), cả 3 mô hình ML đạt `100,0%` R@1 trong khi Heuristic sót ca mờ (`99,9%`); khi khuyết tiêu đề `.bbl` (`S3`), **`LightGBM Ranker` vượt `Heuristic` tới `+0,0716` MRR@5 trên Test và `+0,0796` MRR@5 (`+14,6%` R@1) trên 5-Fold Manual CV**.
+  3. **Hiệu quả tăng đều `A1 → A2 → A3` của ngữ cảnh Hierarchy M2:** Ở kịch bản `S3`, bổ sung Pool-relative (`A2`) giúp giảm độ lệch chuẩn 5-Fold CV từ `0,0188 → 0,0157`, và bổ sung 4 đặc trưng cây Hierarchy M2 (`A3`) nâng kết quả lên **cao nhất trên cả Test (`0,6802`) lẫn 5-Fold Manual CV (`0,8530`, Pos-MRR@5 `0,9781`, Recall@5 `99,77%`)**, đồng thời đưa `hier_context_title_tfidf_cosine` vào **Top-7 LightGBM Gain toàn cục**.
 
 ---
 
@@ -307,3 +334,17 @@ predictions = load_dataset("nquocdat06/arxiv-harvester-data", name="predictions"
 | Trần Nguyên Tân | `24120438` | [@nguyentan10052006-cmyk](https://github.com/nguyentan10052006-cmyk) | `2407.12839` → `2407.17838` | S2 batching, reference retry/enrich, provenance, tiền xử lý & gán nhãn M3 |
 | Dương Phan Minh Trí | `24120470` | [@takryudor](https://github.com/takryudor) | `2406.17938` → `2407.02838` | Schema Parquet, gộp shard, parser LaTeX/BibTeX, kiểm chuẩn 5 bảng & đặc trưng M3 |
 | Trịnh Vỹ Triết | `24120474` | [@AIVIETNAM-AIO-Triet-Descartes](https://github.com/AIVIETNAM-AIO-Triet-Descartes) | `2406.12938` → `2406.17937` | CLI runner, điều phối Colab/Kaggle, profiler, Jupyter Book, đóng gói HF & Poster A2 |
+
+---
+
+## Tài liệu tham khảo (References)
+
+- Allen Institute for AI. (2026). *Semantic Scholar Academic Graph API*. https://api.semanticscholar.org/api-docs/
+- Ammar, W., Groeneveld, D., Bhagavatula, C., Beltagy, I., Crawford, M., Downey, D., Dunkelberger, J., Elgohary, A., Feldman, S., Ha, V., Kinney, R., Kohlmeier, S., Lo, K., Murray, T., Ooi, H.-H., Peters, M., Power, J., Skjonsberg, S., Wang, L., ... Etzioni, O. (2018). Construction of the literature graph in Semantic Scholar. *NAACL-HLT 2018* (arXiv:1805.02234).
+- arXiv.org. (1999–2026). *arXiv API User's Manual, Terms of Use & Open Archives Initiative (OAI-PMH)*. https://info.arxiv.org/help/api/
+- Bachmann, M. (2021–2026). *RapidFuzz: Rapid fuzzy string matching in Python and C++*. https://github.com/rapidfuzz/RapidFuzz
+- Hugging Face. (2026). *Datasets & Hub Parquet Format Specification*. https://huggingface.co/docs/datasets/
+- Ke, G., Meng, Q., Finley, T., Wang, T., Chen, W., Ma, W., Ye, Q., & Liu, T.-Y. (2017). LightGBM: A highly efficient gradient boosting decision tree. *Advances in Neural Information Processing Systems (NeurIPS)*, 30.
+- Kinney, R., Anastasiades, C., Authur, R., Beltagy, I., Bragg, J., Buraczynski, A., Cachola, I., Candra, S., Chandrasekhar, Y., Cohan, A., Crawford, M., Downey, D., Dunkelberger, J., Etzioni, O., Evans, R., Feldman, S., Gorney, J., Graham, D., Hu, F., ... Weld, D. S. (2023). The Semantic Scholar Open Data Platform. *arXiv preprint arXiv:2301.10140*.
+- Pedregosa, F., Varoquaux, G., Gramfort, A., Michel, V., Thirion, B., Grisel, O., Blondel, M., Prettenhofer, P., Weiss, R., Dubourg, V., Vanderplas, J., Passos, A., Cournapeau, D., Brucher, M., Perrot, M., & Duchesnay, E. (2011). Scikit-learn: Machine learning in Python. *Journal of Machine Learning Research*, 12, 2825–2830.
+- Schwab, L. (2015–2026). *arxiv.py: Python wrapper for the arXiv API*. https://github.com/lukasschwab/arxiv.py

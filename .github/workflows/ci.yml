@@ -21,12 +21,20 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Check Python syntax
         run: python -m compileall -q src tools
-      - name: Check notebook JSON
+      - name: Check notebook JSON and requirements mirror
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
-          for path in [*Path("docs").glob("*.ipynb"), Path("colab_crawler.ipynb")]:
+          assert Path("requirements.txt").is_file(), "Missing root requirements.txt"
+          assert Path("src/requirements.txt").is_file(), "Missing src/requirements.txt"
+          notebooks = [
+              *sorted(Path("docs").glob("*.ipynb")),
+              Path("colab_crawler.ipynb"),
+              Path("colab_parser_full.ipynb"),
+              Path("kaggle_crawler.ipynb"),
+          ]
+          for path in notebooks:
               book = json.loads(path.read_text(encoding="utf-8"))
               assert book["nbformat"] == 4, path
               assert isinstance(book["cells"], list), path

@@ -29,7 +29,6 @@ dependencies = [
 dev = ["nbformat>=5"]
 report = ["jupyter-book>=1,<2", "nbformat>=5", "nbclient>=0.8"]
 poster = ["python-pptx>=1.0"]
-hub = ["huggingface-hub>=0.24"]
 
 [project.scripts]
 arxiv-harvester = "crawler.main:main"
