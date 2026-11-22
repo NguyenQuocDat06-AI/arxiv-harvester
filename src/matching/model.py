@@ -123,7 +123,7 @@ def compute_ranking_metrics(df_preds: pd.DataFrame) -> dict[str, float | int]:
     n_pos = 0
     for row in df_preds.itertuples(index=False):
         gt = row.groundtruth_arxiv_id
-        if not gt:
+        if gt is None or pd.isna(gt) or not str(gt):
             continue
         n_pos += 1
         cands = (row.cand_1, row.cand_2, row.cand_3, row.cand_4, row.cand_5)
@@ -232,7 +232,6 @@ def _fit_and_score_model(
         ranker = lgb.LGBMRanker(
             objective="lambdarank",
             metric="ndcg",
-            ndcg_eval_at=[1, 5],
             n_estimators=220,
             learning_rate=0.05,
             num_leaves=31,
@@ -248,6 +247,7 @@ def _fit_and_score_model(
             va_order = np.argsort(groups_valid, kind="mergesort")
             fit_kwargs["eval_set"] = [(X_valid[va_order], y_valid[va_order])]
             fit_kwargs["eval_group"] = [_group_sizes_from_sorted_queries(groups_valid[va_order])]
+            fit_kwargs["eval_at"] = [1, 5]
             fit_kwargs["callbacks"] = [lgb.early_stopping(stopping_rounds=25, verbose=False)]
 
         ranker.fit(X_tr_sorted, y_tr_sorted, **fit_kwargs)
