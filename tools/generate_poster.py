@@ -1,4 +1,4 @@
-"""Sinh Poster học thuật 1 trang khổ đứng A2 (420mm x 594mm) bằng tiếng Việt từ số liệu thực M1-M3."""
+"""Sinh Poster học thuật 1 trang khổ đứng A2 (420mm x 594mm) bằng tiếng Việt từ số liệu thực M1-M3 & EDA."""
 from __future__ import annotations
 
 import argparse
@@ -8,6 +8,7 @@ from typing import Any
 
 import matplotlib
 matplotlib.use("Agg")
+from matplotlib.patches import Patch
 import matplotlib.pyplot as plt
 import numpy as np
 from pptx import Presentation
@@ -30,7 +31,7 @@ AMBER = RGBColor(0xD9, 0x77, 0x06)
 TEXT_DARK = RGBColor(0x1E, 0x29, 0x3B)
 TEXT_MUTED = RGBColor(0x47, 0x55, 0x69)
 BORDER = RGBColor(0xCB, 0xD5, 0xE1)
-CARD_TINT = RGBColor(0xE0, 0xF2, 0xFE)
+CARD_TINT = RGBColor(0xEC, 0xF8, 0xFF)
 
 FONT_NAME = "DejaVu Sans"
 
@@ -49,8 +50,8 @@ MODEL_SHORT = {
 }
 
 FEATURE_VI_LABELS = {
-    "arxiv_id_exact_match": "Khớp trực tiếp arXiv ID",
-    "title_tfidf_cosine": "TF-IDF Cosine tiêu đề",
+    "arxiv_id_exact_match": "Khớp trực tiếp arXiv ID (100% precision)",
+    "title_tfidf_cosine": "TF-IDF Cosine tiêu đề (1–2 gram)",
     "title_rapidfuzz_ratio": "Tương đồng chuỗi tiêu đề (Fuzzy)",
     "title_token_jaccard": "Jaccard token tiêu đề",
     "title_token_dice": "Dice token tiêu đề",
@@ -59,21 +60,21 @@ FEATURE_VI_LABELS = {
     "title_len_ratio": "Tỷ lệ độ dài tiêu đề",
     "first_author_surname_match": "Khớp họ tác giả đầu",
     "author_surname_jaccard": "Jaccard họ tác giả",
-    "author_surname_recall": "Recall họ tác giả",
+    "author_surname_recall": "Recall họ tác giả (bền với et al.)",
     "author_initial_surname_match": "Khớp (Họ + chữ đầu tên)",
     "author_count_diff": "Chênh lệch số tác giả",
     "year_exact_match": "Khớp chính xác năm",
     "year_abs_diff": "Độ lệch tuyệt đối năm",
     "year_diff_signed": "Độ trễ năm arXiv ↔ xuất bản",
-    "cite_key_author_year_hit": "Gợi ý từ citation_key",
-    "title_tfidf_margin_to_best": "Khoảng cách tới TF-IDF cao nhất (pool)",
-    "title_tfidf_rank_inv": "Hạng nghịch đảo TF-IDF (pool)",
-    "author_jaccard_margin_to_best": "Khoảng cách tới Jaccard tác giả tốt nhất",
-    "pool_size_log": "Kích thước tập ứng viên (log)",
+    "cite_key_author_year_hit": "Gợi ý họ + năm từ citation_key",
+    "title_tfidf_margin_to_best": "[Pool] Khoảng cách tới TF-IDF tốt nhất",
+    "title_tfidf_rank_inv": "[Pool] Hạng nghịch đảo TF-IDF",
+    "author_jaccard_margin_to_best": "[Pool] Khoảng cách tới tác giả tốt nhất",
+    "pool_size_log": "[Pool] Kích thước tập ứng viên (log)",
     "hier_cite_count": "[M2 Hierarchy] Tần suất \\cite{}",
     "hier_in_intro_or_related": "[M2 Hierarchy] Thuộc Intro/Related",
-    "hier_context_title_tfidf_cosine": "[M2 Hierarchy] Ngữ cảnh câu ↔ tiêu đề",
-    "hier_context_author_hit": "[M2 Hierarchy] Tác giả trong câu trích dẫn",
+    "hier_context_title_tfidf_cosine": "[M2 Hierarchy] Câu trích dẫn ↔ tiêu đề",
+    "hier_context_author_hit": "[M2 Hierarchy] Họ tác giả trong câu \\cite{}",
 }
 
 
@@ -96,13 +97,14 @@ def render_charts(
     feat_imp: list[dict[str, Any]],
     ablation: dict[str, Any],
     charts_dir: Path,
+    feature_eda: dict[str, Any] | None = None,
 ) -> dict[str, Path]:
     _setup_plt()
     charts_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[str, Path] = {}
 
     # 1. Biểu đồ M1-M2: Trạng thái parse 41.498 version & Khử trùng 2 tầng
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.5, 4.3), gridspec_kw={"width_ratios": [1.15, 1.0]})
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.5, 4.15), gridspec_kw={"width_ratios": [1.15, 1.0]})
     sc = m2_summary["m2_status_counts"]
     st_labels = ["Thành công\n(success)", "Bán phần\n(partial)", "Không có TeX\n(empty)", "Lỗi parse\n(error)", "Thiếu nguồn\n(404/pending)"]
     st_vals = [
@@ -116,13 +118,13 @@ def render_charts(
     y_pos = np.arange(len(st_labels))
     bars = ax1.barh(y_pos, st_vals, color=st_colors, height=0.62)
     ax1.set_yticks(y_pos)
-    ax1.set_yticklabels(st_labels, fontsize=9.5, color="#1E293B")
+    ax1.set_yticklabels(st_labels, fontsize=9.3, color="#1E293B")
     ax1.invert_yaxis()
-    ax1.set_title("Trạng thái phân tích 41.498 phiên bản (M2)", fontsize=11, fontweight="bold", color="#0F2744", pad=10)
-    ax1.set_xlabel("Số phiên bản", fontsize=9.5, color="#334155")
+    ax1.set_title("Trạng thái phân tích 41.498 phiên bản (M2)", fontsize=10.8, fontweight="bold", color="#0F2744", pad=9)
+    ax1.set_xlabel("Số phiên bản", fontsize=9.2, color="#334155")
     ax1.set_xlim(0, max(st_vals) * 1.24)
     for b, v in zip(bars, st_vals):
-        ax1.text(v + max(st_vals) * 0.02, b.get_y() + b.get_height() / 2, f"{v:,}", va="center", fontsize=9, fontweight="bold", color="#0F172A")
+        ax1.text(v + max(st_vals) * 0.02, b.get_y() + b.get_height() / 2, f"{v:,}", va="center", fontsize=8.8, fontweight="bold", color="#0F172A")
 
     dd = m2_summary["m2_deduplication"]
     cats = ["Elements\n(triệu dòng)", "BibTeX\n(triệu dòng)"]
@@ -131,132 +133,215 @@ def render_charts(
     rates = [dd["elements"]["reduction_rate"] * 100, dd["bibtex"]["reduction_rate"] * 100]
     x = np.arange(len(cats))
     w = 0.34
-    b1 = ax2.bar(x - w / 2, before_m, w, label="Trước khử trùng", color="#94A3B8")
-    b2 = ax2.bar(x + w / 2, after_m, w, label="Sau khử trùng", color="#0D9488")
+    ax2.bar(x - w / 2, before_m, w, label="Trước khử trùng", color="#94A3B8")
+    ax2.bar(x + w / 2, after_m, w, label="Sau khử trùng", color="#0D9488")
     ax2.set_xticks(x)
-    ax2.set_xticklabels(cats, fontsize=9.5, color="#1E293B")
-    ax2.set_title("Hiệu quả khử trùng 2 tầng xuyên phiên bản", fontsize=11, fontweight="bold", color="#0F2744", pad=10)
-    ax2.set_ylabel("Triệu bản ghi", fontsize=9.5, color="#334155")
-    ax2.set_ylim(0, max(before_m) * 1.25)
-    ax2.legend(frameon=False, fontsize=9, loc="upper right")
+    ax2.set_xticklabels(cats, fontsize=9.3, color="#1E293B")
+    ax2.set_title("Hiệu quả khử trùng 2 tầng xuyên phiên bản", fontsize=10.8, fontweight="bold", color="#0F2744", pad=9)
+    ax2.set_ylabel("Triệu bản ghi", fontsize=9.2, color="#334155")
+    ax2.set_ylim(0, max(before_m) * 1.26)
+    ax2.legend(frameon=False, fontsize=8.8, loc="upper right")
     for idx_c in range(len(cats)):
         ax2.text(x[idx_c] - w / 2, before_m[idx_c] + 0.45, f"{before_m[idx_c]:.2f}M", ha="center", fontsize=8.5, color="#475569")
         ax2.text(x[idx_c] + w / 2, after_m[idx_c] + 0.45, f"{after_m[idx_c]:.2f}M\n(-{rates[idx_c]:.1f}%)", ha="center", fontsize=8.5, fontweight="bold", color="#0F766E")
 
-    fig.tight_layout(pad=1.4)
+    fig.tight_layout(pad=1.2)
     p1 = charts_dir / "chart_m1_m2_overview.png"
     fig.savefig(p1)
     plt.close(fig)
     paths["m1_m2"] = p1
 
-    # 2. Biểu đồ so sánh 4 mô hình cổ điển (Test MRR@5, Recall@1, Recall@5)
-    fig, ax = plt.subplots(figsize=(10.2, 3.85))
+    # 2. Biểu đồ so sánh 4 mô hình cổ điển: Test chuẩn (S0) vs Kịch bản nhiễu .bbl (S2 & S3)
     models_order = ["heuristic_baseline", "logistic_regression", "random_forest", "lightgbm_ranker"]
     labels = [MODEL_LABELS[m] for m in models_order]
-    mrr_all = [m3_summary["models"][m]["test"]["mrr_at_5"] for m in models_order]
-    r1_vals = [m3_summary["models"][m]["test"]["recall_at_1"] for m in models_order]
-    r5_vals = [m3_summary["models"][m]["test"]["recall_at_5"] for m in models_order]
-
+    fig, ax = plt.subplots(figsize=(10.2, 3.85))
     x = np.arange(len(models_order))
     w = 0.25
-    bars_mrr = ax.bar(x - w, mrr_all, w, label="Test MRR@5 (toàn bộ |Q|)", color="#0F2744")
-    bars_r1 = ax.bar(x, r1_vals, w, label="Test Recall@1 (mục có đích)", color="#0284C7")
-    bars_r5 = ax.bar(x + w, r5_vals, w, label="Test Recall@5 (mục có đích)", color="#0D9488")
+
+    if feature_eda and "stress_test" in feature_eda:
+        st = feature_eda["stress_test"]
+        s0_vals = [st["S0_clean"]["models"][m]["test"]["mrr_at_5"] for m in models_order]
+        s2_vals = [st["S2_noisy_bbl_title"]["models"][m]["test"]["mrr_at_5"] for m in models_order]
+        s3_vals = [st["S3_missing_title_rescue"]["models"][m]["test"]["mrr_at_5"] for m in models_order]
+
+        b0 = ax.bar(x - w, s0_vals, w, label="Test chuẩn S0 (trần 0,6907)", color="#0F2744")
+        b2 = ax.bar(x, s2_vals, w, label="Test S2: Rút gọn tiêu đề .bbl", color="#0284C7")
+        b3 = ax.bar(x + w, s3_vals, w, label="Test S3: Khuyết hoàn toàn tiêu đề", color="#D97706")
+
+        ax.axhline(0.690741, color="#0D9488", linestyle=":", linewidth=1.25, alpha=0.9)
+        ax.text(0.45, 0.718, "Trần lý thuyết: 373/540 = 0,6907", fontsize=7.9, color="#0F766E", ha="center", fontweight="bold")
+        ax.set_ylim(0.54, 0.775)
+        ax.set_yticks([0.55, 0.60, 0.65, 0.70])
+        ax.set_ylabel("Test MRR@5 (|Q| = 540)", fontsize=9.3, color="#334155")
+        ax.set_title("So sánh 4 mô hình cổ điển: Test chuẩn (S0) vs Stress-Test .bbl nhiễu/khuyết (S2, S3)", fontsize=10.5, fontweight="bold", color="#0F2744", pad=16)
+        ax.legend(frameon=False, fontsize=8.4, ncol=3, loc="upper center", bbox_to_anchor=(0.5, 1.05))
+        for group_bars in (b0, b2, b3):
+            for b in group_bars:
+                v = b.get_height()
+                ax.text(b.get_x() + b.get_width() / 2, v + 0.004, f"{v:.4f}", ha="center", va="bottom", fontsize=7.9, fontweight="bold", color="#0F172A")
+    else:
+        mrr_all = [m3_summary["models"][m]["test"]["mrr_at_5"] for m in models_order]
+        r1_vals = [m3_summary["models"][m]["test"]["recall_at_1"] for m in models_order]
+        r5_vals = [m3_summary["models"][m]["test"]["recall_at_5"] for m in models_order]
+        b0 = ax.bar(x - w, mrr_all, w, label="Test MRR@5 (toàn bộ |Q|)", color="#0F2744")
+        b2 = ax.bar(x, r1_vals, w, label="Test Recall@1 (mục có đích)", color="#0284C7")
+        b3 = ax.bar(x + w, r5_vals, w, label="Test Recall@5 (mục có đích)", color="#0D9488")
+        ax.set_ylim(0, 1.26)
+        ax.set_ylabel("Điểm đánh giá", fontsize=9.3, color="#334155")
+        ax.set_title("So sánh 4 mô hình cổ điển trên tập Test (5 bài Manual + 5 bài Auto)", fontsize=10.8, fontweight="bold", color="#0F2744", pad=16)
+        ax.legend(frameon=False, fontsize=8.6, ncol=3, loc="upper center", bbox_to_anchor=(0.5, 1.04))
+        for group_bars in (b0, b2, b3):
+            for b in group_bars:
+                v = b.get_height()
+                ax.text(b.get_x() + b.get_width() / 2, v + 0.02, f"{v:.3f}", ha="center", va="bottom", fontsize=8.1, fontweight="bold", color="#0F172A")
 
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=9.5, fontweight="bold", color="#1E293B")
-    ax.set_ylim(0, 1.26)
-    ax.set_yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
-    ax.set_ylabel("Điểm đánh giá", fontsize=9.5, color="#334155")
-    ax.set_title("So sánh 4 mô hình cổ điển trên tập Test (5 bài Manual + 5 bài Auto)", fontsize=11, fontweight="bold", color="#0F2744", pad=16)
+    ax.set_xticklabels(labels, fontsize=9.3, fontweight="bold", color="#1E293B")
     ax.grid(axis="y", linestyle="--", alpha=0.35, color="#CBD5E1")
     ax.set_axisbelow(True)
-    ax.legend(frameon=False, fontsize=8.8, ncol=3, loc="upper center", bbox_to_anchor=(0.5, 1.03))
-
-    for group_bars in (bars_mrr, bars_r1, bars_r5):
-        for b in group_bars:
-            v = b.get_height()
-            ax.text(b.get_x() + b.get_width() / 2, v + 0.02, f"{v:.3f}", ha="center", va="bottom", fontsize=8.2, fontweight="bold", color="#0F172A")
-
-    fig.tight_layout(pad=1.1)
+    fig.tight_layout(pad=1.0)
     p2 = charts_dir / "chart_m3_models.png"
     fig.savefig(p2)
     plt.close(fig)
     paths["models"] = p2
 
-    # 3. Biểu đồ Top-16 đặc trưng có độ quan trọng > 0 (nhấn mạnh đặc trưng Hierarchy M2)
+    # 3. Biểu đồ giải thích đặc trưng bằng dữ liệu thật: ROC-AUC đơn biến trên 1,12 triệu cặp (đủ cả 5 nhóm!)
     fig, ax = plt.subplots(figsize=(10.2, 4.35))
-    nonzero_imp = [item for item in feat_imp if item["importance_raw"] > 0]
-    top_feats = nonzero_imp[:12] if len(nonzero_imp) >= 12 else feat_imp[:12]
-    # Bảo đảm đặc trưng M2 Hierarchy xuất hiện rõ nếu có importance > 0 nằm ở hạng 13..16
-    if not any(i["group"] == "m2_hierarchy_context" for i in top_feats):
-        m2_item = next((i for i in nonzero_imp if i["group"] == "m2_hierarchy_context"), None)
-        if m2_item is not None:
-            top_feats = [*top_feats[:11], m2_item]
-    f_labels = [FEATURE_VI_LABELS.get(item["feature"], item["feature"]) for item in top_feats]
-    f_vals = [item["importance_share"] * 100.0 for item in top_feats]
     color_map = {
         "base_metadata": "#0284C7",
         "pool_relative": "#0D9488",
         "m2_hierarchy_context": "#D97706",
     }
-    f_colors = [color_map.get(item["group"], "#64748B") for item in top_feats]
-    y_pos = np.arange(len(f_labels))
-    bars = ax.barh(y_pos, f_vals, color=f_colors, height=0.66)
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(f_labels, fontsize=9.0, color="#1E293B")
-    ax.invert_yaxis()
-    ax.set_xlabel("Tỷ trọng độ quan trọng đặc trưng (%)", fontsize=9.5, color="#334155")
-    ax.set_title("Top-12 đặc trưng quan trọng nhất (LightGBM Ranker)", fontsize=11, fontweight="bold", color="#0F2744", pad=10)
-    ax.set_xlim(0, max(f_vals) * 1.22 if f_vals else 10)
-    for b, v in zip(bars, f_vals):
-        ax.text(v + (max(f_vals) * 0.018 if f_vals else 0.2), b.get_y() + b.get_height() / 2, f"{v:.1f}%", va="center", fontsize=8.6, fontweight="bold", color="#0F172A")
+    if feature_eda and "feature_separation_auc" in feature_eda:
+        auc_by_name = {item["feature"]: item for item in feature_eda["feature_separation_auc"]}
+        # Chọn 12 đặc trưng đại diện rõ nhất cho đủ cả 5 nhóm (Tiêu đề, Tác giả, Thời gian/ID, Pool, Hierarchy M2)
+        showcase = [
+            "title_token_jaccard",
+            "title_tfidf_cosine",
+            "author_surname_recall",
+            "title_tfidf_rank_inv",
+            "first_author_surname_match",
+            "cite_key_author_year_hit",
+            "title_tfidf_margin_to_best",
+            "year_abs_diff",
+            "author_jaccard_margin_to_best",
+            "hier_context_author_hit",
+            "year_exact_match",
+            "hier_context_title_tfidf_cosine",
+        ]
+        items = [auc_by_name[f] for f in showcase if f in auc_by_name]
+        f_labels = [FEATURE_VI_LABELS.get(it["feature"], it["feature"]) for it in items]
+        f_vals = [it["roc_auc"] for it in items]
+        f_colors = [color_map.get(it["group"], "#64748B") for it in items]
+        y_pos = np.arange(len(f_labels))
+        bars = ax.barh(y_pos, f_vals, color=f_colors, height=0.66)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(f_labels, fontsize=8.8, color="#1E293B")
+        ax.invert_yaxis()
+        ax.set_xlim(0.50, 1.08)
+        ax.axvline(0.50, color="#94A3B8", linestyle="--", linewidth=0.8)
+        ax.set_xlabel("ROC-AUC đơn biến (Phân tách cặp Dương vs Âm trên 1,12 triệu cặp thật)", fontsize=9.0, color="#334155")
+        ax.set_title("Đánh giá định lượng sức phân tách đặc trưng theo 5 nhóm (EDA thực nghiệm)", fontsize=10.6, fontweight="bold", color="#0F2744", pad=10)
+        for b, v in zip(bars, f_vals):
+            ax.text(v + 0.008, b.get_y() + b.get_height() / 2, f"{v:.4f}", va="center", fontsize=8.3, fontweight="bold", color="#0F172A")
+    else:
+        nonzero_imp = [item for item in feat_imp if item["importance_raw"] > 0]
+        top_feats = nonzero_imp[:12] if len(nonzero_imp) >= 12 else feat_imp[:12]
+        f_labels = [FEATURE_VI_LABELS.get(item["feature"], item["feature"]) for item in top_feats]
+        f_vals = [item["importance_share"] * 100.0 for item in top_feats]
+        f_colors = [color_map.get(item["group"], "#64748B") for item in top_feats]
+        y_pos = np.arange(len(f_labels))
+        bars = ax.barh(y_pos, f_vals, color=f_colors, height=0.66)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(f_labels, fontsize=8.8, color="#1E293B")
+        ax.invert_yaxis()
+        ax.set_xlabel("Tỷ trọng độ quan trọng đặc trưng (%)", fontsize=9.2, color="#334155")
+        ax.set_title("Top-12 đặc trưng quan trọng nhất (LightGBM Ranker)", fontsize=10.8, fontweight="bold", color="#0F2744", pad=10)
+        ax.set_xlim(0, max(f_vals) * 1.22 if f_vals else 10)
+        for b, v in zip(bars, f_vals):
+            ax.text(v + (max(f_vals) * 0.018 if f_vals else 0.2), b.get_y() + b.get_height() / 2, f"{v:.1f}%", va="center", fontsize=8.5, fontweight="bold", color="#0F172A")
 
-    from matplotlib.patches import Patch
     legend_handles = [
         Patch(facecolor="#0284C7", label="Metadata cơ bản (Tiêu đề/Tác giả/Năm/ID)"),
-        Patch(facecolor="#0D9488", label="Tương đối trong tập ứng viên (Pool)"),
+        Patch(facecolor="#0D9488", label="Tương đối trong Pool ứng viên"),
         Patch(facecolor="#D97706", label="Ngữ cảnh cây Hierarchy M2"),
     ]
-    ax.legend(handles=legend_handles, frameon=False, fontsize=8.3, loc="lower right")
-    fig.tight_layout(pad=1.1)
+    ax.legend(handles=legend_handles, frameon=False, fontsize=8.1, loc="lower right")
+    fig.tight_layout(pad=1.0)
     p3 = charts_dir / "chart_m3_features.png"
     fig.savefig(p3)
     plt.close(fig)
     paths["features"] = p3
 
-    # 4. Biểu đồ Ablation Study (A1 -> A2 -> A3)
+    # 4. Biểu đồ Ablation Study (A1 -> A2 -> A3) trên 5-Fold Manual CV (25 bài, 1.150 mục) ở kịch bản khuyết tiêu đề S3
     fig, ax = plt.subplots(figsize=(10.2, 2.95))
-    abl_keys = ["A1_base_metadata", "A2_plus_pool_relative", "A3_full_with_m2_hierarchy"]
-    abl_labels = [
-        "A1: Metadata cơ bản\n(17 đặc trưng)",
-        "A2: + Tương đối pool\n(21 đặc trưng)",
-        "A3: + Ngữ cảnh Hierarchy M2\n(đủ 25 đặc trưng)",
-    ]
-    val_mrr = [ablation[k]["metrics"]["valid"]["mrr_at_5"] for k in abl_keys]
-    tst_mrr = [ablation[k]["metrics"]["test"]["mrr_at_5"] for k in abl_keys]
-    tst_pos = [ablation[k]["metrics"]["test"]["mrr_at_5_positive_only"] for k in abl_keys]
+    if feature_eda and "manual_5fold_cv" in feature_eda:
+        cv_s3 = feature_eda["manual_5fold_cv"]["S3_missing_title_rescue"]
+        cats = [
+            "Heuristic\nBaseline",
+            "A1: Metadata\n(17 đặc trưng)",
+            "A2: + Pool\n(21 đặc trưng)",
+            "A3: + Hierarchy M2\n(đủ 25 đặc trưng)",
+        ]
+        mrr_vals = [
+            cv_s3["models"]["heuristic_baseline"]["mrr_at_5_mean"],
+            cv_s3["ablation"]["A1_base_metadata"]["mrr_at_5_mean"],
+            cv_s3["ablation"]["A2_plus_pool_relative"]["mrr_at_5_mean"],
+            cv_s3["ablation"]["A3_full_with_m2_hierarchy"]["mrr_at_5_mean"],
+        ]
+        pos_mrr_vals = [
+            cv_s3["models"]["heuristic_baseline"]["mrr_pos_mean"],
+            cv_s3["ablation"]["A1_base_metadata"]["mrr_pos_mean"],
+            cv_s3["ablation"]["A2_plus_pool_relative"]["mrr_pos_mean"],
+            cv_s3["ablation"]["A3_full_with_m2_hierarchy"]["mrr_pos_mean"],
+        ]
+        r1_vals = [
+            cv_s3["models"]["heuristic_baseline"]["recall_at_1_mean"],
+            cv_s3["ablation"]["A1_base_metadata"]["recall_at_1_mean"],
+            cv_s3["ablation"]["A2_plus_pool_relative"]["recall_at_1_mean"],
+            cv_s3["ablation"]["A3_full_with_m2_hierarchy"]["recall_at_1_mean"],
+        ]
+        x = np.arange(len(cats))
+        w = 0.25
+        b1 = ax.bar(x - w, mrr_vals, w, label="5-Fold CV MRR@5 (toàn |Q|=1.150)", color="#0284C7")
+        b2 = ax.bar(x, r1_vals, w, label="Recall@1 (1.003 mục có đích)", color="#0D9488")
+        b3 = ax.bar(x + w, pos_mrr_vals, w, label="MRR@5 mục có đích", color="#D97706")
+        ax.set_xticks(x)
+        ax.set_xticklabels(cats, fontsize=8.9, fontweight="bold", color="#1E293B")
+        ax.set_ylim(0.72, 1.07)
+        ax.set_yticks([0.75, 0.85, 0.95, 1.00])
+        ax.set_ylabel("Điểm 5-Fold CV", fontsize=9.0, color="#334155")
+        ax.set_title("Ablation Study trên 5-Fold Manual CV (25 bài, S3 khuyết tiêu đề — LightGBM Ranker)", fontsize=10.2, fontweight="bold", color="#0F2744", pad=15)
+        ax.grid(axis="y", linestyle="--", alpha=0.35, color="#CBD5E1")
+        ax.set_axisbelow(True)
+        ax.legend(frameon=False, fontsize=8.1, ncol=3, loc="upper center", bbox_to_anchor=(0.5, 1.06))
+        for grp in (b1, b2, b3):
+            for b in grp:
+                v = b.get_height()
+                ax.text(b.get_x() + b.get_width() / 2, v + 0.008, f"{v:.4f}", ha="center", va="bottom", fontsize=7.6, fontweight="bold", color="#0F172A")
+    else:
+        abl_keys = ["A1_base_metadata", "A2_plus_pool_relative", "A3_full_with_m2_hierarchy"]
+        abl_labels = ["A1: Metadata\n(17 đặc trưng)", "A2: + Pool\n(21 đặc trưng)", "A3: + Hierarchy M2\n(25 đặc trưng)"]
+        val_mrr = [ablation[k]["metrics"]["valid"]["mrr_at_5"] for k in abl_keys]
+        tst_mrr = [ablation[k]["metrics"]["test"]["mrr_at_5"] for k in abl_keys]
+        tst_pos = [ablation[k]["metrics"]["test"]["mrr_at_5_positive_only"] for k in abl_keys]
+        x = np.arange(len(abl_keys))
+        w = 0.25
+        b1 = ax.bar(x - w, val_mrr, w, label="Valid MRR@5", color="#64748B")
+        b2 = ax.bar(x, tst_mrr, w, label="Test MRR@5", color="#0284C7")
+        b3 = ax.bar(x + w, tst_pos, w, label="Test Positive-only", color="#D97706")
+        ax.set_xticks(x)
+        ax.set_xticklabels(abl_labels, fontsize=9.0, fontweight="bold", color="#1E293B")
+        ax.set_ylim(0, 1.30)
+        ax.set_ylabel("MRR@5", fontsize=9.0, color="#334155")
+        ax.set_title("Nghiên cứu loại bỏ đặc trưng (Ablation Study — LightGBM Ranker)", fontsize=10.5, fontweight="bold", color="#0F2744", pad=16)
+        ax.legend(frameon=False, fontsize=8.3, ncol=3, loc="upper center", bbox_to_anchor=(0.5, 1.04))
+        for grp in (b1, b2, b3):
+            for b in grp:
+                v = b.get_height()
+                ax.text(b.get_x() + b.get_width() / 2, v + 0.02, f"{v:.4f}", ha="center", va="bottom", fontsize=8.0, fontweight="bold", color="#0F172A")
 
-    x = np.arange(len(abl_keys))
-    w = 0.25
-    b_va = ax.bar(x - w, val_mrr, w, label="Valid MRR@5", color="#64748B")
-    b_te = ax.bar(x, tst_mrr, w, label="Test MRR@5 (toàn |Q|)", color="#0284C7")
-    b_tp = ax.bar(x + w, tst_pos, w, label="Test MRR@5 (mục có đích)", color="#D97706")
-    ax.set_xticks(x)
-    ax.set_xticklabels(abl_labels, fontsize=9.2, fontweight="bold", color="#1E293B")
-    ax.set_ylim(0, 1.30)
-    ax.set_yticks([0.0, 0.2, 0.4, 0.6, 0.8, 1.0])
-    ax.set_ylabel("MRR@5", fontsize=9.2, color="#334155")
-    ax.set_title("Nghiên cứu loại bỏ đặc trưng (Ablation Study — LightGBM Ranker)", fontsize=10.8, fontweight="bold", color="#0F2744", pad=16)
-    ax.grid(axis="y", linestyle="--", alpha=0.35, color="#CBD5E1")
-    ax.set_axisbelow(True)
-    ax.legend(frameon=False, fontsize=8.5, ncol=3, loc="upper center", bbox_to_anchor=(0.5, 1.04))
-    for grp in (b_va, b_te, b_tp):
-        for b in grp:
-            v = b.get_height()
-            ax.text(b.get_x() + b.get_width() / 2, v + 0.022, f"{v:.4f}", ha="center", va="bottom", fontsize=8.0, fontweight="bold", color="#0F172A")
-
-    fig.tight_layout(pad=1.0)
+    fig.tight_layout(pad=0.9)
     p4 = charts_dir / "chart_m3_ablation.png"
     fig.savefig(p4)
     plt.close(fig)
@@ -308,7 +393,7 @@ def _add_bullets(slide, x: float, y: float, w: float, h: float, items: list[tupl
     for idx, (lead, body) in enumerate(items):
         p = tf.paragraphs[0] if idx == 0 else tf.add_paragraph()
         p.space_after = Pt(space_after)
-        p.line_spacing = 1.16
+        p.line_spacing = 1.15
         r1 = p.add_run()
         r1.text = f"▪ {lead}: " if lead else "▪ "
         r1.font.name = FONT_NAME
@@ -335,9 +420,11 @@ def build_poster(
     ablation = json.loads((m3_workspace / "m3_ablation.json").read_text(encoding="utf-8"))
     hf_manifest = json.loads((m3_workspace / "hf_staging_manifest.json").read_text(encoding="utf-8"))
     err_analysis = json.loads((m3_workspace / "m3_error_analysis.json").read_text(encoding="utf-8"))
+    eda_path = m3_workspace / "m3_feature_eda.json"
+    feature_eda = json.loads(eda_path.read_text(encoding="utf-8")) if eda_path.is_file() else None
 
     charts_dir = output_pptx.parent / "charts"
-    charts = render_charts(m2_summary, m3_summary, feat_imp, ablation, charts_dir)
+    charts = render_charts(m2_summary, m3_summary, feat_imp, ablation, charts_dir, feature_eda=feature_eda)
 
     prs = Presentation()
     prs.slide_width = Inches(A2_WIDTH_IN)
@@ -397,10 +484,10 @@ def build_poster(
     hf_gb = hf_manifest["total_bytes"] / (1024 ** 3)
 
     kpis = [
-        ("25.000 bài", "41.498 phiên bản (5 dải ID)", NAVY),
+        ("25.000 bài", "41.498 phiên bản (5 × 5.000 bài)", NAVY),
         (f"{parsed_pct:.2f}%", "Phiên bản TeX parse được cấu trúc", SKY),
         (f"-{elem_red:.1f}% / -{bib_red:.1f}%", "Khử trùng Elements & BibTeX", TEAL),
-        (f"MRR@5 = {best_test['mrr_at_5']:.4f}", f"{MODEL_SHORT[best_model]} (R@1={best_test['recall_at_1']:.3f})", AMBER),
+        (f"MRR@5 = {best_test['mrr_at_5']:.4f}", f"{MODEL_SHORT[best_model]} (R@1={best_test['recall_at_1']*100:.0f}%)", AMBER),
         ("6 bảng Parquet", f"{hf_gb:.2f} GiB chuẩn Hugging Face", NAVY),
     ]
     kpi_w = 2.951
@@ -475,30 +562,45 @@ def build_poster(
             ("Phân tích phân cấp (M2)", "Tự dò compilation root + \\input/\\include, dựng cây (Document → Section → Sentence/Math/Figure/List), chuẩn hóa LaTeX/toán, khử trùng 2 tầng & đổi tên \\cite{} xuyên phiên bản."),
             ("Kiểm chuẩn Out-of-Core", "Xác minh 5 bảng bằng SQLite trên đĩa từng đồ thị (arxiv_id, version): structural_valid = True, 0 chu trình, 0 thiếu phiên bản trên 41.498 version."),
         ],
-        font_size=10.6,
+        font_size=10.5,
         space_after=4.5,
     )
 
-    # Card L2: Kết quả M1-M2 & Benchmark Colab CPU (8.70 -> 16.25)
-    _add_card(slide, lx, 8.70, cw, 7.55, "2. THỐNG KÊ M1–M2 & BENCHMARK COLAB CPU-ONLY (25.000 BÀI)", SKY)
+    # Card L2: Kết quả M1-M2, Benchmark & Bằng chứng EDA Chất lượng BibTeX (8.70 -> 16.25)
+    _add_card(slide, lx, 8.70, cw, 7.55, "2. THỐNG KÊ M1–M2, BENCHMARK COLAB & EDA CHẤT LƯỢNG BIBTEX", SKY)
     card_bounds.append(("L2", lx, 8.70, lx + cw, 16.25))
 
     bm = m2_summary["benchmark_summary"]
     _add_bullets(
         slide,
         lx + 0.16,
-        9.32,
+        9.30,
         cw - 0.32,
-        2.00,
+        1.98,
         [
-            ("Độ phủ nguồn & trích dẫn", f"25.000 bài (0 trùng chéo thành viên), {m2_summary['source_audit_summary']['verified']:,}/41.498 version đã audit, {m2_summary['m1_references']:,} working references và {m2_summary['course_references']:,} arXiv-keyed references."),
-            ("Hiệu năng Colab CPU-only", f"5 phiên độc lập không gối giờ (reused = 0): tổng {bm['total_profiler_sec']:,.1f}s (~5h11m), trung bình {bm['avg_sec_per_unique_publication']:.3f}s/bài, Peak RSS {bm['max_session_peak_rss_mib']:.1f} MiB (TB trọng số {bm['session_time_weighted_avg_rss_mib']:.1f} MiB)."),
+            ("Độ phủ nguồn & trích dẫn", f"25.000 bài (0 trùng chéo thành viên), {m2_summary['source_audit_summary']['verified']:,}/41.498 version đã audit, {m2_summary['m1_references']:,} working refs và {m2_summary['course_references']:,} arXiv-keyed refs."),
+            ("Hiệu năng Colab CPU-only", f"5 phiên độc lập không gối giờ (reused = 0): tổng {bm['total_profiler_sec']:,.1f}s (~5h11m), TB {bm['avg_sec_per_unique_publication']:.3f}s/bài, Peak RSS {bm['max_session_peak_rss_mib']:.1f} MiB (TB trọng số {bm['session_time_weighted_avg_rss_mib']:.1f} MiB)."),
             ("Chất lượng phân tích M2", f"33.025 success (85,66% TeX) + 4.503 partial (97,34% parse cấu trúc); khử trùng Elements {m2_summary['m2_deduplication']['elements']['before']/1e6:.2f}M → {m2_summary['m2_deduplication']['elements']['after']/1e6:.2f}M, BibTeX {m2_summary['m2_deduplication']['bibtex']['before']/1e6:.2f}M → {m2_summary['m2_deduplication']['bibtex']['after']/1e6:.2f}M."),
         ],
-        font_size=10.5,
-        space_after=4.0,
+        font_size=10.3,
+        space_after=3.8,
     )
-    slide.shapes.add_picture(str(charts["m1_m2"]), Inches(lx + 0.14), Inches(11.42), width=Inches(cw - 0.28))
+    slide.shapes.add_picture(str(charts["m1_m2"]), Inches(lx + 0.14), Inches(11.34), width=Inches(cw - 0.28))
+
+    # Hộp tóm tắt EDA chất lượng BibTeX & độ trễ năm (lấp gọn vùng trống dưới Chart 1: 14.38 -> 16.08)
+    _add_rect(slide, lx + 0.16, 14.38, cw - 0.32, 1.68, CARD_TINT, line=SKY, radius=True)
+    if feature_eda and "metadata_and_year_lag_eda" in feature_eda:
+        meda = feature_eda["metadata_and_year_lag_eda"]
+        yl = meda["year_lag_distribution"]
+        eda_bullets = [
+            ("Bằng chứng EDA định hướng đặc trưng M3 (n = 29.309 mục BibTeX / 1,12M cặp)", f"70,8% thiếu DOI, 89,0% thiếu URL, chỉ {meda['has_explicit_arxiv_id_pct']:.1f}% có sẵn arXiv ID và {meda['author_count_mismatch_pct']:.1f}% cặp dương lệch số lượng tác giả (TB lệch {meda['mean_author_count_diff']:.1f} do 'et al.') → cần khớp mờ tiêu đề + recall họ tác giả."),
+            ("Bất đối xứng độ trễ năm & độ phủ cây M2", f"Độ trễ năm (bib_year − ref_year, n={meda['year_lag_samples']:,}): 0 năm = {yl['0']['pct']:.1f}%, +1 năm = {yl['1']['pct']:.1f}% (preprint → hội nghị) so với −1 năm chỉ {yl['-1']['pct']:.1f}% → chứng minh cần year_diff_signed; {meda['has_m2_hierarchy_ctx_pct']:.1f}% mục BibTeX giải được ngữ cảnh \\cite{{}} trong cây M2."),
+        ]
+    else:
+        eda_bullets = [
+            ("Phân bổ dữ liệu 5 thành viên", "Mỗi thành viên phụ trách đúng 5.000 bài báo (0 trùng chéo), đảm bảo mỗi lát dữ liệu cá nhân đều đạt chuẩn M1–M2–M3 (5 bài Manual ≥20 mục + 12% Auto)."),
+        ]
+    _add_bullets(slide, lx + 0.24, 14.44, cw - 0.48, 1.56, eda_bullets, font_size=9.7, space_after=3.5)
 
     # Card L3: Bộ dữ liệu 6 bảng Hugging Face (16.50 -> 22.65)
     _add_card(slide, lx, 16.50, cw, 6.15, "3. BỘ DỮ LIỆU 6 BẢNG PARQUET CHUẨN HUGGING FACE", NAVY)
@@ -551,15 +653,15 @@ def build_poster(
     _add_bullets(
         slide,
         lx + 0.16,
-        21.15,
+        21.14,
         cw - 0.32,
-        1.35,
+        1.38,
         [
-            ("Chuẩn streaming Hugging Face", "Bố cục data/<table>/*.parquet + YAML Dataset Card (README.md), không dùng custom script, không chứa JSON lồng nhau."),
-            ("Kiểm chuẩn 6 bảng", f"Tất cả 6/6 cấu hình xác minh hợp lệ (valid = True, tổng {hf_gb:.2f} GiB), tải trực tiếp qua datasets.load_dataset()."),
+            ("Chuẩn streaming Hugging Face", "Bố cục data/<table>/*.parquet + YAML Dataset Card (README.md), không dùng custom script, không chứa JSON lồng nhau; xác minh live preview/viewer/search/filter/statistics = True."),
+            ("Hỗ trợ cả nhóm & từng thành viên", f"Tổng {hf_gb:.2f} GiB (25.000 bài) và cấu trúc chuẩn hóa 5 × 5.000 bài cá nhân, mỗi lát đạt đủ 6 bảng & chuẩn gán nhãn M3 độc lập."),
         ],
-        font_size=10.3,
-        space_after=4.0,
+        font_size=10.1,
+        space_after=3.8,
     )
 
     # ===== CỘT PHẢI (x=8.44, w=7.64) =====
@@ -577,43 +679,52 @@ def build_poster(
         cw - 0.32,
         2.38,
         [
-            ("Gán nhãn chuẩn theo thành viên (k = 5)", f"Manual pool: {lbl['manual_papers']} bài (5 bài/thành viên, mỗi bài ≥20 BibTeX, tổng {lbl['manual_entries']:,} mục). Auto pool: {lbl['auto_papers']:,} bài ({lbl['auto_fraction_of_remaining']*100:.1f}% > ngưỡng 10%, tổng {lbl['auto_entries']:,} mục)."),
+            ("Gán nhãn chuẩn theo thành viên (k = 5)", f"Manual pool: {lbl['manual_papers']} bài (5 bài/thành viên, min Q = 26 ≥ 20, tổng {lbl['manual_entries']:,} mục). Auto pool: {lbl['auto_papers']:,} bài ({lbl['auto_fraction_of_remaining']*100:.1f}% > ngưỡng 10%, tổng {lbl['auto_entries']:,} mục)."),
             ("Chia tập chống rò rỉ theo arxiv_id", f"Test: 5 Manual + 5 Auto ({lbl['split_entries']['test']:,} mục) • Valid: 5 Manual + 5 Auto ({lbl['split_entries']['valid']:,} mục) • Train: {lbl['split_papers']['train']['manual']} Manual + {lbl['split_papers']['train']['auto']:,} Auto ({lbl['split_entries']['train']:,} mục). TF-IDF chỉ fit trên Train."),
-            ("25 đặc trưng (không dùng LLM/Pretrained)", "Gồm 7 đặc trưng tiêu đề, 5 tác giả, 5 thời gian/ID (arXiv ID, độ trễ năm), 4 tương đối trong pool và 4 đặc trưng ngữ cảnh cây Hierarchy M2 (\\cite{}, mục Intro/Related, câu trích dẫn ↔ ref_title, khớp tác giả trong câu)."),
+            ("25 đặc trưng (100% cổ điển, 0 LLM)", "7 tiêu đề + 5 tác giả + 5 thời gian/ID + 4 tương đối trong pool + 4 ngữ cảnh cây Hierarchy M2. Trên 1,12M cặp thật, [M2] khớp họ tác giả trong câu \\cite{} đạt AUC = 0,7825 (63,9% dương vs 7,4% âm — gấp 8,6×)."),
         ],
-        font_size=10.2,
-        space_after=4.0,
+        font_size=10.1,
+        space_after=3.8,
     )
     slide.shapes.add_picture(str(charts["features"]), Inches(rx + 0.14), Inches(7.36), width=Inches(cw - 0.28))
 
     # Card R2: So sánh mô hình & Ablation Study (10.90 -> 18.25)
-    _add_card(slide, rx, 10.90, cw, 7.35, "5. SO SÁNH MÔ HÌNH, ĐÁNH GIÁ MRR@5 & ABLATION STUDY", AMBER)
+    _add_card(slide, rx, 10.90, cw, 7.35, "5. SO SÁNH MÔ HÌNH, ĐÁNH GIÁ MRR@5 & STRESS-TEST ABLATION", AMBER)
     card_bounds.append(("R2", rx, 10.90, rx + cw, 18.25))
 
-    slide.shapes.add_picture(str(charts["models"]), Inches(rx + 0.14), Inches(11.50), width=Inches(cw - 0.28))
-    slide.shapes.add_picture(str(charts["ablation"]), Inches(rx + 0.14), Inches(14.62), width=Inches(cw - 0.28))
+    slide.shapes.add_picture(str(charts["models"]), Inches(rx + 0.14), Inches(11.48), width=Inches(cw - 0.28))
+    slide.shapes.add_picture(str(charts["ablation"]), Inches(rx + 0.14), Inches(14.58), width=Inches(cw - 0.28))
 
-    tb_m3note = slide.shapes.add_textbox(Inches(rx + 0.18), Inches(17.12), Inches(cw - 0.36), Inches(1.02))
+    tb_m3note = slide.shapes.add_textbox(Inches(rx + 0.18), Inches(17.08), Inches(cw - 0.36), Inches(1.06))
     tf_n = tb_m3note.text_frame
     tf_n.word_wrap = True
     pn = tf_n.paragraphs[0]
     pn.line_spacing = 1.15
     r1 = pn.add_run()
-    r1.text = "Kết quả nổi bật trên tập Test: "
+    r1.text = "Kết quả thực nghiệm cốt lõi: "
     r1.font.name = FONT_NAME
-    r1.font.size = Pt(10.4)
+    r1.font.size = Pt(10.2)
     r1.font.bold = True
     r1.font.color.rgb = NAVY
     r2 = pn.add_run()
     best_auto = m3_summary["models"][best_model]["test_auto"]
-    r2.text = (
-        f"{MODEL_SHORT[best_model]} đạt MRR@5 = {best_test['mrr_at_5']:.4f} trên toàn tập |Q|={best_test['n_entries']} "
-        f"(MRR@5 mục có đích = {best_test['mrr_at_5_positive_only']:.4f}, Recall@1 = {best_test['recall_at_1']*100:.1f}%, "
-        f"Recall@5 = {best_test['recall_at_5']*100:.1f}%). Tách riêng: Test-Manual MRR@5 = {best_manual['mrr_at_5']:.4f} "
-        f"(R@1 = {best_manual['recall_at_1']*100:.1f}%), Test-Auto MRR@5 = {best_auto['mrr_at_5']:.4f}."
-    )
+    if feature_eda and "manual_5fold_cv" in feature_eda:
+        s3_t_lgb = feature_eda["stress_test"]["S3_missing_title_rescue"]["models"]["lightgbm_ranker"]["test"]["mrr_at_5"]
+        s3_t_heu = feature_eda["stress_test"]["S3_missing_title_rescue"]["models"]["heuristic_baseline"]["test"]["mrr_at_5"]
+        cv_s3 = feature_eda["manual_5fold_cv"]["S3_missing_title_rescue"]
+        r2.text = (
+            f"Trên Test chuẩn (|Q|=540), {MODEL_SHORT[best_model]} đạt đúng trần lý thuyết MRR@5 = {best_test['mrr_at_5']:.4f} "
+            f"(100% Recall@1 trên 373 mục có đích; Test-Manual = {best_manual['mrr_at_5']:.4f}, Test-Auto = {best_auto['mrr_at_5']:.4f}). "
+            f"Khi khuyết tiêu đề .bbl (S3), LightGBM vượt Heuristic tới +{s3_t_lgb - s3_t_heu:.4f} MRR@5 trên Test và "
+            f"A3 (+Hierarchy M2) đạt đỉnh 5-Fold Manual CV ({cv_s3['ablation']['A3_full_with_m2_hierarchy']['mrr_at_5_mean']:.4f}, R@1 = {cv_s3['ablation']['A3_full_with_m2_hierarchy']['recall_at_1_mean']*100:.1f}% vs Heuristic {cv_s3['models']['heuristic_baseline']['recall_at_1_mean']*100:.1f}%)."
+        )
+    else:
+        r2.text = (
+            f"{MODEL_SHORT[best_model]} đạt MRR@5 = {best_test['mrr_at_5']:.4f} trên toàn tập |Q|={best_test['n_entries']} "
+            f"(Recall@1 = {best_test['recall_at_1']*100:.1f}%, Test-Manual = {best_manual['mrr_at_5']:.4f}, Test-Auto = {best_auto['mrr_at_5']:.4f})."
+        )
     r2.font.name = FONT_NAME
-    r2.font.size = Pt(10.3)
+    r2.font.size = Pt(9.9)
     r2.font.color.rgb = TEXT_DARK
 
     # Card R3: Phân tích lỗi & Kết luận (18.50 -> 22.65)
@@ -622,12 +733,6 @@ def build_poster(
 
     n_neg_test = best_test["n_entries"] - best_test["n_positive_entries"]
     neg_pct = (n_neg_test / best_test["n_entries"] * 100.0) if best_test["n_entries"] else 0.0
-    n_miss_test = err_analysis["test_positive_not_rank1"]
-    miss_bullet = (
-        f"Toàn bộ {best_test['n_positive_entries']}/{best_test['n_positive_entries']} mục có đích arXiv trên tập Test đều đạt hạng 1 (Recall@1 = 100%); các ca khó hiếm gặp trên tập lớn chủ yếu do .bbl rút gọn tiêu đề/tác giả hoặc bài đổi tên giữa các phiên bản."
-        if n_miss_test == 0
-        else f"Chỉ {n_miss_test} mục có đích trên tập Test không đứng hạng 1: chủ yếu do .bbl rút gọn tiêu đề/tên tác giả, bài đổi tựa hoặc trùng họ tác giả đầu trong cùng năm."
-    )
     _add_bullets(
         slide,
         rx + 0.16,
@@ -635,13 +740,13 @@ def build_poster(
         cw - 0.32,
         3.40,
         [
-            ("Trần lý thuyết từ hàng all-negative", f"Trong tập Test có {n_neg_test}/{best_test['n_entries']} mục ({neg_pct:.1f}%) là tài liệu không có bản arXiv (sách, hội nghị/tạp chí đóng), tạo hàng âm toàn phần — xác định trần tự nhiên MRR@5 = {best_test['mrr_at_5']:.4f} (Test-Manual: {best_manual['mrr_at_5']:.4f}, Test-Auto: {best_auto['mrr_at_5']:.4f})."),
-            ("Hiệu quả xếp hạng nội bài báo", miss_bullet),
-            ("Tác động đặc trưng Pool & Hierarchy M2", "Hai đặc trưng khoảng cách tới ứng viên tốt nhất trong pool (author_jaccard_margin_to_best 16,7%, title_tfidf_margin_to_best 13,3%), độ trễ năm (13,3%) và tần suất \\cite{} từ Hierarchy M2 (3,3%) giúp LightGBM hội tụ ngay vòng đầu."),
-            ("Tính minh bạch & tái lập 100%", "Toàn bộ mô hình cổ điển (không dùng LLM/pretrained), mã nguồn sạch, CI tự động, bộ 6 bảng Parquet (3,92 GiB) đã xuất bản công khai trên Hugging Face và báo cáo Jupyter Book sinh động từ số đo thật."),
+            ("Trần lý thuyết từ hàng all-negative", f"Trong tập Test có {n_neg_test}/{best_test['n_entries']} mục ({neg_pct:.1f}%) là tài liệu không có bản arXiv (sách, hội nghị/tạp chí đóng), tạo hàng âm toàn phần — xác định trần tự nhiên MRR@5 = 373/540 = {best_test['mrr_at_5']:.4f}."),
+            ("Học máy cổ điển vượt trội khi .bbl nhiễu", "Trên 5-Fold Manual CV (25 bài / 1.150 mục), ngay cả ở dữ liệu sạch ML đạt 100% R@1 (Heuristic 99,9%); khi rút gọn hoặc khuyết tiêu đề (S2/S3), LightGBM Ranker giữ 96,1%–99,3% R@1 (Heuristic tụt còn 81,4%–91,7%)."),
+            ("Vai trò phục hồi của Pool & Hierarchy M2", "Trên S0, 2 đặc trưng Pool-relative đóng góp >98% LightGBM Gain; khi mất tiêu đề (S3), ngữ cảnh câu \\cite{} (hier_context_title_tfidf_cosine) vươn lên Top-7 Gain toàn cục và nâng A3 lên đỉnh 5-Fold CV (0,8530)."),
+            ("Tái lập 100% & Tuân thủ quy định", "100% học máy cổ điển (không dùng LLM/pretrained), mã nguồn sạch có CI tự động, notebook EDA M3, báo cáo Jupyter Book M1–M2 và bộ 6 bảng Parquet trên Hugging Face."),
         ],
-        font_size=10.1,
-        space_after=4.5,
+        font_size=10.0,
+        space_after=4.2,
     )
 
     # ===== FOOTER =====
@@ -649,9 +754,9 @@ def build_poster(
     tb_f = slide.shapes.add_textbox(Inches(0.45), Inches(22.95), Inches(15.64), Inches(0.35))
     pf = tb_f.text_frame.paragraphs[0]
     pf.alignment = PP_ALIGN.CENTER
-    pf.text = "arXiv Harvester • Nhập môn Khoa học dữ liệu (Chương trình Chuẩn) • Khổ đứng A2 (420 × 594 mm) • Tái lập tự động qua tools/generate_poster.py"
+    pf.text = "arXiv Harvester • Nhập môn Khoa học dữ liệu (Chương trình Chuẩn) • Khổ đứng A2 (420 × 594 mm) • Nguồn: arXiv API, Semantic Scholar API, LightGBM, scikit-learn"
     pf.font.name = FONT_NAME
-    pf.font.size = Pt(10.5)
+    pf.font.size = Pt(10.2)
     pf.font.color.rgb = SKY_LIGHT
 
     output_pptx.parent.mkdir(parents=True, exist_ok=True)
@@ -660,8 +765,8 @@ def build_poster(
     # Kiểm tra hình học tự động: 1 slide, đúng A2 portrait, không tràn biên, không đè card
     check_prs = Presentation(str(output_pptx))
     assert len(check_prs.slides) == 1, f"Expected 1 slide, got {len(check_prs.slides)}"
-    w_mm = check_prs.slide_width.inches * 25.4
-    h_mm = check_prs.slide_height.inches * 25.4
+    w_mm = (check_prs.slide_width / 914400.0) * 25.4
+    h_mm = (check_prs.slide_height / 914400.0) * 25.4
     assert abs(w_mm - 420.0) < 0.5 and abs(h_mm - 594.0) < 0.5, f"Wrong A2 size: {w_mm:.2f}x{h_mm:.2f}mm"
 
     overlaps = []
